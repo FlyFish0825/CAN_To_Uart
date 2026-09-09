@@ -1,0 +1,11 @@
+CompileFlags:
+  CompilationDatabase: build/Release
+
+Index:
+  Background: Build
+
+Diagnostics:
+  UnusedIncludes: None
+
+Hover:
+  ShowAKA: true
