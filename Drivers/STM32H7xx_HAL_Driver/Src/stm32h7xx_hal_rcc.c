@@ -1518,7 +1518,8 @@ uint32_t HAL_RCC_GetPCLK1Freq(void)
 {
 #if defined (RCC_D2CFGR_D2PPRE1)
   /* Get HCLK source and Compute PCLK1 frequency ---------------------------*/
-  return (HAL_RCC_GetHCLKFreq() >> ((D1CorePrescTable[(RCC->D2CFGR & RCC_D2CFGR_D2PPRE1) >> RCC_D2CFGR_D2PPRE1_Pos]) & 0x1FU));
+  static const uint8_t APBPrescTable[8] = {0U, 0U, 0U, 0U, 1U, 2U, 3U, 4U};
+  return (HAL_RCC_GetHCLKFreq() >> APBPrescTable[(RCC->D2CFGR & RCC_D2CFGR_D2PPRE1) >> RCC_D2CFGR_D2PPRE1_Pos]);
 #else
   /* Get HCLK source and Compute PCLK1 frequency ---------------------------*/
   return (HAL_RCC_GetHCLKFreq() >> ((D1CorePrescTable[(RCC->CDCFGR2 & RCC_CDCFGR2_CDPPRE1) >> RCC_CDCFGR2_CDPPRE1_Pos]) & 0x1FU));
@@ -1536,7 +1537,8 @@ uint32_t HAL_RCC_GetPCLK2Freq(void)
 {
   /* Get HCLK source and Compute PCLK1 frequency ---------------------------*/
 #if defined(RCC_D2CFGR_D2PPRE2)
-  return (HAL_RCC_GetHCLKFreq() >> ((D1CorePrescTable[(RCC->D2CFGR & RCC_D2CFGR_D2PPRE2) >> RCC_D2CFGR_D2PPRE2_Pos]) & 0x1FU));
+  static const uint8_t APBPrescTable[8] = {0U, 0U, 0U, 0U, 1U, 2U, 3U, 4U};
+  return (HAL_RCC_GetHCLKFreq() >> APBPrescTable[(RCC->D2CFGR & RCC_D2CFGR_D2PPRE2) >> RCC_D2CFGR_D2PPRE2_Pos]);
 #else
   return (HAL_RCC_GetHCLKFreq() >> ((D1CorePrescTable[(RCC->CDCFGR2 & RCC_CDCFGR2_CDPPRE2) >> RCC_CDCFGR2_CDPPRE2_Pos]) & 0x1FU));
 #endif
