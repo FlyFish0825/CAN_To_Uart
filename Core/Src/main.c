@@ -21,6 +21,7 @@
 #include "dma.h"
 #include "fdcan.h"
 #include "usart.h"
+#include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -96,6 +97,7 @@ int main(void)
   MX_DMA_Init();
   MX_FDCAN1_Init();
   MX_USART1_UART_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   if (CanUartGateway_Init() != HAL_OK)
   {
@@ -111,8 +113,8 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     CanUartGateway_Process();
-    /* USER CODE END 3 */
-  }
+  /* USER CODE END 3 */
+}
 }
 
 /**
