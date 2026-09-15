@@ -334,6 +334,10 @@ static HAL_StatusTypeDef Uart_SendCanPacket(const CanFrame_t *frame)
     return HAL_ERROR;
   }
 
+  /*
+   * 此函数只做“CAN 帧 -> 串口协议帧”的封装并写入串口 TX 队列。
+   * 它用于 CAN 接收上报、启动提示和状态提示；不会向 CAN 总线发送数据。
+   */
   packet[0] = UART_FRAME_START_0;
   packet[1] = UART_FRAME_START_1;
   packet[2] = (uint8_t)(UART_PACKET_MIN_BODY_LEN + frame->len);
@@ -400,6 +404,12 @@ static void Uart_SendStatusPacket(uint32_t id, const char text[8])
 
 static void CanRx_ProcessUart(void)
 {
+  /*
+   * 数据路径 2（CAN -> 上位机）的主循环阶段：
+   * HAL_FDCAN_RxFifo0Callback() 已在中断中把 CAN 报文存入 can_rx_queue，
+   * 此处取出一帧，封装成 AA 55 ... CRC 55 AA，并交给 UART TX DMA。
+   * 每轮只处理一帧，避免 CAN 突发数据长期占用主循环。
+   */
   if (can_rx_tail != can_rx_head)
   {
     uint16_t tail = can_rx_tail;
@@ -419,6 +429,12 @@ static void CanTx_ProcessBus(void)
   uint32_t dlc;
   uint16_t tail;
 
+  /*
+   * 数据路径 1（串口 -> CAN）的最终发送阶段：
+   * QueueCanTxFromPacket() 已把校验后的串口命令放入 can_tx_queue；
+   * 此处转换为 FDCAN 发送头，并写入 FDCAN1 的硬件 TX FIFO。
+   * HAL_OK 仅代表写入硬件 FIFO 成功，不代表总线已得到 ACK。
+   */
   if (can_tx_tail == can_tx_head) return;
   if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0U) return;
 
@@ -582,6 +598,11 @@ static void QueueCanTxFromPacket(const uint8_t *packet)
   uint16_t next;
   uint16_t i;
 
+  /*
+   * 数据路径 1（串口 -> CAN）的协议转换点：
+   * 输入 packet 已通过帧头、帧尾和 CRC 校验；这里读取 CAN_ID、FLAGS、LEN、DATA，
+   * 校验 CAN 帧属性后写入 can_tx_queue。真正访问 FDCAN 硬件在 CanTx_ProcessBus()。
+   */
   frame.id = ReadU32Le(&packet[5]);
   frame.flags = packet[9];
   frame.len = packet[10];
@@ -655,6 +676,10 @@ static void UartParser_CommitPacket(void)
   uint8_t end_index;
   uint8_t expected_crc;
 
+  /*
+   * 串口收包完成后的分流点：先核对帧尾和 CRC，
+   * FLAGS.bit7=1 时作为本地配置命令处理；否则进入“串口 -> CAN”路径。
+   */
   crc_index = (uint8_t)(uart_rx_packet[2] + 3U);
   end_index = (uint8_t)(crc_index + 1U);
   if ((uart_rx_packet[end_index] != UART_FRAME_END_0) ||
@@ -811,6 +836,11 @@ static HAL_StatusTypeDef UartRxDma_Start(void)
 
 static void UartRx_Process(void)
 {
+  /*
+   * 串口 DMA 回调只负责把新字节放入 uart_rx_ring；
+   * 主循环在这里逐字节执行帧头、长度、CRC、帧尾解析，随后调用
+   * QueueCanTxFromPacket()，因此这是“串口原始字节 -> CAN 发送命令”的入口。
+   */
   while (uart_rx_ring_tail != uart_rx_ring_head)
   {
     uint16_t tail = uart_rx_ring_tail;
@@ -825,6 +855,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
   if ((huart != NULL) && (huart->Instance == USART1))
   {
+    /* RX DMA 的 IDLE、半满、全满事件：将 DMA 缓冲的新增字节搬入软件环形缓冲。 */
     UartRxDma_Consume(size, HAL_UARTEx_GetRxEventType(huart));
   }
 }
@@ -862,6 +893,11 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
                                uint32_t RxFifo0ITs)
 {
+  /*
+   * 数据路径 2（CAN -> 上位机）的中断入口：
+   * 从 FDCAN1 RX FIFO0 读出原始 CAN 帧，转换为 CanFrame_t 并写入 can_rx_queue。
+   * 中断中不直接调用串口 DMA，实际串口发送由 CanRx_ProcessUart() 在主循环完成。
+   */
   if ((hfdcan == NULL) || (hfdcan->Instance != FDCAN1))
   {
     return;
@@ -977,6 +1013,7 @@ void CanUartGateway_Process(void)
     (void)UartRxDma_Start();
   }
 
+  /* 路径 1：处理电脑发来的串口字节，得到待发送 CAN 帧。 */
   UartRx_Process();
 
   if (bitrate_change_pending != 0U)
@@ -998,6 +1035,7 @@ void CanUartGateway_Process(void)
     config_response_pending = 1U;
   }
 
+  /* 路径 1：每轮最多向 FDCAN 硬件提交 3 帧。 */
   for (i = 0U; i < 3U; i++)
   {
     CanTx_ProcessBus();
@@ -1034,6 +1072,8 @@ void CanUartGateway_Process(void)
     Uart_SendConfigResponse();
   }
 
+  /* 路径 2：将 CAN RX FIFO 中已接收的帧转发给电脑。 */
   CanRx_ProcessUart();
+  /* 统一启动串口 TX DMA，发送路径 2 的 CAN 上报或本地状态提示。 */
   UartTx_Process();
 }
