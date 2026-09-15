@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
 #include "fdcan.h"
 #include "usart.h"
 #include "gpio.h"
@@ -92,6 +93,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_FDCAN1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
@@ -99,7 +101,7 @@ int main(void)
   {
     Error_Handler();
   }
-/* USER CODE END 2 */
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -109,7 +111,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     CanUartGateway_Process();
-/* USER CODE END 3 */
+    /* USER CODE END 3 */
   }
 }
 
