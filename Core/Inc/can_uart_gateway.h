@@ -8,7 +8,7 @@ extern "C" {
 #include "can_gateway_core.h"
 
 /*
- * USB CDC 使用的 AA55 CAN 网关报文格式（多字节字段均为小端序）。
+ * 外部设备使用的 AA55 CAN 网关报文格式（多字节字段均为小端序）。
  * 该头文件保留协议说明，便于抓包工具、上位机和后续维护人员对照代码。
  *
  * 字节布局：
@@ -26,13 +26,13 @@ extern "C" {
  *   [...]     0x55              固定结束字节 0
  *   [...]     0xAA              固定结束字节 1
  *
- * BODY_LEN=8+LEN 是变长协议的有效体长度；解析器允许 USB 分包、半包和
+ * BODY_LEN=8+LEN 是变长协议的有效体长度；解析器允许分包、半包和
  * 粘包，收到完整帧后才校验帧尾/CRC。普通 CAN 数据路径如下：
- *   电脑 -> USB RX Ring -> AA55 解析 -> CAN 软件队列 -> FDCAN1 TX FIFO
- *   FDCAN1 RX FIFO -> CAN 软件队列 -> AA55 封装 -> USB TX Queue -> 电脑
+ *   外部设备 -> 接收环形缓冲 -> AA55 解析 -> CAN 软件队列 -> FDCAN1 TX FIFO
+ *   FDCAN1 RX FIFO -> CAN 软件队列 -> AA55 封装 -> 发送队列 -> 外部设备
  *
  * 函数指针解耦后的新入口位于 can_gateway_core.h：应用只需注册传输操作表，
- * 不要在业务代码中直接调用 USB CDC 函数。
+ * 业务代码只需注册接口并调用统一入口，不要直接访问具体传输驱动。
  */
 
 /**

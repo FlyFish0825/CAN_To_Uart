@@ -251,7 +251,7 @@ static HAL_StatusTypeDef GatewayTx_Enqueue(const uint8_t *data, uint16_t len)
   }
 
   /*
-   * 协议核心只调用抽象接口，不依赖 USB、UART 或其他具体驱动。
+   * 协议核心只调用抽象接口，不依赖任何具体传输驱动。
    * 注意：send_packet() 的 OK 只表示“驱动已复制并接收该包”，不是物理
    * 线路发送完成；BUSY/ERROR 则表示本次调用没有接收该包。
    */
@@ -281,7 +281,7 @@ static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
   }
 
   /*
-   * 此函数只做“CAN 帧 -> AA55 协议帧”的封装并写入 USB TX 队列。
+   * 此函数只做“CAN 帧 -> AA55 协议帧”的封装并写入外部接口发送队列。
    * 它用于 CAN 接收上报、启动提示和状态提示；不会向 CAN 总线发送数据。
    */
   packet[0] = UART_FRAME_START_0;
@@ -353,7 +353,7 @@ static void CanRx_ProcessTransport(void)
   /*
    * 数据路径 2（CAN -> 上位机）的主循环阶段：
    * HAL_FDCAN_RxFifo0Callback() 已在中断中把 CAN 报文存入 can_rx_queue，
-   * 此处取出一帧，封装成 AA 55 ... CRC 55 AA，并交给 USB TX 队列。
+   * 此处取出一帧，封装成 AA 55 ... CRC 55 AA，并交给外部接口发送队列。
    * 每轮只处理一帧，避免 CAN 突发数据长期占用主循环。
    */
   if (can_rx_tail != can_rx_head)
@@ -376,8 +376,8 @@ static void CanTx_ProcessBus(void)
   uint16_t tail;
 
   /*
-   * 数据路径 1（USB -> CAN）的最终发送阶段：
-   * QueueCanTxFromPacket() 已把校验后的 USB 命令放入 can_tx_queue；
+   * 数据路径 1（外部接口 -> CAN）的最终发送阶段：
+   * QueueCanTxFromPacket() 已把校验后的命令放入 can_tx_queue；
    * 此处转换为 FDCAN 发送头，并写入 FDCAN1 的硬件 TX FIFO。
    * HAL_OK 仅代表写入硬件 FIFO 成功，不代表总线已得到 ACK。
    */
@@ -545,7 +545,7 @@ static void QueueCanTxFromPacket(const uint8_t *packet)
   uint16_t i;
 
   /*
-   * 数据路径 1（USB -> CAN）的协议转换点：
+   * 数据路径 1（外部接口 -> CAN）的协议转换点：
    * 输入 packet 已通过帧头、帧尾和 CRC 校验；这里读取 CAN_ID、FLAGS、LEN、DATA，
    * 校验 CAN 帧属性后写入 can_tx_queue。真正访问 FDCAN 硬件在 CanTx_ProcessBus()。
    */
@@ -623,8 +623,8 @@ static void UartParser_CommitPacket(void)
   uint8_t expected_crc;
 
   /*
-   * USB 收包完成后的分流点：先核对帧尾和 CRC，
-   * FLAGS.bit7=1 时作为本地配置命令处理；否则进入“USB -> CAN”路径。
+   * 一帧输入完成后的分流点：先核对帧尾和 CRC，
+   * FLAGS.bit7=1 时作为本地配置命令处理；否则进入“外部接口 -> CAN”路径。
    */
   crc_index = (uint8_t)(uart_rx_packet[2] + 3U);
   end_index = (uint8_t)(crc_index + 1U);
@@ -726,7 +726,7 @@ void CanGateway_RxFeed(const uint8_t *data, uint16_t len)
     return;
   }
 
-  /* USB CDC 在主循环调用此入口，复用原 AA55 协议状态机。 */
+  /* 接收驱动在主循环中调用此入口，复用统一 AA55 协议状态机。 */
   for (i = 0U; i < len; i++)
   {
     UartParser_PushByte(data[i]);
@@ -739,7 +739,8 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
   /*
    * 数据路径 2（CAN -> 上位机）的中断入口：
    * 从 FDCAN1 RX FIFO0 读出原始 CAN 帧，转换为 CanFrame_t 并写入 can_rx_queue。
-   * 中断中不直接调用 USB 发送，实际上报由 CanRx_ProcessUsb() 在主循环完成。
+   * 中断中不直接调用外部接口发送，实际上报由 CanRx_ProcessTransport()
+   * 在主循环完成。
    */
   if ((hfdcan == NULL) || (hfdcan->Instance != FDCAN1))
   {
@@ -808,8 +809,8 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
 /**
  * @brief 初始化 CAN 网关核心并注册电脑侧发送接口。
  *
- * 初始化顺序必须是：底层 HAL/HAL 时钟 -> MX_FDCAN1_Init() 与 USB 初始化
- * -> 本函数。函数首先检查并复制传输操作表，然后初始化 CRC 硬件、配置
+ * 初始化顺序必须是：底层 HAL/HAL 时钟 -> FDCAN 与外部接口初始化
+ * -> 本函数。函数首先检查并复制接口操作表，然后初始化 CRC 硬件、配置
  * FDCAN 接收过滤器/通知并启动 FDCAN，最后排入一帧上电测试协议包。
  */
 HAL_StatusTypeDef CanGateway_Init(const CanGatewayTransportOps_t *transport)
@@ -849,7 +850,7 @@ HAL_StatusTypeDef CanGateway_Init(const CanGatewayTransportOps_t *transport)
     return HAL_ERROR;
   }
 
-  /* 上电发送一帧标准 AA55 测试报文，验证 USB CDC TX 与 CAN 无关。 */
+  /* 上电发送一帧标准 AA55 测试报文，验证外部接口发送链路。 */
   Gateway_SendBootTestPacket();
   return HAL_OK;
 }
@@ -857,10 +858,10 @@ HAL_StatusTypeDef CanGateway_Init(const CanGatewayTransportOps_t *transport)
 /**
  * @brief 网关核心的一次主循环轮询。
  *
- * 本函数不直接读取 USB，而是处理已经通过 CanGateway_RxFeed() 进入解析器
- * 的电脑数据，并驱动 USB->CAN、CAN->USB 两条软件队列。建议在 while(1)
- * 中持续调用，不能只调用一次；函数本身不阻塞，适合与 USB 服务函数交替
- * 调度。
+ * 本函数不直接读取外部接口，而是处理已经通过 CanGateway_RxFeed() 进入
+ * 解析器的输入数据，并驱动“外部接口->CAN”和“CAN->外部接口”两条软件
+ * 队列。建议在 while(1) 中持续调用，不能只调用一次；函数本身不阻塞，
+ * 适合与传输层服务函数交替调度。
  */
 void CanGateway_Process(void)
 {
@@ -927,7 +928,7 @@ void CanGateway_Process(void)
     Gateway_SendConfigResponse();
   }
 
-  /* 将 CAN RX FIFO 中已接收的帧转发给 USB CDC。 */
+  /* 将 CAN RX FIFO 中已接收的帧转发给外部接口。 */
   CanRx_ProcessTransport();
 }
 
