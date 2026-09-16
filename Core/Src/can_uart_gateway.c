@@ -1,6 +1,6 @@
 #include "can_uart_gateway.h"
 #include "fdcan.h"
-#include "usart.h"
+#include "usb_can_gateway.h"
 
 typedef struct
 {
@@ -19,12 +19,6 @@ typedef struct
   uint32_t seg2;
 } CanBitTiming_t;
 
-typedef struct
-{
-  uint16_t len;
-  uint8_t data[78];
-} UartTxPacket_t;
-
 #define CAN_QUEUE_SIZE          64U
 #define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U)
 #define UART_PACKET_SIZE        78U
@@ -35,18 +29,6 @@ typedef struct
 #define UART_FRAME_START_1      0x55U
 #define UART_FRAME_END_0        0x55U
 #define UART_FRAME_END_1        0xAAU
-#define UART_RX_DMA_SIZE        256U
-#define UART_RX_RING_SIZE       1024U
-#define UART_RX_RING_MASK       (UART_RX_RING_SIZE - 1U)
-#define UART_TX_QUEUE_SIZE      16U
-#define UART_TX_QUEUE_MASK      (UART_TX_QUEUE_SIZE - 1U)
-
-_Static_assert((UART_RX_DMA_SIZE & (UART_RX_DMA_SIZE - 1U)) == 0U,
-               "UART RX DMA size must be a power of two");
-_Static_assert((UART_RX_RING_SIZE & (UART_RX_RING_SIZE - 1U)) == 0U,
-               "UART RX ring size must be a power of two");
-_Static_assert((UART_TX_QUEUE_SIZE & (UART_TX_QUEUE_SIZE - 1U)) == 0U,
-               "UART TX queue size must be a power of two");
 #define UART_BOOT_TEST_ID       0x7FFU
 #define UART_RX_STATUS_ID       0x7FEU
 #define CAN_PUT_STATUS_ID       0x7FDU
@@ -75,24 +57,9 @@ static CanFrame_t can_tx_queue[CAN_QUEUE_SIZE];
 static volatile uint16_t can_tx_head = 0U;
 static volatile uint16_t can_tx_tail = 0U;
 
-static uint8_t uart_rx_dma_buffer[UART_RX_DMA_SIZE]
-  __attribute__((section(".dma_buffer"), aligned(32)));
-static UartTxPacket_t uart_dma_tx_queue[UART_TX_QUEUE_SIZE]
-  __attribute__((section(".dma_buffer"), aligned(32)));
-
-static uint8_t uart_rx_ring[UART_RX_RING_SIZE];
-static volatile uint16_t uart_rx_ring_head = 0U;
-static volatile uint16_t uart_rx_ring_tail = 0U;
-static volatile uint16_t uart_rx_dma_last_pos = 0U;
-
 static uint8_t uart_rx_packet[UART_PACKET_SIZE];
 static uint8_t uart_rx_index = 0U;
 static uint8_t uart_rx_expected_size = 0U;
-static volatile uint8_t uart_rx_restart_pending = 0U;
-
-static volatile uint16_t uart_dma_tx_head = 0U;
-static volatile uint16_t uart_dma_tx_tail = 0U;
-static volatile uint8_t uart_dma_tx_busy = 0U;
 static uint16_t uart_tx_sequence = 0U;
 
 static volatile uint32_t can_rx_drop_count = 0U;
@@ -103,10 +70,7 @@ static volatile uint32_t can_tx_submit_count = 0U;
 static volatile uint32_t uart_valid_packet_count = 0U;
 static volatile uint32_t uart_crc_error_count = 0U;
 static volatile uint32_t uart_protocol_error_count = 0U;
-static volatile uint32_t uart_rx_error_count = 0U;
 static volatile uint32_t uart_tx_error_count = 0U;
-static volatile uint32_t uart_rx_ring_drop_count = 0U;
-static volatile uint32_t uart_tx_queue_drop_count = 0U;
 
 static volatile uint8_t bitrate_change_pending = 0U;
 static uint32_t pending_nominal_bps = 500000U;
@@ -272,57 +236,18 @@ static uint8_t CanFrame_Validate(const CanFrame_t *frame)
   return 1U;
 }
 
-static HAL_StatusTypeDef UartTx_Enqueue(const uint8_t *data, uint16_t len)
+static HAL_StatusTypeDef GatewayTx_Enqueue(const uint8_t *data, uint16_t len)
 {
-  uint16_t head;
-  uint16_t next;
-  uint16_t i;
-
   if ((data == NULL) || (len == 0U) || (len > UART_PACKET_SIZE))
   {
     return HAL_ERROR;
   }
 
-  head = uart_dma_tx_head;
-  next = (uint16_t)((head + 1U) & UART_TX_QUEUE_MASK);
-  if (next == uart_dma_tx_tail)
-  {
-    uart_tx_queue_drop_count++;
-    return HAL_BUSY;
-  }
-
-  uart_dma_tx_queue[head].len = len;
-  for (i = 0U; i < len; i++)
-  {
-    uart_dma_tx_queue[head].data[i] = data[i];
-  }
-  __DMB();
-  uart_dma_tx_head = next;
-  return HAL_OK;
+  /* CAN/状态协议包现在唯一通过 USB CDC 可靠队列发送。 */
+  return UsbCanGateway_TxEnqueue(data, len);
 }
 
-static void UartTx_Process(void)
-{
-  uint16_t tail;
-
-  if ((uart_dma_tx_busy != 0U) ||
-      (uart_dma_tx_tail == uart_dma_tx_head))
-  {
-    return;
-  }
-
-  tail = uart_dma_tx_tail;
-  uart_dma_tx_busy = 1U;
-  if (HAL_UART_Transmit_DMA(&huart1,
-                            uart_dma_tx_queue[tail].data,
-                            uart_dma_tx_queue[tail].len) != HAL_OK)
-  {
-    uart_dma_tx_busy = 0U;
-    uart_tx_error_count++;
-  }
-}
-
-static HAL_StatusTypeDef Uart_SendCanPacket(const CanFrame_t *frame)
+static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
 {
   uint8_t packet[UART_PACKET_SIZE];
   uint8_t crc_index;
@@ -335,7 +260,7 @@ static HAL_StatusTypeDef Uart_SendCanPacket(const CanFrame_t *frame)
   }
 
   /*
-   * 此函数只做“CAN 帧 -> 串口协议帧”的封装并写入串口 TX 队列。
+   * 此函数只做“CAN 帧 -> AA55 协议帧”的封装并写入 USB TX 队列。
    * 它用于 CAN 接收上报、启动提示和状态提示；不会向 CAN 总线发送数据。
    */
   packet[0] = UART_FRAME_START_0;
@@ -361,7 +286,7 @@ static HAL_StatusTypeDef Uart_SendCanPacket(const CanFrame_t *frame)
   packet[crc_index + 1U] = UART_FRAME_END_0;
   packet[crc_index + 2U] = UART_FRAME_END_1;
   packet_len = (uint16_t)crc_index + 3U;
-  if (UartTx_Enqueue(packet, packet_len) != HAL_OK)
+  if (GatewayTx_Enqueue(packet, packet_len) != HAL_OK)
   {
     uart_tx_error_count++;
     return HAL_ERROR;
@@ -371,7 +296,7 @@ static HAL_StatusTypeDef Uart_SendCanPacket(const CanFrame_t *frame)
   return HAL_OK;
 }
 
-static void Uart_SendBootTestPacket(void)
+static void Gateway_SendBootTestPacket(void)
 {
   CanFrame_t frame = {0};
 
@@ -385,10 +310,10 @@ static void Uart_SendBootTestPacket(void)
   frame.data[5] = 'T';
   frame.data[6] = 'X';
   frame.data[7] = '!';
-  (void)Uart_SendCanPacket(&frame);
+  (void)Gateway_SendCanPacket(&frame);
 }
 
-static void Uart_SendStatusPacket(uint32_t id, const char text[8])
+static void Gateway_SendStatusPacket(uint32_t id, const char text[8])
 {
   CanFrame_t frame = {0};
   uint8_t i;
@@ -399,15 +324,15 @@ static void Uart_SendStatusPacket(uint32_t id, const char text[8])
   {
     frame.data[i] = (uint8_t)text[i];
   }
-  (void)Uart_SendCanPacket(&frame);
+  (void)Gateway_SendCanPacket(&frame);
 }
 
-static void CanRx_ProcessUart(void)
+static void CanRx_ProcessUsb(void)
 {
   /*
    * 数据路径 2（CAN -> 上位机）的主循环阶段：
    * HAL_FDCAN_RxFifo0Callback() 已在中断中把 CAN 报文存入 can_rx_queue，
-   * 此处取出一帧，封装成 AA 55 ... CRC 55 AA，并交给 UART TX DMA。
+   * 此处取出一帧，封装成 AA 55 ... CRC 55 AA，并交给 USB TX 队列。
    * 每轮只处理一帧，避免 CAN 突发数据长期占用主循环。
    */
   if (can_rx_tail != can_rx_head)
@@ -415,7 +340,7 @@ static void CanRx_ProcessUart(void)
     uint16_t tail = can_rx_tail;
     CanFrame_t frame = can_rx_queue[tail];
 
-    (void)Uart_SendCanPacket(&frame);
+    (void)Gateway_SendCanPacket(&frame);
 
     __DMB();
     can_rx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
@@ -430,8 +355,8 @@ static void CanTx_ProcessBus(void)
   uint16_t tail;
 
   /*
-   * 数据路径 1（串口 -> CAN）的最终发送阶段：
-   * QueueCanTxFromPacket() 已把校验后的串口命令放入 can_tx_queue；
+   * 数据路径 1（USB -> CAN）的最终发送阶段：
+   * QueueCanTxFromPacket() 已把校验后的 USB 命令放入 can_tx_queue；
    * 此处转换为 FDCAN 发送头，并写入 FDCAN1 的硬件 TX FIFO。
    * HAL_OK 仅代表写入硬件 FIFO 成功，不代表总线已得到 ACK。
    */
@@ -566,7 +491,7 @@ static HAL_StatusTypeDef ApplyCanBitrate(uint32_t nominal_bps,
   return HAL_OK;
 }
 
-static void Uart_SendConfigResponse(void)
+static void Gateway_SendConfigResponse(void)
 {
   uint8_t packet[UART_PACKET_SIZE] = {0};
 
@@ -584,7 +509,7 @@ static void Uart_SendConfigResponse(void)
   packet[21] = UART_FRAME_END_0;
   packet[22] = UART_FRAME_END_1;
 
-  if (UartTx_Enqueue(packet, 23U) != HAL_OK)
+  if (GatewayTx_Enqueue(packet, 23U) != HAL_OK)
   {
     uart_tx_error_count++;
   }
@@ -599,7 +524,7 @@ static void QueueCanTxFromPacket(const uint8_t *packet)
   uint16_t i;
 
   /*
-   * 数据路径 1（串口 -> CAN）的协议转换点：
+   * 数据路径 1（USB -> CAN）的协议转换点：
    * 输入 packet 已通过帧头、帧尾和 CRC 校验；这里读取 CAN_ID、FLAGS、LEN、DATA，
    * 校验 CAN 帧属性后写入 can_tx_queue。真正访问 FDCAN 硬件在 CanTx_ProcessBus()。
    */
@@ -677,8 +602,8 @@ static void UartParser_CommitPacket(void)
   uint8_t expected_crc;
 
   /*
-   * 串口收包完成后的分流点：先核对帧尾和 CRC，
-   * FLAGS.bit7=1 时作为本地配置命令处理；否则进入“串口 -> CAN”路径。
+   * USB 收包完成后的分流点：先核对帧尾和 CRC，
+   * FLAGS.bit7=1 时作为本地配置命令处理；否则进入“USB -> CAN”路径。
    */
   crc_index = (uint8_t)(uart_rx_packet[2] + 3U);
   end_index = (uint8_t)(crc_index + 1U);
@@ -765,128 +690,19 @@ static void UartParser_PushByte(uint8_t byte)
   }
 }
 
-static void UartRxRing_Push(const uint8_t *data, uint16_t len)
+void CanUartGateway_ProtocolFeed(const uint8_t *data, uint16_t len)
 {
   uint16_t i;
 
-  for (i = 0U; i < len; i++)
-  {
-    uint16_t head = uart_rx_ring_head;
-    uint16_t next = (uint16_t)((head + 1U) & UART_RX_RING_MASK);
-    if (next == uart_rx_ring_tail)
-    {
-      uart_rx_ring_drop_count++;
-      break;
-    }
-    uart_rx_ring[head] = data[i];
-    __DMB();
-    uart_rx_ring_head = next;
-  }
-}
-
-static void UartRxDma_Consume(uint16_t pos, HAL_UART_RxEventTypeTypeDef event)
-{
-  uint16_t last = uart_rx_dma_last_pos;
-
-  if (pos > UART_RX_DMA_SIZE)
+  if ((data == NULL) || (len == 0U))
   {
     return;
   }
 
-  if (pos == UART_RX_DMA_SIZE)
+  /* USB CDC 在主循环调用此入口，复用原 AA55 协议状态机。 */
+  for (i = 0U; i < len; i++)
   {
-    if ((last != 0U) || (event == HAL_UART_RXEVENT_TC))
-    {
-      UartRxRing_Push(&uart_rx_dma_buffer[last],
-                      (uint16_t)(UART_RX_DMA_SIZE - last));
-    }
-    uart_rx_dma_last_pos = 0U;
-  }
-  else
-  {
-    if (pos > last)
-    {
-      UartRxRing_Push(&uart_rx_dma_buffer[last], (uint16_t)(pos - last));
-    }
-    else if (pos < last)
-    {
-      UartRxRing_Push(&uart_rx_dma_buffer[last],
-                      (uint16_t)(UART_RX_DMA_SIZE - last));
-      if (pos > 0U)
-      {
-        UartRxRing_Push(uart_rx_dma_buffer, pos);
-      }
-    }
-    uart_rx_dma_last_pos = pos;
-  }
-}
-
-static HAL_StatusTypeDef UartRxDma_Start(void)
-{
-  uart_rx_dma_last_pos = 0U;
-  if (HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_rx_dma_buffer,
-                                   UART_RX_DMA_SIZE) != HAL_OK)
-  {
-    uart_rx_error_count++;
-    return HAL_ERROR;
-  }
-  uart_rx_restart_pending = 0U;
-  return HAL_OK;
-}
-
-static void UartRx_Process(void)
-{
-  /*
-   * 串口 DMA 回调只负责把新字节放入 uart_rx_ring；
-   * 主循环在这里逐字节执行帧头、长度、CRC、帧尾解析，随后调用
-   * QueueCanTxFromPacket()，因此这是“串口原始字节 -> CAN 发送命令”的入口。
-   */
-  while (uart_rx_ring_tail != uart_rx_ring_head)
-  {
-    uint16_t tail = uart_rx_ring_tail;
-    __DMB();
-    uint8_t byte = uart_rx_ring[tail];
-    uart_rx_ring_tail = (uint16_t)((tail + 1U) & UART_RX_RING_MASK);
-    UartParser_PushByte(byte);
-  }
-}
-
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
-{
-  if ((huart != NULL) && (huart->Instance == USART1))
-  {
-    /* RX DMA 的 IDLE、半满、全满事件：将 DMA 缓冲的新增字节搬入软件环形缓冲。 */
-    UartRxDma_Consume(size, HAL_UARTEx_GetRxEventType(huart));
-  }
-}
-
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if ((huart != NULL) && (huart->Instance == USART1))
-  {
-    uart_dma_tx_tail = (uint16_t)((uart_dma_tx_tail + 1U) &
-                                  UART_TX_QUEUE_MASK);
-    __DMB();
-    uart_dma_tx_busy = 0U;
-  }
-}
-
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-  if ((huart != NULL) && (huart->Instance == USART1))
-  {
-    uart_rx_error_count++;
-    uart_rx_index = 0U;
-    uart_rx_expected_size = 0U;
-    uart_rx_restart_pending = 1U;
-    if ((uart_dma_tx_busy != 0U) &&
-        (huart->gState == HAL_UART_STATE_READY))
-    {
-      uart_dma_tx_tail = (uint16_t)((uart_dma_tx_tail + 1U) &
-                                    UART_TX_QUEUE_MASK);
-      uart_dma_tx_busy = 0U;
-      uart_tx_error_count++;
-    }
+    UartParser_PushByte(data[i]);
   }
 }
 
@@ -896,7 +712,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
   /*
    * 数据路径 2（CAN -> 上位机）的中断入口：
    * 从 FDCAN1 RX FIFO0 读出原始 CAN 帧，转换为 CanFrame_t 并写入 can_rx_queue。
-   * 中断中不直接调用串口 DMA，实际串口发送由 CanRx_ProcessUart() 在主循环完成。
+   * 中断中不直接调用 USB 发送，实际上报由 CanRx_ProcessUsb() 在主循环完成。
    */
   if ((hfdcan == NULL) || (hfdcan->Instance != FDCAN1))
   {
@@ -988,13 +804,8 @@ HAL_StatusTypeDef CanUartGateway_Init(void)
     return HAL_ERROR;
   }
 
-  if (UartRxDma_Start() != HAL_OK)
-  {
-    return HAL_ERROR;
-  }
-
-  /* A valid protocol frame on every reset proves UART TX independently of CAN traffic. */
-  Uart_SendBootTestPacket();
+  /* 上电发送一帧标准 AA55 测试报文，验证 USB CDC TX 与 CAN 无关。 */
+  Gateway_SendBootTestPacket();
   return HAL_OK;
 }
 
@@ -1006,15 +817,6 @@ void CanUartGateway_Process(void)
   static uint32_t reported_uart_crc_errors = 0U;
   static uint32_t reported_uart_protocol_errors = 0U;
   static uint32_t reported_can_tx_failures = 0U;
-
-  if (uart_rx_restart_pending != 0U)
-  {
-    (void)HAL_UART_AbortReceive(&huart1);
-    (void)UartRxDma_Start();
-  }
-
-  /* 路径 1：处理电脑发来的串口字节，得到待发送 CAN 帧。 */
-  UartRx_Process();
 
   if (bitrate_change_pending != 0U)
   {
@@ -1044,36 +846,34 @@ void CanUartGateway_Process(void)
   if (reported_uart_valid_packets != uart_valid_packet_count)
   {
     reported_uart_valid_packets = uart_valid_packet_count;
-    Uart_SendStatusPacket(UART_RX_STATUS_ID, "UART_RX!");
+    Gateway_SendStatusPacket(UART_RX_STATUS_ID, "USB_RX!!");
   }
   if (reported_can_tx_submits != can_tx_submit_count)
   {
     reported_can_tx_submits = can_tx_submit_count;
-    Uart_SendStatusPacket(CAN_PUT_STATUS_ID, "CAN_PUT!");
+    Gateway_SendStatusPacket(CAN_PUT_STATUS_ID, "CAN_PUT!");
   }
   if (reported_uart_crc_errors != uart_crc_error_count)
   {
     reported_uart_crc_errors = uart_crc_error_count;
-    Uart_SendStatusPacket(UART_CRC_ERROR_ID, "CRC_ERR!");
+    Gateway_SendStatusPacket(UART_CRC_ERROR_ID, "CRC_ERR!");
   }
   if (reported_uart_protocol_errors != uart_protocol_error_count)
   {
     reported_uart_protocol_errors = uart_protocol_error_count;
-    Uart_SendStatusPacket(UART_PROTOCOL_ERROR_ID, "PKT_ERR!");
+    Gateway_SendStatusPacket(UART_PROTOCOL_ERROR_ID, "PKT_ERR!");
   }
   if (reported_can_tx_failures != can_tx_fail_count)
   {
     reported_can_tx_failures = can_tx_fail_count;
-    Uart_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_FAIL");
+    Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_FAIL");
   }
 
   if (config_response_pending != 0U)
   {
-    Uart_SendConfigResponse();
+    Gateway_SendConfigResponse();
   }
 
-  /* 路径 2：将 CAN RX FIFO 中已接收的帧转发给电脑。 */
-  CanRx_ProcessUart();
-  /* 统一启动串口 TX DMA，发送路径 2 的 CAN 上报或本地状态提示。 */
-  UartTx_Process();
+  /* 将 CAN RX FIFO 中已接收的帧转发给 USB CDC。 */
+  CanRx_ProcessUsb();
 }

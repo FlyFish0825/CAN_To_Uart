@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "can_uart_gateway.h"
+#include "usb_can_gateway.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,7 +48,6 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -94,11 +94,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_FDCAN1_Init();
-  MX_USART1_UART_Init();
+  /* USB 设备初始化：枚举成功后，电脑端会出现一个虚拟串口（CDC）。 */
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
+  /* CAN 网关唯一的电脑接口为 USB CDC，UART 不再参与运行时通信。 */
   if (CanUartGateway_Init() != HAL_OK)
   {
     Error_Handler();
@@ -112,7 +112,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* CAN 网关主循环：USB CDC 是唯一电脑传输接口。 */
     CanUartGateway_Process();
+
+    /* USB CDC 负责 RX 字节队列和 TX 可靠队列，CAN 核心继续独立运行。 */
+    UsbCanGateway_Process();
   /* USER CODE END 3 */
 }
 }

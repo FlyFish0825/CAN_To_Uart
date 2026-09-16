@@ -23,6 +23,8 @@
 
 /* USER CODE BEGIN INCLUDE */
 
+#include "usb_can_gateway.h"
+
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -155,6 +157,7 @@ static int8_t CDC_Init_FS(void)
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
+  UsbCanGateway_OnConfigured();
   return (USBD_OK);
   /* USER CODE END 3 */
 }
@@ -261,7 +264,14 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
+  /* USB OUT 回调只搬字节到 8 KB 环形缓冲，不在中断中解析 AA55 协议。 */
+  if ((Buf != NULL) && (Len != NULL) && (*Len <= UINT16_MAX))
+  {
+    UsbCanGateway_RxPush(Buf, (uint16_t)*Len);
+  }
+
+  /* 重新提交 OUT 接收，使电脑可以继续发送下一包。 */
+  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, Buf);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
   /* USER CODE END 6 */
@@ -283,7 +293,17 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
-  if (hcdc->TxState != 0){
+
+  /* 电脑尚未完成 USB 枚举/配置时，CDC 类实例可能还没有创建。
+   * 此时直接访问 hcdc->TxState 会产生空指针异常，因此统一返回 BUSY，
+   * 让上层稍后再试；本测试不会在这里阻塞等待。 */
+  if ((hcdc == NULL) || (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED))
+  {
+    return USBD_BUSY;
+  }
+
+  if (hcdc->TxState != 0U)
+  {
     return USBD_BUSY;
   }
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
@@ -311,6 +331,8 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
+  /* 回调保持极轻，只推进 USB 可靠发送队列。 */
+  UsbCanGateway_TxComplete();
   /* USER CODE END 13 */
   return result;
 }
