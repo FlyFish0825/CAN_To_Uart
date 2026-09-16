@@ -26,7 +26,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "can_uart_gateway.h"
+#include "can_gateway_core.h"
 #include "usb_can_gateway.h"
 /* USER CODE END Includes */
 
@@ -98,8 +98,16 @@ int main(void)
   /* USB 设备初始化：枚举成功后，电脑端会出现一个虚拟串口（CDC）。 */
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
+  /*
+   * 注册电脑侧传输驱动：
+   *   1. UsbCanGateway_GetTransport() 返回 USB CDC 的函数指针表；
+   *   2. CanGateway_Init() 只保存这组抽象接口，不直接依赖 USB 实现；
+   *   3. 以后改用 UART/TCP 时，替换这里传入的操作表即可，协议核心无需改动。
+   * USB CDC 的底层接收回调和发送完成回调会在后续运行过程中持续更新
+   * USB 队列，网关核心则通过下面的主循环完成协议和 CAN 处理。
+   */
   /* CAN 网关唯一的电脑接口为 USB CDC，UART 不再参与运行时通信。 */
-  if (CanUartGateway_Init() != HAL_OK)
+  if (CanGateway_Init(UsbCanGateway_GetTransport()) != HAL_OK)
   {
     Error_Handler();
   }
@@ -112,10 +120,16 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* CAN 网关主循环：USB CDC 是唯一电脑传输接口。 */
-    CanUartGateway_Process();
+    /*
+     * 第一步运行协议/CAN 核心：处理已解析的电脑命令、发送 CAN 帧、封装
+     * CAN 接收帧和状态回复。该层只通过函数指针请求“向电脑发送”。
+     */
+    CanGateway_Process();
 
-    /* USB CDC 负责 RX 字节队列和 TX 可靠队列，CAN 核心继续独立运行。 */
+    /*
+     * 第二步运行 USB 传输层：搬运 RX 环形缓冲中的字节、启动一个 USB TX
+     * 包。USB 完成回调只释放队列槽位，整个发送过程保持非阻塞。
+     */
     UsbCanGateway_Process();
   /* USER CODE END 3 */
 }
