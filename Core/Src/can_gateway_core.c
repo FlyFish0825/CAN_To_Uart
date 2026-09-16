@@ -931,17 +931,3 @@ void CanGateway_Process(void)
   /* 将 CAN RX FIFO 中已接收的帧转发给外部接口。 */
   CanRx_ProcessTransport();
 }
-
-/*
- * 兼容旧工程入口；新应用应直接调用 CanGateway_*。
- * 这两个包装函数只做名称转发，不改变协议行为，便于旧业务代码平滑迁移。
- */
-void CanUartGateway_Process(void)
-{
-  CanGateway_Process();
-}
-
-void CanUartGateway_ProtocolFeed(const uint8_t *data, uint16_t len)
-{
-  CanGateway_RxFeed(data, len);
-}

@@ -1,12 +1,12 @@
-# STM32H750 CAN / UART 网关使用说明
+# STM32H750 CAN / USB CDC 网关使用说明
 
-本项目通过 USART1 接收电脑命令，将 CAN 帧提交到 FDCAN1；也包含 CAN 接收转串口功能。当前采用帧头、长度、CRC、帧尾协议，以及 UART DMA 和循环缓冲区。
+本项目通过 USB CDC 虚拟串口接收电脑命令，将 CAN 帧提交到 FDCAN1；同时将 CAN 接收帧封装后返回电脑。当前采用帧头、长度、CRC、帧尾协议，以及 USB 接收/发送队列和循环缓冲区。UART 外设文件仍可能由 CubeMX 保留，但不属于 CAN 网关运行时通信路径。
 
 ## 1. 快速上手
 
-1. 编译并烧录本项目固件，按下表连接 USB 转串口模块与板卡，双方共地。
-2. 串口助手设置为 **921600、8 数据位、无校验、1 停止位、无流控**，发送与接收均选择 **Hex**，发送时选择“无追加”（不加换行）。
-3. 板卡复位后会通过串口输出 `UART_TX!` 启动提示。该提示不发送到 CAN 总线。
+1. 编译并烧录本项目固件，使用 USB 数据线连接板卡与电脑。
+2. 电脑端打开枚举出来的 USB CDC 虚拟串口，发送与接收均选择 **Hex**，发送时选择“无追加”（不加换行）。USB CDC 不需要配置波特率、校验位或停止位。
+3. 板卡复位后会通过 USB CDC 输出启动提示。该提示不发送到 CAN 总线。
 4. 将下面完整的 22 字节复制到发送框，单击发送：
 
 ```text
@@ -15,20 +15,19 @@ AA 55 10 01 00 23 01 00 00 00 08 11 22 33 44 55 66 77 88 BC 55 AA
 
 这条命令发送标准经典 CAN 数据帧：ID 为 `0x123`，8 字节数据为 `11 22 33 44 55 66 77 88`，默认 CAN 速率为 **500 kbit/s**。
 
-低速手动单次测试通常会看到 `UART_RX!` 和 `CAN_PUT!` 两条状态。它们证明串口解析、软件入队和硬件 FIFO 提交已执行，**不能证明物理总线发送成功或其他节点收到数据**。
+低速手动单次测试通常会看到输入确认和 `CAN_PUT!` 两条状态。它们证明协议解析、软件入队和硬件 FIFO 提交已执行，**不能证明物理总线发送成功或其他节点收到数据**。
 
 ## 2. 接线与默认配置
 
 | 接口 | MCU 引脚 | 接法 / 用途 |
 | --- | --- | --- |
-| USART1 TX | PA9 | 接 USB 转串口模块 RX，3.3 V TTL 电平 |
-| USART1 RX | PA10 | 接 USB 转串口模块 TX，3.3 V TTL 电平 |
-| GND | GND | 板卡与串口模块共地 |
+| USB | USB 接口 | 连接电脑，枚举为 USB CDC 虚拟串口 |
+| GND | GND | 板卡与电脑共地（由 USB 线提供） |
 | FDCAN1 TX | PD1 | MCU 到 CAN 收发器 TXD |
 | FDCAN1 RX | PD0 | CAN 收发器 RXD 到 MCU |
 | CANH / CANL | 收发器总线侧 | 接 CAN 总线，不能接 TTL 串口 |
 
-本固件使用 USART1，不提供 USB CDC 虚拟串口功能；不能把板上原生 USB 接口直接当成这里的串口。请根据实际板卡原理图确认连接器引脚。
+本固件使用 USB CDC 虚拟串口作为电脑接口，不需要外接 USB 转串口模块，也不需要配置传统串口波特率。请根据实际板卡原理图确认 USB 接口连接和供电。
 
 FDCAN 内核时钟配置为 80 MHz；默认仲裁段 500 kbit/s、FD 数据段 5 Mbit/s。工作模式为 Normal，自动重发关闭。经典 CAN 帧不使用 FD 数据段速率。支持 FD 报文的软件配置不等于板卡收发器及布线已通过对应高速验证。
 
@@ -386,8 +385,9 @@ cmake --build --preset Release --parallel
 
 | 文件 | 维护内容 |
 | --- | --- |
-| Core/Src/can_uart_gateway.c | 协议、CRC、环形队列、CAN 转发、状态与速率命令 |
-| Core/Inc/can_uart_gateway.h | 网关接口与协议概述 |
+| Core/Src/can_gateway_core.c | 协议、CRC、环形队列、CAN 转发、状态与速率命令 |
+| Core/Inc/can_gateway_core.h | 核心函数指针接口、初始化、轮询和输入入口 |
+| Core/Inc/can_gateway_protocol.h | AA55 协议字段和数据格式说明 |
 | Core/Src/main.c | 网关初始化及主循环调用 |
 | Core/Src/usart.c | USART1 参数及 RX/TX DMA 初始化 |
 | Core/Src/stm32h7xx_it.c | USART1 和 DMA 中断入口 |
@@ -398,7 +398,7 @@ cmake --build --preset Release --parallel
 
 RX 使用 DMA1 Stream0 循环模式，256 字节 DMA 缓冲，通过 IDLE、半满和全满事件搬入软件环形缓冲。软件环形缓冲分配 1024 字节、可用 1023 字节。TX 使用 DMA1 Stream1 普通模式，16 个队列槽、可用 15 个。CAN 收发软件队列各 64 槽、可用 63 帧；CAN 硬件 TX FIFO 为 3 帧。
 
-DMA 缓冲区位于 D2 SRAM，32 字节对齐，避免落入 DMA1 不可访问的 DTCM。当前未启用 D-Cache；后续启用时必须处理 DMA 缓存一致性（非缓存区或正确的缓存维护），仅地址对齐并不足够。保持主循环持续调用 CanUartGateway_Process，避免加入长时间阻塞操作。
+DMA 缓冲区位于 D2 SRAM，32 字节对齐，避免落入 DMA1 不可访问的 DTCM。当前未启用 D-Cache；后续启用时必须处理 DMA 缓存一致性（非缓存区或正确的缓存维护），仅地址对齐并不足够。保持主循环持续调用 CanGateway_Process 和传输层服务函数，避免加入长时间阻塞操作。
 
 CubeMX 再生成代码后检查 DMA 初始化顺序、中断入口、链接脚本 .dma_buffer 和 CMake 网关源文件条目；当前再生成流程未验证，不能仅凭 .ioc 存在就认为自定义内容一定保留。
 

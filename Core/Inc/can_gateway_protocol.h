@@ -1,5 +1,5 @@
-#ifndef __CAN_UART_GATEWAY_H__
-#define __CAN_UART_GATEWAY_H__
+#ifndef __CAN_GATEWAY_PROTOCOL_H__
+#define __CAN_GATEWAY_PROTOCOL_H__
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,24 +35,8 @@ extern "C" {
  * 业务代码只需注册接口并调用统一入口，不要直接访问具体传输驱动。
  */
 
-/**
- * @brief 旧工程主循环入口的兼容包装函数。
- *
- * 新代码应调用 CanGateway_Process()。保留本声明是为了让尚未迁移的旧
- * 模块继续编译；实现只转发到新核心，不会创建第二套协议状态机。
- */
-void CanUartGateway_Process(void);
-
-/**
- * @brief 旧工程协议输入入口的兼容包装函数。
- *
- * 新传输驱动应调用 CanGateway_RxFeed()。data 可以是半帧、整帧或粘包，
- * len 是本次输入的实际字节数；实现只转发到统一 AA55 解析器。
- */
-void CanUartGateway_ProtocolFeed(const uint8_t *data, uint16_t len);
-
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __CAN_UART_GATEWAY_H__ */
+#endif /* __CAN_GATEWAY_PROTOCOL_H__ */

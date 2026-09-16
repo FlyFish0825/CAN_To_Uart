@@ -44,7 +44,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    Core/Src/can_uart_gateway.c
+    Core/Src/can_gateway_core.c
     Core/Src/usb_can_gateway.c
 )
 
