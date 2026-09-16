@@ -348,7 +348,7 @@ static void Gateway_SendStatusPacket(uint32_t id, const char text[8])
   (void)Gateway_SendCanPacket(&frame);
 }
 
-static void CanRx_ProcessUsb(void)
+static void CanRx_ProcessTransport(void)
 {
   /*
    * 数据路径 2（CAN -> 上位机）的主循环阶段：
@@ -928,7 +928,7 @@ void CanGateway_Process(void)
   }
 
   /* 将 CAN RX FIFO 中已接收的帧转发给 USB CDC。 */
-  CanRx_ProcessUsb();
+  CanRx_ProcessTransport();
 }
 
 /*
