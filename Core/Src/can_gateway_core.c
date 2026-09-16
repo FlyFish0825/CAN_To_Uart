@@ -20,6 +20,11 @@ typedef struct
 
 #define CAN_QUEUE_SIZE          64U
 #define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U)
+/*
+ * AA55 协议长度常量：完整固定缓冲区最大 78 字节；BODY_LEN 包含 SEQ、
+ * CAN_ID、FLAGS、LEN 和 DATA，不包含帧头、CRC、帧尾；完整帧总长为
+ * BODY_LEN + 6。普通数据帧的 BODY_LEN 范围为 8..72。
+ */
 #define UART_PACKET_SIZE        78U
 #define UART_PACKET_BODY_LEN    72U
 #define UART_PACKET_MIN_BODY_LEN 8U
@@ -48,20 +53,36 @@ typedef struct
 #define UART_CFG_OK             0x00U
 #define UART_CFG_BAD_RATE       0x01U
 #define UART_CFG_APPLY_FAILED   0x02U
+/* CAN 接收软件队列：中断负责写入，主循环负责取出并封装上报。 */
 static CanFrame_t can_rx_queue[CAN_QUEUE_SIZE];
 static volatile uint16_t can_rx_head = 0U;
 static volatile uint16_t can_rx_tail = 0U;
 
+/* CAN 发送软件队列：协议解析后写入，主循环再提交给 FDCAN 硬件 FIFO。 */
 static CanFrame_t can_tx_queue[CAN_QUEUE_SIZE];
 static volatile uint16_t can_tx_head = 0U;
 static volatile uint16_t can_tx_tail = 0U;
 
+/*
+ * 协议接收状态：
+ * - uart_rx_packet：保存当前正在接收的完整协议帧；
+ * - uart_rx_index：下一个待写入的位置，同时表示解析阶段；
+ *   0=等待第一个帧头字节，1=已收到 AA、等待 55，2=等待 BODY_LEN，
+ *   >=3=正在接收 BODY/CRC/帧尾；
+ * - uart_rx_expected_size：收到 BODY_LEN 后计算出的完整帧总字节数，
+ *   等于 BODY_LEN+6，用于判断何时调用提交函数；
+ * - uart_tx_sequence：输出协议帧使用的 16 位序号，每发送一帧递增。
+ */
 static uint8_t uart_rx_packet[UART_PACKET_SIZE];
 static uint8_t uart_rx_index = 0U;
 static uint8_t uart_rx_expected_size = 0U;
 static uint16_t uart_tx_sequence = 0U;
 static CanGatewayTransportOps_t gateway_transport = {0};
 
+/*
+ * 运行统计计数。计数只用于诊断，不参与协议状态机；声明为 volatile，
+ * 便于调试器或异步上下文观察最新值。
+ */
 static volatile uint32_t can_rx_drop_count = 0U;
 static volatile uint32_t can_rx_hw_lost_count = 0U;
 static volatile uint32_t can_tx_drop_count = 0U;
@@ -616,6 +637,17 @@ static void HandleControlPacket(const uint8_t *packet)
   bitrate_change_pending = 1U;
 }
 
+/**
+ * @brief 提交一帧已按 BODY_LEN 收齐的协议数据。
+ *
+ * 函数调用前，uart_rx_packet 中已经包含帧头、BODY、CRC 和帧尾，
+ * uart_rx_expected_size 也已经由 BODY_LEN 计算完成。函数按以下顺序处理：
+ * 1. 检查帧尾，确认长度字段没有导致越界或错位；
+ * 2. 计算并比较 CRC8-ATM，拒绝内容损坏的帧；
+ * 3. 根据 FLAGS.bit7 分流到配置命令或“外部接口 -> CAN”数据队列。
+ *
+ * 校验失败时只增加对应错误计数并返回，不会把不完整数据送入 CAN 队列。
+ */
 static void UartParser_CommitPacket(void)
 {
   uint8_t crc_index;
@@ -653,8 +685,18 @@ static void UartParser_CommitPacket(void)
   }
 }
 
+/**
+ * @brief 向 AA55 协议状态机输入一个字节。
+ *
+ * 这是一个可跨调用保存状态的字节级解析器，适用于输入被拆成半帧、
+ * 一帧或多帧粘包的情况。解析状态由 uart_rx_index 表示：函数每次只消费
+ * 当前 byte，不等待更多数据；只有收齐 BODY_LEN+6 字节后才提交整帧。
+ * 当帧头或长度非法时，立即回到寻找 AA 55 的状态，保证后续数据可以重新
+ * 对齐，而不会因为一个坏字节永久卡在错误位置。
+ */
 static void UartParser_PushByte(uint8_t byte)
 {
+  /* 状态 0：尚未进入一帧，只接受 AA 作为候选帧头。 */
   if (uart_rx_index == 0U)
   {
     if (byte == UART_FRAME_START_0)
@@ -665,6 +707,11 @@ static void UartParser_PushByte(uint8_t byte)
     return;
   }
 
+  /*
+   * 状态 1：已经收到 AA。
+   * 收到 55 才确认帧头；如果再次收到 AA，则保留它作为新的帧头候选，
+   * 这样可以正确处理 AA AA 55 这种连续输入。
+   */
   if (uart_rx_index == 1U)
   {
     if (byte == UART_FRAME_START_1)
@@ -680,6 +727,11 @@ static void UartParser_PushByte(uint8_t byte)
     return;
   }
 
+  /*
+   * 状态 2：读取 BODY_LEN 并检查范围。
+   * 一旦长度合法，就能提前计算整帧总长度 BODY_LEN+6，后续不依赖固定
+   * 的 USB/接口分包大小，只按协议长度收齐数据。
+   */
   if (uart_rx_index == 2U)
   {
     if ((byte < UART_PACKET_MIN_BODY_LEN) ||
@@ -696,6 +748,7 @@ static void UartParser_PushByte(uint8_t byte)
     return;
   }
 
+  /* 状态 >=3：按已知总长度保存后续字节，直到形成一帧完整协议数据。 */
   if (uart_rx_index < UART_PACKET_SIZE)
   {
     uart_rx_packet[uart_rx_index] = byte;
