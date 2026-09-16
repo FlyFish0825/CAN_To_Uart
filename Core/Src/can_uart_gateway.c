@@ -1,6 +1,5 @@
-#include "can_uart_gateway.h"
+#include "can_gateway_core.h"
 #include "fdcan.h"
-#include "usb_can_gateway.h"
 
 typedef struct
 {
@@ -61,6 +60,7 @@ static uint8_t uart_rx_packet[UART_PACKET_SIZE];
 static uint8_t uart_rx_index = 0U;
 static uint8_t uart_rx_expected_size = 0U;
 static uint16_t uart_tx_sequence = 0U;
+static CanGatewayTransportOps_t gateway_transport = {0};
 
 static volatile uint32_t can_rx_drop_count = 0U;
 static volatile uint32_t can_rx_hw_lost_count = 0U;
@@ -238,13 +238,34 @@ static uint8_t CanFrame_Validate(const CanFrame_t *frame)
 
 static HAL_StatusTypeDef GatewayTx_Enqueue(const uint8_t *data, uint16_t len)
 {
+  CanGatewayIoResult_t result;
+
   if ((data == NULL) || (len == 0U) || (len > UART_PACKET_SIZE))
   {
     return HAL_ERROR;
   }
 
-  /* CAN/状态协议包现在唯一通过 USB CDC 可靠队列发送。 */
-  return UsbCanGateway_TxEnqueue(data, len);
+  if (gateway_transport.send_packet == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  /*
+   * 协议核心只调用抽象接口，不依赖 USB、UART 或其他具体驱动。
+   * 注意：send_packet() 的 OK 只表示“驱动已复制并接收该包”，不是物理
+   * 线路发送完成；BUSY/ERROR 则表示本次调用没有接收该包。
+   */
+  result = gateway_transport.send_packet(gateway_transport.context,
+                                         data, len);
+  if (result == CAN_GATEWAY_IO_OK)
+  {
+    return HAL_OK;
+  }
+  if (result == CAN_GATEWAY_IO_BUSY)
+  {
+    return HAL_BUSY;
+  }
+  return HAL_ERROR;
 }
 
 static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
@@ -690,7 +711,13 @@ static void UartParser_PushByte(uint8_t byte)
   }
 }
 
-void CanUartGateway_ProtocolFeed(const uint8_t *data, uint16_t len)
+/**
+ * @brief 向协议状态机输入电脑侧字节流。
+ *
+ * 传输层可以按任意粒度调用本函数。这里不假设 data 是完整协议帧，而是
+ * 逐字节推进 AA55 状态机；状态机会在多次调用之间保留当前帧的半包状态。
+ */
+void CanGateway_RxFeed(const uint8_t *data, uint16_t len)
 {
   uint16_t i;
 
@@ -778,8 +805,26 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
   }
 }
 
-HAL_StatusTypeDef CanUartGateway_Init(void)
+/**
+ * @brief 初始化 CAN 网关核心并注册电脑侧发送接口。
+ *
+ * 初始化顺序必须是：底层 HAL/HAL 时钟 -> MX_FDCAN1_Init() 与 USB 初始化
+ * -> 本函数。函数首先检查并复制传输操作表，然后初始化 CRC 硬件、配置
+ * FDCAN 接收过滤器/通知并启动 FDCAN，最后排入一帧上电测试协议包。
+ */
+HAL_StatusTypeDef CanGateway_Init(const CanGatewayTransportOps_t *transport)
 {
+  if ((transport == NULL) || (transport->send_packet == NULL))
+  {
+    return HAL_ERROR;
+  }
+
+  /*
+   * 复制接口内容，调用方不需要保证 transport 结构体本身长期有效；但
+   * transport->context（如果非 NULL）指向的实例必须在网关运行期间有效。
+   */
+  gateway_transport = *transport;
+
   Crc8Hw_Init();
 
   if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,
@@ -809,7 +854,15 @@ HAL_StatusTypeDef CanUartGateway_Init(void)
   return HAL_OK;
 }
 
-void CanUartGateway_Process(void)
+/**
+ * @brief 网关核心的一次主循环轮询。
+ *
+ * 本函数不直接读取 USB，而是处理已经通过 CanGateway_RxFeed() 进入解析器
+ * 的电脑数据，并驱动 USB->CAN、CAN->USB 两条软件队列。建议在 while(1)
+ * 中持续调用，不能只调用一次；函数本身不阻塞，适合与 USB 服务函数交替
+ * 调度。
+ */
+void CanGateway_Process(void)
 {
   uint8_t i;
   static uint32_t reported_uart_valid_packets = 0U;
@@ -876,4 +929,18 @@ void CanUartGateway_Process(void)
 
   /* 将 CAN RX FIFO 中已接收的帧转发给 USB CDC。 */
   CanRx_ProcessUsb();
+}
+
+/*
+ * 兼容旧工程入口；新应用应直接调用 CanGateway_*。
+ * 这两个包装函数只做名称转发，不改变协议行为，便于旧业务代码平滑迁移。
+ */
+void CanUartGateway_Process(void)
+{
+  CanGateway_Process();
+}
+
+void CanUartGateway_ProtocolFeed(const uint8_t *data, uint16_t len)
+{
+  CanGateway_RxFeed(data, len);
 }
