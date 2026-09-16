@@ -18,6 +18,18 @@ typedef struct
   uint32_t seg2;
 } CanBitTiming_t;
 
+/*
+ * AA55 协议解析状态。使用枚举而不是用 0/1/2 等数字表示状态，便于阅读
+ * 和维护；每个枚举值都对应接收流程中的一个明确阶段。
+ */
+typedef enum
+{
+  GATEWAY_PARSER_WAIT_START_0 = 0U, /* 等待第一个帧头字节 AA */
+  GATEWAY_PARSER_WAIT_START_1,      /* 已收到 AA，等待第二个帧头字节 55 */
+  GATEWAY_PARSER_WAIT_BODY_LEN,     /* 帧头完成，等待 BODY_LEN */
+  GATEWAY_PARSER_READ_BODY          /* 已知总长度，接收剩余字段 */
+} GatewayParserState_t;
+
 #define CAN_QUEUE_SIZE          64U
 #define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U)
 /*
@@ -66,9 +78,8 @@ static volatile uint16_t can_tx_tail = 0U;
 /*
  * 协议接收状态：
  * - uart_rx_packet：保存当前正在接收的完整协议帧；
- * - uart_rx_index：下一个待写入的位置，同时表示解析阶段；
- *   0=等待第一个帧头字节，1=已收到 AA、等待 55，2=等待 BODY_LEN，
- *   >=3=正在接收 BODY/CRC/帧尾；
+ * - gateway_parser_state：当前解析阶段，由 GatewayParserState_t 枚举表示；
+ * - uart_rx_index：当前帧缓存的下一个待写入位置，不再承担状态含义；
  * - uart_rx_expected_size：收到 BODY_LEN 后计算出的完整帧总字节数，
  *   等于 BODY_LEN+6，用于判断何时调用提交函数；
  * - uart_tx_sequence：输出协议帧使用的 16 位序号，每发送一帧递增。
@@ -78,6 +89,7 @@ static uint8_t uart_rx_index = 0U;
 static uint8_t uart_rx_expected_size = 0U;
 static uint16_t uart_tx_sequence = 0U;
 static CanGatewayTransportOps_t gateway_transport = {0};
+static GatewayParserState_t gateway_parser_state = GATEWAY_PARSER_WAIT_START_0;
 
 /*
  * 运行统计计数。计数只用于诊断，不参与协议状态机；声明为 volatile，
@@ -689,78 +701,106 @@ static void UartParser_CommitPacket(void)
  * @brief 向 AA55 协议状态机输入一个字节。
  *
  * 这是一个可跨调用保存状态的字节级解析器，适用于输入被拆成半帧、
- * 一帧或多帧粘包的情况。解析状态由 uart_rx_index 表示：函数每次只消费
- * 当前 byte，不等待更多数据；只有收齐 BODY_LEN+6 字节后才提交整帧。
+ * 一帧或多帧粘包的情况。解析状态由 gateway_parser_state 表示，缓存写入
+ * 位置由 uart_rx_index 表示；函数每次只消费当前 byte，不等待更多数据，
+ * 只有收齐 BODY_LEN+6 字节后才提交整帧。
  * 当帧头或长度非法时，立即回到寻找 AA 55 的状态，保证后续数据可以重新
  * 对齐，而不会因为一个坏字节永久卡在错误位置。
  */
 static void UartParser_PushByte(uint8_t byte)
 {
-  /* 状态 0：尚未进入一帧，只接受 AA 作为候选帧头。 */
-  if (uart_rx_index == 0U)
+  switch (gateway_parser_state)
   {
-    if (byte == UART_FRAME_START_0)
-    {
-      uart_rx_packet[0] = byte;
-      uart_rx_index = 1U;
-    }
-    return;
-  }
+    case GATEWAY_PARSER_WAIT_START_0:
+      /* 还没有进入一帧，只接受 AA 作为帧头候选。 */
+      if (byte == UART_FRAME_START_0)
+      {
+        uart_rx_packet[0] = byte;
+        uart_rx_index = 1U;
+        gateway_parser_state = GATEWAY_PARSER_WAIT_START_1;
+      }
+      break;
 
-  /*
-   * 状态 1：已经收到 AA。
-   * 收到 55 才确认帧头；如果再次收到 AA，则保留它作为新的帧头候选，
-   * 这样可以正确处理 AA AA 55 这种连续输入。
-   */
-  if (uart_rx_index == 1U)
-  {
-    if (byte == UART_FRAME_START_1)
-    {
-      uart_rx_packet[1] = byte;
-      uart_rx_index = 2U;
-    }
-    else
-    {
-      uart_rx_index = (byte == UART_FRAME_START_0) ? 1U : 0U;
-      if (uart_rx_index == 1U) uart_rx_packet[0] = UART_FRAME_START_0;
-    }
-    return;
-  }
+    case GATEWAY_PARSER_WAIT_START_1:
+      /*
+       * 已收到 AA，只有继续收到 55 才确认帧头。
+       * 如果当前字节仍是 AA，则把它作为新的帧头候选，支持 AA AA 55
+       * 这种连续输入；其他字节则回到等待 AA 状态。
+       */
+      if (byte == UART_FRAME_START_1)
+      {
+        uart_rx_packet[1] = byte;
+        uart_rx_index = 2U;
+        gateway_parser_state = GATEWAY_PARSER_WAIT_BODY_LEN;
+      }
+      else if (byte == UART_FRAME_START_0)
+      {
+        uart_rx_packet[0] = UART_FRAME_START_0;
+        uart_rx_index = 1U;
+        gateway_parser_state = GATEWAY_PARSER_WAIT_START_1;
+      }
+      else
+      {
+        uart_rx_index = 0U;
+        gateway_parser_state = GATEWAY_PARSER_WAIT_START_0;
+      }
+      break;
 
-  /*
-   * 状态 2：读取 BODY_LEN 并检查范围。
-   * 一旦长度合法，就能提前计算整帧总长度 BODY_LEN+6，后续不依赖固定
-   * 的 USB/接口分包大小，只按协议长度收齐数据。
-   */
-  if (uart_rx_index == 2U)
-  {
-    if ((byte < UART_PACKET_MIN_BODY_LEN) ||
-        (byte > UART_PACKET_BODY_LEN))
-    {
-      uart_protocol_error_count++;
-      uart_rx_index = (byte == UART_FRAME_START_0) ? 1U : 0U;
-      if (uart_rx_index == 1U) uart_rx_packet[0] = UART_FRAME_START_0;
-      return;
-    }
-    uart_rx_packet[2] = byte;
-    uart_rx_index = 3U;
-    uart_rx_expected_size = (uint8_t)(byte + 6U);
-    return;
-  }
+    case GATEWAY_PARSER_WAIT_BODY_LEN:
+      /*
+       * 读取 BODY_LEN 并检查范围。长度合法后计算完整帧总长度 BODY_LEN+6，
+       * 后续只按协议长度接收，不依赖底层接口的分包大小。
+       */
+      if ((byte < UART_PACKET_MIN_BODY_LEN) ||
+          (byte > UART_PACKET_BODY_LEN))
+      {
+        uart_protocol_error_count++;
+        if (byte == UART_FRAME_START_0)
+        {
+          uart_rx_packet[0] = UART_FRAME_START_0;
+          uart_rx_index = 1U;
+          gateway_parser_state = GATEWAY_PARSER_WAIT_START_1;
+        }
+        else
+        {
+          uart_rx_index = 0U;
+          gateway_parser_state = GATEWAY_PARSER_WAIT_START_0;
+        }
+      }
+      else
+      {
+        uart_rx_packet[2] = byte;
+        uart_rx_index = 3U;
+        uart_rx_expected_size = (uint8_t)(byte + 6U);
+        gateway_parser_state = GATEWAY_PARSER_READ_BODY;
+      }
+      break;
 
-  /* 状态 >=3：按已知总长度保存后续字节，直到形成一帧完整协议数据。 */
-  if (uart_rx_index < UART_PACKET_SIZE)
-  {
-    uart_rx_packet[uart_rx_index] = byte;
-    uart_rx_index++;
-  }
+    case GATEWAY_PARSER_READ_BODY:
+      /* 已知完整帧长度，依次保存 BODY、CRC 和帧尾字节。 */
+      if (uart_rx_index < UART_PACKET_SIZE)
+      {
+        uart_rx_packet[uart_rx_index] = byte;
+        uart_rx_index++;
+      }
 
-  if ((uart_rx_expected_size != 0U) &&
-      (uart_rx_index >= uart_rx_expected_size))
-  {
-    UartParser_CommitPacket();
-    uart_rx_index = 0U;
-    uart_rx_expected_size = 0U;
+      /* 收齐整帧后校验并分流，然后回到下一帧的帧头搜索状态。 */
+      if ((uart_rx_expected_size != 0U) &&
+          (uart_rx_index >= uart_rx_expected_size))
+      {
+        UartParser_CommitPacket();
+        uart_rx_index = 0U;
+        uart_rx_expected_size = 0U;
+        gateway_parser_state = GATEWAY_PARSER_WAIT_START_0;
+      }
+      break;
+
+    default:
+      /* 防御性处理：状态异常时清空当前帧并重新寻找帧头。 */
+      uart_rx_index = 0U;
+      uart_rx_expected_size = 0U;
+      gateway_parser_state = GATEWAY_PARSER_WAIT_START_0;
+      break;
   }
 }
 
