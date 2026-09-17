@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include "can_gateway_core.h"
+#include "system_heartbeat.h"
 
 /*
  * USB CDC 只是字节传输层，协议仍沿用现有 AA 55 CAN 网关格式。
@@ -51,6 +52,14 @@ void UsbCanGateway_Process(void);
  * 另一份具有相同 CanGatewayTransportOps_t 类型的操作表。
  */
 const CanGatewayTransportOps_t *UsbCanGateway_GetTransport(void);
+
+/**
+ * @brief 获取同一外部传输队列的系统心跳适配器。
+ *
+ * 心跳使用独立的 AA58 System 协议，但仍复用本模块提供的可靠发送队列；
+ * 该函数返回的接口与 CAN 网关核心接口相互独立。
+ */
+const SystemHeartbeatTransportOps_t *UsbCanGateway_GetSystemTransport(void);
 
 /**
  * @brief 将一个完整电脑协议包复制到 USB TX 队列。

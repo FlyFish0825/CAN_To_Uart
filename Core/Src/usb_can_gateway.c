@@ -53,9 +53,41 @@ static CanGatewayIoResult_t UsbCanGateway_SendAdapter(
   return CAN_GATEWAY_IO_ERROR;
 }
 
+/**
+ * @brief 把系统心跳的通用发送请求转入同一个外部发送队列。
+ *
+ * 这里只负责搬运完整字节包，不判断包属于哪一种协议，也不访问 CAN。
+ */
+static SystemHeartbeatIoResult_t UsbCanGateway_SendSystemAdapter(
+    void *context,
+    const uint8_t *data,
+    uint16_t length)
+{
+  HAL_StatusTypeDef status;
+
+  UNUSED(context);
+
+  status = UsbCanGateway_TxEnqueue(data, length);
+  if (status == HAL_OK)
+  {
+    return SYSTEM_HEARTBEAT_IO_OK;
+  }
+  if (status == HAL_BUSY)
+  {
+    return SYSTEM_HEARTBEAT_IO_BUSY;
+  }
+  return SYSTEM_HEARTBEAT_IO_ERROR;
+}
+
 static const CanGatewayTransportOps_t usb_can_transport_ops =
 {
   UsbCanGateway_SendAdapter,
+  NULL
+};
+
+static const SystemHeartbeatTransportOps_t usb_system_transport_ops =
+{
+  UsbCanGateway_SendSystemAdapter,
   NULL
 };
 
@@ -68,6 +100,11 @@ static const CanGatewayTransportOps_t usb_can_transport_ops =
 const CanGatewayTransportOps_t *UsbCanGateway_GetTransport(void)
 {
   return &usb_can_transport_ops;
+}
+
+const SystemHeartbeatTransportOps_t *UsbCanGateway_GetSystemTransport(void)
+{
+  return &usb_system_transport_ops;
 }
 
 void UsbCanGateway_RxPush(const uint8_t *data, uint16_t len)

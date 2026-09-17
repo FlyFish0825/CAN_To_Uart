@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "can_gateway_core.h"
+#include "system_heartbeat.h"
 #include "usb_can_gateway.h"
 /* USER CODE END Includes */
 
@@ -111,6 +112,14 @@ int main(void)
   {
     Error_Handler();
   }
+  /*
+   * 单独注册公共链路心跳。它使用 AA58 System PING 协议，不经过 CAN 网关
+   * 解析器，也不携带 CAN ID/数据；发送时只复用同一外部传输队列。
+   */
+  if (SystemHeartbeat_Init(UsbCanGateway_GetSystemTransport()) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -125,6 +134,9 @@ int main(void)
      * CAN 接收帧和状态回复。该层只通过函数指针请求“向电脑发送”。
      */
     CanGateway_Process();
+
+    /* 每秒检查一次公共链路心跳，未到周期时立即返回，不阻塞主循环。 */
+    SystemHeartbeat_Process();
 
     /*
      * 第二步运行 USB 传输层：搬运 RX 环形缓冲中的字节、启动一个 USB TX
