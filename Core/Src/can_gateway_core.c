@@ -34,6 +34,8 @@ typedef enum
 #define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U)
 /* 保留一段余量，不能等到 63 个槽位全部占满才停止接收。 */
 #define CAN_TX_QUEUE_HIGH_WATERMARK 48U
+/* 成功状态只做低频诊断，不为每个数据帧生成一个 USB 回包。 */
+#define GATEWAY_STATUS_REPORT_INTERVAL_MS 100U
 /*
  * AA55 协议长度常量：完整固定缓冲区最大 78 字节；BODY_LEN 包含 SEQ、
  * CAN_ID、FLAGS、LEN 和 DATA，不包含帧头、CRC、帧尾；完整帧总长为
@@ -106,6 +108,9 @@ static volatile uint32_t uart_valid_packet_count = 0U;
 static volatile uint32_t uart_crc_error_count = 0U;
 static volatile uint32_t uart_protocol_error_count = 0U;
 static volatile uint32_t uart_tx_error_count = 0U;
+static volatile uint32_t can_bus_off_count = 0U;
+static volatile uint32_t can_error_status_count = 0U;
+static volatile uint8_t can_recovery_pending = 0U;
 
 static volatile uint8_t bitrate_change_pending = 0U;
 static uint32_t pending_nominal_bps = 500000U;
@@ -497,6 +502,39 @@ static void WriteU32Le(uint8_t *p, uint32_t value)
   p[3] = (uint8_t)((value >> 24U) & 0xFFU);
 }
 
+static HAL_StatusTypeDef CanGateway_ActivateNotifications(void)
+{
+  return HAL_FDCAN_ActivateNotification(
+      &hfdcan1,
+      FDCAN_IT_RX_FIFO0_NEW_MESSAGE |
+      FDCAN_IT_RX_FIFO0_MESSAGE_LOST |
+      FDCAN_IT_ERROR_WARNING |
+      FDCAN_IT_ERROR_PASSIVE |
+      FDCAN_IT_BUS_OFF,
+      0U);
+}
+
+/**
+ * @brief 总线异常后的非阻塞恢复。
+ *
+ * Bus-Off 时硬件可能不再释放 TX FIFO 中的槽位，单靠软件队列水位会一直
+ * 停在“暂不可发送”。在主循环里停止再启动控制器可以让硬件重新退出
+ * Bus-Off；不在中断里执行 HAL_Stop，避免在中断上下文等待硬件状态。
+ */
+static void CanGateway_ProcessCanRecovery(void)
+{
+  if (can_recovery_pending == 0U)
+  {
+    return;
+  }
+
+  if ((HAL_FDCAN_Stop(&hfdcan1) == HAL_OK) &&
+      (HAL_FDCAN_Start(&hfdcan1) == HAL_OK))
+  {
+    can_recovery_pending = 0U;
+  }
+}
+
 static HAL_StatusTypeDef ApplyCanBitrate(uint32_t nominal_bps,
                                          uint32_t data_bps)
 {
@@ -541,10 +579,7 @@ static HAL_StatusTypeDef ApplyCanBitrate(uint32_t nominal_bps,
     return HAL_ERROR;
   }
 
-  if (HAL_FDCAN_ActivateNotification(&hfdcan1,
-                                     FDCAN_IT_RX_FIFO0_NEW_MESSAGE |
-                                     FDCAN_IT_RX_FIFO0_MESSAGE_LOST,
-                                     0U) != HAL_OK)
+  if (CanGateway_ActivateNotifications() != HAL_OK)
   {
     return HAL_ERROR;
   }
@@ -925,6 +960,28 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
 }
 
 /**
+ * @brief FDCAN 错误状态通知。
+ *
+ * 这里只记录事件并置位恢复请求；恢复动作统一留给主循环，避免中断中
+ * 进行 Stop/Start 或其他可能等待硬件的操作。错误不会被当成正常发送完成。
+ */
+void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan,
+                                   uint32_t ErrorStatusITs)
+{
+  if ((hfdcan == NULL) || (hfdcan->Instance != FDCAN1))
+  {
+    return;
+  }
+
+  can_error_status_count++;
+  if ((ErrorStatusITs & FDCAN_IT_BUS_OFF) != 0U)
+  {
+    can_bus_off_count++;
+    can_recovery_pending = 1U;
+  }
+}
+
+/**
  * @brief 初始化 CAN 网关核心并注册电脑侧发送接口。
  *
  * 初始化顺序必须是：底层 HAL/HAL 时钟 -> FDCAN 与外部接口初始化
@@ -955,10 +1012,7 @@ HAL_StatusTypeDef CanGateway_Init(const CanGatewayTransportOps_t *transport)
     return HAL_ERROR;
   }
 
-  if (HAL_FDCAN_ActivateNotification(&hfdcan1,
-                                     FDCAN_IT_RX_FIFO0_NEW_MESSAGE |
-                                     FDCAN_IT_RX_FIFO0_MESSAGE_LOST,
-                                     0U) != HAL_OK)
+  if (CanGateway_ActivateNotifications() != HAL_OK)
   {
     return HAL_ERROR;
   }
@@ -984,12 +1038,19 @@ HAL_StatusTypeDef CanGateway_Init(const CanGatewayTransportOps_t *transport)
 void CanGateway_Process(void)
 {
   uint8_t i;
+  uint32_t status_now;
+  uint8_t status_due;
   static uint32_t reported_uart_valid_packets = 0U;
   static uint32_t reported_can_tx_submits = 0U;
   static uint32_t reported_uart_crc_errors = 0U;
   static uint32_t reported_uart_protocol_errors = 0U;
   static uint32_t reported_can_tx_failures = 0U;
   static uint32_t reported_can_tx_drops = 0U;
+  static uint32_t reported_can_bus_off = 0U;
+  static uint32_t reported_can_errors = 0U;
+  static uint32_t status_report_tick = 0U;
+
+  CanGateway_ProcessCanRecovery();
 
   if (bitrate_change_pending != 0U)
   {
@@ -1016,47 +1077,57 @@ void CanGateway_Process(void)
     CanTx_ProcessBus();
   }
 
-  if (reported_uart_valid_packets != uart_valid_packet_count)
+  /*
+   * 成功状态包按时间合并：连续输入时每帧回一个 USB 包会形成反馈风暴，
+   * 最终由诊断包自己占满 USB TX 队列。错误仍会报告，但同样限制为每
+   * 100 ms 至多一个状态包；计数器只在真正入队成功后前移。
+   */
+  status_now = HAL_GetTick();
+  status_due = ((uint32_t)(status_now - status_report_tick) >=
+                GATEWAY_STATUS_REPORT_INTERVAL_MS) ? 1U : 0U;
+  if (status_due != 0U)
   {
-    if (Gateway_SendStatusPacket(UART_RX_STATUS_ID, "USB_RX!!") == HAL_OK)
+    status_report_tick = status_now;
+    if ((reported_can_bus_off != can_bus_off_count) &&
+        (Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "BUS_OFF!") == HAL_OK))
     {
-      reported_uart_valid_packets = uart_valid_packet_count;
+      reported_can_bus_off = can_bus_off_count;
     }
-  }
-  if (reported_can_tx_submits != can_tx_submit_count)
-  {
-    if (Gateway_SendStatusPacket(CAN_PUT_STATUS_ID, "CAN_PUT!") == HAL_OK)
+    else if ((reported_can_errors != can_error_status_count) &&
+             (Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_ERR!") == HAL_OK))
     {
-      reported_can_tx_submits = can_tx_submit_count;
+      reported_can_errors = can_error_status_count;
     }
-  }
-  if (reported_uart_crc_errors != uart_crc_error_count)
-  {
-    if (Gateway_SendStatusPacket(UART_CRC_ERROR_ID, "CRC_ERR!") == HAL_OK)
-    {
-      reported_uart_crc_errors = uart_crc_error_count;
-    }
-  }
-  if (reported_uart_protocol_errors != uart_protocol_error_count)
-  {
-    if (Gateway_SendStatusPacket(UART_PROTOCOL_ERROR_ID, "PKT_ERR!") == HAL_OK)
-    {
-      reported_uart_protocol_errors = uart_protocol_error_count;
-    }
-  }
-  if (reported_can_tx_failures != can_tx_fail_count)
-  {
-    if (Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_FAIL") == HAL_OK)
+    else if ((reported_can_tx_failures != can_tx_fail_count) &&
+             (Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_FAIL") == HAL_OK))
     {
       reported_can_tx_failures = can_tx_fail_count;
     }
-  }
-  if (reported_can_tx_drops != can_tx_drop_count)
-  {
-    /* 队列满丢帧必须显式告知上位机，不能只留在调试计数里。 */
-    if (Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_QFUL") == HAL_OK)
+    else if ((reported_can_tx_drops != can_tx_drop_count) &&
+             (Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_QFUL") == HAL_OK))
     {
+      /* 队列满丢帧必须显式告知上位机，不能只留在调试计数里。 */
       reported_can_tx_drops = can_tx_drop_count;
+    }
+    else if ((reported_uart_crc_errors != uart_crc_error_count) &&
+             (Gateway_SendStatusPacket(UART_CRC_ERROR_ID, "CRC_ERR!") == HAL_OK))
+    {
+      reported_uart_crc_errors = uart_crc_error_count;
+    }
+    else if ((reported_uart_protocol_errors != uart_protocol_error_count) &&
+             (Gateway_SendStatusPacket(UART_PROTOCOL_ERROR_ID, "PKT_ERR!") == HAL_OK))
+    {
+      reported_uart_protocol_errors = uart_protocol_error_count;
+    }
+    else if ((reported_uart_valid_packets != uart_valid_packet_count) &&
+             (Gateway_SendStatusPacket(UART_RX_STATUS_ID, "USB_RX!!") == HAL_OK))
+    {
+      reported_uart_valid_packets = uart_valid_packet_count;
+    }
+    else if ((reported_can_tx_submits != can_tx_submit_count) &&
+             (Gateway_SendStatusPacket(CAN_PUT_STATUS_ID, "CAN_PUT!") == HAL_OK))
+    {
+      reported_can_tx_submits = can_tx_submit_count;
     }
   }
 
