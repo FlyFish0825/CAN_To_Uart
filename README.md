@@ -453,8 +453,8 @@ CubeMX 再生成代码后检查 DMA 初始化顺序、中断入口、链接脚�
 | 有 UART_RX!，没有 CAN_PUT! | 检查 CAN FIFO 是否满、控制器状态和发送队列计数 |
 | 有 CAN_PUT!，总线无波形 | 先测 PD1，再测收发器 CANH/CANL；核对供电、待机脚、连接的 CAN 通道及终端电阻 |
 
-可以在没有其他节点回复的情况下用示波器检查发送尝试；CAN_PUT! 不代表收到 ACK。当前未实现总线错误状态上报或 bus-off 自动恢复，也未证明持续无 ACK 下的长期运行行为。
+可以在没有其他节点回复的情况下用示波器检查发送尝试；CAN_PUT! 不代表收到 ACK。FDCAN 的 Error-Warning、Error-Passive、Bus-Off 状态会被记录；Bus-Off 或硬件 TX FIFO 连续 100 ms 不释放时，主循环会重新启动控制器，避免软件队列永久停住。持续无节点、收发器断开或物理层异常仍需在实机上确认波形和恢复效果。
 
-缓冲有限且没有流控，持续输入超过处理能力会丢数据。调试器可观察 `uart_rx_ring_drop_count`、`uart_tx_queue_drop_count`、`can_tx_drop_count`、`can_rx_drop_count`、`can_rx_hw_lost_count`、`uart_rx_error_count` 和 `can_tx_fail_count`。这些计数目前不通过独立查询命令输出。解析器没有半帧超时；输入残缺帧可能影响后续帧对齐，手工测试遇到此情况可复位后发送完整报文。
+缓冲采用水位反压，正常达到处理能力上限时会暂停 USB OUT，而不是覆盖旧数据；极端情况下仍应观察 `uart_rx_ring_drop_count`、`uart_tx_queue_drop_count`、`can_tx_drop_count`、`can_rx_drop_count`、`can_rx_hw_lost_count`、`uart_rx_error_count` 和 `can_tx_fail_count`。这些计数目前不通过独立查询命令输出。解析器没有半帧超时；输入残缺帧可能影响后续帧对齐，手工测试遇到此情况可复位后发送完整报文。
 
 截至本次交接：Debug/Release 已编译通过；用户板上截图显示启动提示，且两次完整 22 字节命令均产生 UART_RX! 与 CAN_PUT!。CAN 物理波形、节点接收、CAN 转串口方向、FD 高速、速率切换、长时间连续流量以及异常恢复仍需板上验证。

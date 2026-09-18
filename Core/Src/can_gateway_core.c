@@ -36,6 +36,8 @@ typedef enum
 #define CAN_TX_QUEUE_HIGH_WATERMARK 48U
 /* 成功状态只做低频诊断，不为每个数据帧生成一个 USB 回包。 */
 #define GATEWAY_STATUS_REPORT_INTERVAL_MS 100U
+/* 硬件 TX FIFO 长时间没有释放槽位时，触发一次控制器恢复。 */
+#define CAN_TX_FIFO_STALL_TIMEOUT_MS 100U
 /*
  * AA55 协议长度常量：完整固定缓冲区最大 78 字节；BODY_LEN 包含 SEQ、
  * CAN_ID、FLAGS、LEN 和 DATA，不包含帧头、CRC、帧尾；完整帧总长为
@@ -111,6 +113,8 @@ static volatile uint32_t uart_tx_error_count = 0U;
 static volatile uint32_t can_bus_off_count = 0U;
 static volatile uint32_t can_error_status_count = 0U;
 static volatile uint8_t can_recovery_pending = 0U;
+static volatile uint8_t can_tx_fifo_stall_active = 0U;
+static volatile uint32_t can_tx_fifo_stall_tick = 0U;
 
 static volatile uint8_t bitrate_change_pending = 0U;
 static uint32_t pending_nominal_bps = 500000U;
@@ -426,8 +430,30 @@ static void CanTx_ProcessBus(void)
    * 此处转换为 FDCAN 发送头，并写入 FDCAN1 的硬件 TX FIFO。
    * HAL_OK 仅代表写入硬件 FIFO 成功，不代表总线已得到 ACK。
    */
-  if (can_tx_tail == can_tx_head) return;
-  if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0U) return;
+  if (can_tx_tail == can_tx_head)
+  {
+    can_tx_fifo_stall_active = 0U;
+    return;
+  }
+
+  if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0U)
+  {
+    /* 正常发送只会短暂占满 3 槽 FIFO；长期不释放通常表示 Bus-Off、
+     * 控制器异常或收发器状态异常，不能让软件队列无限等待。 */
+    if (can_tx_fifo_stall_active == 0U)
+    {
+      can_tx_fifo_stall_active = 1U;
+      can_tx_fifo_stall_tick = HAL_GetTick();
+    }
+    else if ((uint32_t)(HAL_GetTick() - can_tx_fifo_stall_tick) >=
+             CAN_TX_FIFO_STALL_TIMEOUT_MS)
+    {
+      can_recovery_pending = 1U;
+    }
+    return;
+  }
+
+  can_tx_fifo_stall_active = 0U;
 
   tail = can_tx_tail;
   frame = can_tx_queue[tail];
@@ -532,6 +558,8 @@ static void CanGateway_ProcessCanRecovery(void)
       (HAL_FDCAN_Start(&hfdcan1) == HAL_OK))
   {
     can_recovery_pending = 0U;
+    can_tx_fifo_stall_active = 1U;
+    can_tx_fifo_stall_tick = HAL_GetTick();
   }
 }
 
