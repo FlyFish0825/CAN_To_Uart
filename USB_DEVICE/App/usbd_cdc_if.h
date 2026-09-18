@@ -109,6 +109,17 @@ extern USBD_CDC_ItfTypeDef USBD_Interface_fops_FS;
 uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
 
 /* USER CODE BEGIN EXPORTED_FUNCTIONS */
+/**
+ * @brief 清除 CDC IN 端点卡住时的发送状态。
+ *
+ * 仅由传输层超时恢复路径调用，不阻塞等待 USB 硬件。
+ */
+void CDC_ResetTransmitState_FS(void);
+
+/**
+ * @brief 在 RX 环形缓冲恢复到安全水位后重新提交 CDC OUT 接收。
+ */
+uint8_t CDC_ResumeReceive_FS(void);
 
 /* USER CODE END EXPORTED_FUNCTIONS */
 

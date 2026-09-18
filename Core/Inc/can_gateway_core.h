@@ -136,6 +136,14 @@ void CanGateway_Process(void);
  */
 void CanGateway_RxFeed(const uint8_t *data, uint16_t length);
 
+/**
+ * @brief 查询外部输入是否还可以安全进入 CAN 软件发送队列。
+ *
+ * 返回 0 时，传输层应暂缓继续接收新的完整外部报文，等待主循环把
+ * 已排队报文提交给 FDCAN。该查询只用于流控，不改变 AA55 协议格式。
+ */
+uint8_t CanGateway_CanTxReady(void);
+
 #ifdef __cplusplus
 }
 #endif

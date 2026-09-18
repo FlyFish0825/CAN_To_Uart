@@ -32,6 +32,8 @@ typedef enum
 
 #define CAN_QUEUE_SIZE          64U
 #define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U)
+/* 保留一段余量，不能等到 63 个槽位全部占满才停止接收。 */
+#define CAN_TX_QUEUE_HIGH_WATERMARK 48U
 /*
  * AA55 协议长度常量：完整固定缓冲区最大 78 字节；BODY_LEN 包含 SEQ、
  * CAN_ID、FLAGS、LEN 和 DATA，不包含帧头、CRC、帧尾；完整帧总长为
@@ -367,7 +369,8 @@ static void Gateway_SendBootTestPacket(void)
   (void)Gateway_SendCanPacket(&frame);
 }
 
-static void Gateway_SendStatusPacket(uint32_t id, const char text[8])
+static HAL_StatusTypeDef Gateway_SendStatusPacket(uint32_t id,
+                                                  const char text[8])
 {
   CanFrame_t frame = {0};
   uint8_t i;
@@ -378,7 +381,7 @@ static void Gateway_SendStatusPacket(uint32_t id, const char text[8])
   {
     frame.data[i] = (uint8_t)text[i];
   }
-  (void)Gateway_SendCanPacket(&frame);
+  return Gateway_SendCanPacket(&frame);
 }
 
 static void CanRx_ProcessTransport(void)
@@ -394,7 +397,11 @@ static void CanRx_ProcessTransport(void)
     uint16_t tail = can_rx_tail;
     CanFrame_t frame = can_rx_queue[tail];
 
-    (void)Gateway_SendCanPacket(&frame);
+    /* 外部发送队列暂忙时保留当前 CAN 帧，下一轮继续尝试。 */
+    if (Gateway_SendCanPacket(&frame) != HAL_OK)
+    {
+      return;
+    }
 
     __DMB();
     can_rx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
@@ -444,6 +451,13 @@ static void CanTx_ProcessBus(void)
   if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &header, frame.data) != HAL_OK)
   {
     can_tx_fail_count++;
+    /*
+     * HAL 已明确拒绝该帧时，不能把软件队列永久卡在同一个 tail。失败帧
+     * 不再重复占用队列槽位，错误计数会在主循环转换成 CAN_FAIL 状态包；
+     * 后续帧仍可继续尝试，避免一次硬件错误拖死整条 USB->CAN 链路。
+     */
+    __DMB();
+    can_tx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
     return;
   }
 
@@ -566,6 +580,8 @@ static void Gateway_SendConfigResponse(void)
   if (GatewayTx_Enqueue(packet, 23U) != HAL_OK)
   {
     uart_tx_error_count++;
+    /* 外部发送队列暂忙时保留 pending，下一轮继续尝试，不能丢配置回复。 */
+    return;
   }
   config_response_pending = 0U;
 }
@@ -826,6 +842,15 @@ void CanGateway_RxFeed(const uint8_t *data, uint16_t len)
   }
 }
 
+uint8_t CanGateway_CanTxReady(void)
+{
+  uint16_t used;
+
+  __DMB();
+  used = (uint16_t)((can_tx_head - can_tx_tail) & CAN_QUEUE_MASK);
+  return (used < CAN_TX_QUEUE_HIGH_WATERMARK) ? 1U : 0U;
+}
+
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
                                uint32_t RxFifo0ITs)
 {
@@ -964,6 +989,7 @@ void CanGateway_Process(void)
   static uint32_t reported_uart_crc_errors = 0U;
   static uint32_t reported_uart_protocol_errors = 0U;
   static uint32_t reported_can_tx_failures = 0U;
+  static uint32_t reported_can_tx_drops = 0U;
 
   if (bitrate_change_pending != 0U)
   {
@@ -992,28 +1018,46 @@ void CanGateway_Process(void)
 
   if (reported_uart_valid_packets != uart_valid_packet_count)
   {
-    reported_uart_valid_packets = uart_valid_packet_count;
-    Gateway_SendStatusPacket(UART_RX_STATUS_ID, "USB_RX!!");
+    if (Gateway_SendStatusPacket(UART_RX_STATUS_ID, "USB_RX!!") == HAL_OK)
+    {
+      reported_uart_valid_packets = uart_valid_packet_count;
+    }
   }
   if (reported_can_tx_submits != can_tx_submit_count)
   {
-    reported_can_tx_submits = can_tx_submit_count;
-    Gateway_SendStatusPacket(CAN_PUT_STATUS_ID, "CAN_PUT!");
+    if (Gateway_SendStatusPacket(CAN_PUT_STATUS_ID, "CAN_PUT!") == HAL_OK)
+    {
+      reported_can_tx_submits = can_tx_submit_count;
+    }
   }
   if (reported_uart_crc_errors != uart_crc_error_count)
   {
-    reported_uart_crc_errors = uart_crc_error_count;
-    Gateway_SendStatusPacket(UART_CRC_ERROR_ID, "CRC_ERR!");
+    if (Gateway_SendStatusPacket(UART_CRC_ERROR_ID, "CRC_ERR!") == HAL_OK)
+    {
+      reported_uart_crc_errors = uart_crc_error_count;
+    }
   }
   if (reported_uart_protocol_errors != uart_protocol_error_count)
   {
-    reported_uart_protocol_errors = uart_protocol_error_count;
-    Gateway_SendStatusPacket(UART_PROTOCOL_ERROR_ID, "PKT_ERR!");
+    if (Gateway_SendStatusPacket(UART_PROTOCOL_ERROR_ID, "PKT_ERR!") == HAL_OK)
+    {
+      reported_uart_protocol_errors = uart_protocol_error_count;
+    }
   }
   if (reported_can_tx_failures != can_tx_fail_count)
   {
-    reported_can_tx_failures = can_tx_fail_count;
-    Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_FAIL");
+    if (Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_FAIL") == HAL_OK)
+    {
+      reported_can_tx_failures = can_tx_fail_count;
+    }
+  }
+  if (reported_can_tx_drops != can_tx_drop_count)
+  {
+    /* 队列满丢帧必须显式告知上位机，不能只留在调试计数里。 */
+    if (Gateway_SendStatusPacket(CAN_PUT_ERROR_ID, "CAN_QFUL") == HAL_OK)
+    {
+      reported_can_tx_drops = can_tx_drop_count;
+    }
   }
 
   if (config_response_pending != 0U)

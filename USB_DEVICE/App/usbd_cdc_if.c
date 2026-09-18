@@ -169,6 +169,7 @@ static int8_t CDC_Init_FS(void)
 static int8_t CDC_DeInit_FS(void)
 {
   /* USER CODE BEGIN 4 */
+  UsbCanGateway_OnDeconfigured();
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -267,12 +268,23 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   /* USB OUT 回调只搬字节到 8 KB 环形缓冲，不在中断中解析 AA55 协议。 */
   if ((Buf != NULL) && (Len != NULL) && (*Len <= UINT16_MAX))
   {
+    /* OUT 已在上一轮通过水位检查后提交；当前包到达后只写入 RX 队列。 */
     UsbCanGateway_RxPush(Buf, (uint16_t)*Len);
   }
 
-  /* 重新提交 OUT 接收，使电脑可以继续发送下一包。 */
-  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, Buf);
-  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+  /*
+   * 缓冲空间不足时不重新提交 OUT 接收，USB 栈会对主机返回 NAK，形成
+   * 反压而不是丢弃后续字节。空间恢复后由主循环调用 ResumeReceive。
+   */
+  if (UsbCanGateway_RxCanRearm(USB_CAN_RX_PACKET_RESERVE) != 0U)
+  {
+    USBD_CDC_SetRxBuffer(&hUsbDeviceFS, Buf);
+    (void)USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+  }
+  else
+  {
+    UsbCanGateway_RxMarkPaused();
+  }
   return (USBD_OK);
   /* USER CODE END 6 */
 }
@@ -338,6 +350,45 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+
+/**
+  * @brief 清除 CDC IN 传输状态，供发送队列超时恢复使用。
+  *
+  * 正常路径不会调用此函数。它只在发送完成回调异常丢失超过超时时间时
+  * 执行，先刷新 IN 端点，再清零 CDC 类状态，使队列可以重新提交当前包。
+  */
+void CDC_ResetTransmitState_FS(void)
+{
+  USBD_CDC_HandleTypeDef *hcdc =
+      (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+
+  if ((hcdc == NULL) ||
+      (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED))
+  {
+    return;
+  }
+
+  (void)USBD_LL_FlushEP(&hUsbDeviceFS, CDC_IN_EP);
+  hcdc->TxState = 0U;
+}
+
+/**
+  * @brief 重新提交被反压暂停的 CDC OUT 接收。
+  * @retval USBD_OK 已提交；其他值表示暂时不能提交。
+  */
+uint8_t CDC_ResumeReceive_FS(void)
+{
+  USBD_CDC_HandleTypeDef *hcdc =
+      (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+
+  if ((hcdc == NULL) ||
+      (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED))
+  {
+    return USBD_BUSY;
+  }
+
+  return USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+}
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 
