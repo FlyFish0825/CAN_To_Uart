@@ -16,18 +16,18 @@ extern "C" {
  * 主循环再由 UsbCanGateway_Process() 取出，并交给 CanGateway_RxFeed()。
  * 这样 USB 中断上下文不会执行 CRC、CAN 入队或阻塞式发送。
  */
-#define USB_CAN_RX_RING_SIZE       (8U * 1024U)
-#define USB_CAN_TX_QUEUE_SIZE      256U
-#define USB_CAN_PACKET_SIZE        78U
+#define USB_CAN_RX_RING_SIZE       (8U * 1024U) /* USB RX 环形缓冲总字节数，必须为 2 的幂。 */
+#define USB_CAN_TX_QUEUE_SIZE      256U /* USB TX 槽位总数，实际可用容量少 1 个槽。 */
+#define USB_CAN_PACKET_SIZE        78U /* AA55 普通 CAN 协议包的固定最大长度。 */
 /* 每轮最多解析固定数量的输入字节，避免连续输入长期独占主循环。 */
-#define USB_CAN_RX_PROCESS_BUDGET  256U
+#define USB_CAN_RX_PROCESS_BUDGET  256U /* 单次主循环最多转交给协议解析器的字节数。 */
 /* USB FS CDC 单个 OUT 包最大 64 字节，重新接收前至少预留一个包空间。 */
-#define USB_CAN_RX_PACKET_RESERVE  64U
+#define USB_CAN_RX_PACKET_RESERVE  64U /* CDC FS OUT 包的最大长度预留。 */
 /* USB IN 完成回调异常丢失时，超过该时间自动恢复发送状态。 */
-#define USB_CAN_TX_STALL_TIMEOUT_MS 1000U
+#define USB_CAN_TX_STALL_TIMEOUT_MS 1000U /* TX busy 长时间无完成回调时的恢复阈值。 */
 /* 实际环形队列保留一个空槽，容量为 255；高/低水位用于输入反压。 */
-#define USB_CAN_TX_HIGH_WATERMARK  192U
-#define USB_CAN_TX_LOW_WATERMARK   64U
+#define USB_CAN_TX_HIGH_WATERMARK  192U /* TX 高水位，达到后暂停继续接收。 */
+#define USB_CAN_TX_LOW_WATERMARK   64U /* TX 低水位，降至此值以下后解除发送侧反压。 */
 
 _Static_assert((USB_CAN_RX_RING_SIZE & (USB_CAN_RX_RING_SIZE - 1U)) == 0U,
                "USB CAN RX ring size must be a power of two");
@@ -125,6 +125,12 @@ void UsbCanGateway_OnConfigured(void);
  * 避免断开瞬间静默丢包。
  */
 void UsbCanGateway_OnDeconfigured(void);
+
+/**
+ * @brief 获取 USB 接收/发送软件队列占用百分比，范围为 0~100。
+ */
+void UsbCanGateway_GetBufferUsage(uint8_t *rx_percent,
+                                  uint8_t *tx_percent);
 
 #ifdef __cplusplus
 }

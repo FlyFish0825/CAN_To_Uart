@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "can_gateway_core.h"
+#include "firmware_flow.h"
 #include "system_heartbeat.h"
 #include "usb_can_gateway.h"
 /* USER CODE END Includes */
@@ -112,6 +113,11 @@ int main(void)
   {
     Error_Handler();
   }
+  /* 注册可选 AA59 固件块通道；未发送 AA59 时不影响 AA55 旧路径。 */
+  if (FirmwareFlow_Init(UsbCanGateway_GetTransport()) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /*
    * 单独注册公共链路心跳。它使用 AA58 System PING 协议，不经过 CAN 网关
    * 解析器，也不携带 CAN ID/数据；发送时只复用同一外部传输队列。
@@ -129,6 +135,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* 先推进可靠逻辑块，随后由核心把已入队的物理帧提交给 FDCAN。 */
+    FirmwareFlow_Process();
+
     /*
      * 第一步运行协议/CAN 核心：处理已解析的电脑命令、发送 CAN 帧、封装
      * CAN 接收帧和状态回复。该层只通过函数指针请求“向电脑发送”。

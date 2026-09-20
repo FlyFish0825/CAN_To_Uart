@@ -1,13 +1,19 @@
 #include "can_gateway_core.h"
 #include "fdcan.h"
 
+typedef CanGatewayCanFrame_t CanFrame_t;
+
+/*
+ * CAN 发送队列条目。普通 AA55 报文只需要保存 frame；需要端到端流控的
+ * 上层通道还会设置 tracked 和 token，以便核心在真正向 FDCAN 硬件 TX
+ * FIFO 提交后，准确通知对应的逻辑数据块。
+ */
 typedef struct
 {
-  uint32_t id;
-  uint8_t flags;
-  uint8_t len;
-  uint8_t data[64];
-} CanFrame_t;
+  CanFrame_t frame;
+  uint32_t token;
+  uint8_t tracked;
+} CanTxQueueEntry_t;
 
 typedef struct
 {
@@ -38,6 +44,8 @@ typedef enum
 #define GATEWAY_STATUS_REPORT_INTERVAL_MS 100U
 /* 硬件 TX FIFO 长时间没有释放槽位时，触发一次控制器恢复。 */
 #define CAN_TX_FIFO_STALL_TIMEOUT_MS 100U
+/* USB 字节流中半帧超过该时间仍未收齐，认为本帧已损坏并重新找帧头。 */
+#define UART_PARSER_TIMEOUT_MS  1000U
 /*
  * AA55 协议长度常量：完整固定缓冲区最大 78 字节；BODY_LEN 包含 SEQ、
  * CAN_ID、FLAGS、LEN 和 DATA，不包含帧头、CRC、帧尾；完整帧总长为
@@ -77,9 +85,11 @@ static volatile uint16_t can_rx_head = 0U;
 static volatile uint16_t can_rx_tail = 0U;
 
 /* CAN 发送软件队列：协议解析后写入，主循环再提交给 FDCAN 硬件 FIFO。 */
-static CanFrame_t can_tx_queue[CAN_QUEUE_SIZE];
+static CanTxQueueEntry_t can_tx_queue[CAN_QUEUE_SIZE];
 static volatile uint16_t can_tx_head = 0U;
 static volatile uint16_t can_tx_tail = 0U;
+static CanGatewayTxCompletionFn can_tx_completion_callback = NULL;
+static void *can_tx_completion_context = NULL;
 
 /*
  * 协议接收状态：
@@ -93,6 +103,7 @@ static volatile uint16_t can_tx_tail = 0U;
 static uint8_t uart_rx_packet[UART_PACKET_SIZE];
 static uint8_t uart_rx_index = 0U;
 static uint8_t uart_rx_expected_size = 0U;
+static uint32_t uart_parser_last_tick = 0U;
 static uint16_t uart_tx_sequence = 0U;
 static CanGatewayTransportOps_t gateway_transport = {0};
 static GatewayParserState_t gateway_parser_state = GATEWAY_PARSER_WAIT_START_0;
@@ -117,11 +128,11 @@ static volatile uint8_t can_tx_fifo_stall_active = 0U;
 static volatile uint32_t can_tx_fifo_stall_tick = 0U;
 
 static volatile uint8_t bitrate_change_pending = 0U;
-static uint32_t pending_nominal_bps = 500000U;
-static uint32_t pending_data_bps = 5000000U;
+static uint32_t pending_nominal_bps = 1000000U;
+static uint32_t pending_data_bps = 8000000U;
 static uint16_t pending_config_sequence = 0U;
-static uint32_t current_nominal_bps = 500000U;
-static uint32_t current_data_bps = 5000000U;
+static uint32_t current_nominal_bps = 1000000U;
+static uint32_t current_data_bps = 8000000U;
 static volatile uint8_t config_response_pending = 0U;
 static uint8_t config_response_status = UART_CFG_OK;
 static uint16_t config_response_sequence = 0U;
@@ -417,9 +428,28 @@ static void CanRx_ProcessTransport(void)
   }
 }
 
+/**
+ * @brief 通知可靠上层：一个受跟踪 CAN 帧已经被发送路径消费。
+ *
+ * 普通 AA55 帧的 tracked 为 0，不触发通知。受跟踪帧只会在两种情况下
+ * 通知一次：成功写入 FDCAN 硬件 TX FIFO，或者在写入前/写入时明确失败。
+ * 通知发生在主循环上下文，因此回调只能更新状态，不能阻塞主循环。
+ */
+static void CanTx_NotifyCompletion(const CanTxQueueEntry_t *entry,
+                                   uint8_t success)
+{
+  if ((entry != NULL) && (entry->tracked != 0U) &&
+      (can_tx_completion_callback != NULL))
+  {
+    can_tx_completion_callback(can_tx_completion_context,
+                               entry->token, success);
+  }
+}
+
 static void CanTx_ProcessBus(void)
 {
   FDCAN_TxHeaderTypeDef header;
+  CanTxQueueEntry_t entry;
   CanFrame_t frame;
   uint32_t dlc;
   uint16_t tail;
@@ -456,12 +486,15 @@ static void CanTx_ProcessBus(void)
   can_tx_fifo_stall_active = 0U;
 
   tail = can_tx_tail;
-  frame = can_tx_queue[tail];
+  entry = can_tx_queue[tail];
+  frame = entry.frame;
   if ((CanFrame_Validate(&frame) == 0U) ||
       (CanLengthToDlc(frame.len, &dlc) == 0U))
   {
     can_tx_drop_count++;
+    __DMB();
     can_tx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
+    CanTx_NotifyCompletion(&entry, 0U);
     return;
   }
 
@@ -489,12 +522,14 @@ static void CanTx_ProcessBus(void)
      */
     __DMB();
     can_tx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
+    CanTx_NotifyCompletion(&entry, 0U);
     return;
   }
 
   can_tx_submit_count++;
   __DMB();
   can_tx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
+  CanTx_NotifyCompletion(&entry, 1U);
 }
 
 static const CanBitTiming_t *FindTiming(const CanBitTiming_t *table,
@@ -649,11 +684,75 @@ static void Gateway_SendConfigResponse(void)
   config_response_pending = 0U;
 }
 
+/**
+ * @brief CAN 软件发送队列的统一入队实现。
+ *
+ * tracked=0 用于普通 CAN 帧；tracked=1 时保存上层提供的 token，之后由
+ * CanTx_ProcessBus() 在硬件提交成功或明确失败时产生一次完成通知。
+ */
+static CanGatewayIoResult_t CanGateway_QueueCanFrameInternal(
+    const CanGatewayCanFrame_t *frame,
+    uint8_t tracked,
+    uint32_t token)
+{
+  uint16_t head;
+  uint16_t next;
+
+  if ((frame == NULL) || (CanFrame_Validate(frame) == 0U))
+  {
+    return CAN_GATEWAY_IO_ERROR;
+  }
+
+  head = can_tx_head;
+  next = (uint16_t)((head + 1U) & CAN_QUEUE_MASK);
+  if (next == can_tx_tail)
+  {
+    return CAN_GATEWAY_IO_BUSY;
+  }
+
+  can_tx_queue[head].frame = *frame;
+  can_tx_queue[head].token = token;
+  can_tx_queue[head].tracked = tracked;
+  __DMB();
+  can_tx_head = next;
+  return CAN_GATEWAY_IO_OK;
+}
+
+CanGatewayIoResult_t CanGateway_QueueCanFrame(
+    const CanGatewayCanFrame_t *frame)
+{
+  return CanGateway_QueueCanFrameInternal(frame, 0U, 0U);
+}
+
+CanGatewayIoResult_t CanGateway_QueueTrackedCanFrame(
+    const CanGatewayCanFrame_t *frame,
+    uint32_t token)
+{
+  /* 没有完成接收者时禁止受跟踪帧入队，否则上层永远等不到额度返还。 */
+  if (can_tx_completion_callback == NULL)
+  {
+    return CAN_GATEWAY_IO_ERROR;
+  }
+  return CanGateway_QueueCanFrameInternal(frame, 1U, token);
+}
+
+HAL_StatusTypeDef CanGateway_SetTxCompletionCallback(
+    CanGatewayTxCompletionFn callback,
+    void *context)
+{
+  if (callback == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  can_tx_completion_context = context;
+  can_tx_completion_callback = callback;
+  return HAL_OK;
+}
+
 static void QueueCanTxFromPacket(const uint8_t *packet)
 {
   CanFrame_t frame;
-  uint16_t head;
-  uint16_t next;
   uint16_t i;
 
   /*
@@ -677,17 +776,12 @@ static void QueueCanTxFromPacket(const uint8_t *packet)
     frame.data[i] = (i < frame.len) ? packet[11U + i] : 0U;
   }
 
-  head = can_tx_head;
-  next = (uint16_t)((head + 1U) & CAN_QUEUE_MASK);
-  if (next == can_tx_tail)
+  if (CanGateway_QueueCanFrame(&frame) != CAN_GATEWAY_IO_OK)
   {
+    /* AA55 没有独立的块队列，旧路径在队列满时明确计为丢帧。 */
     can_tx_drop_count++;
     return;
   }
-
-  can_tx_queue[head] = frame;
-  __DMB();
-  can_tx_head = next;
   uart_valid_packet_count++;
 }
 
@@ -891,6 +985,7 @@ static void UartParser_PushByte(uint8_t byte)
  */
 void CanGateway_RxFeed(const uint8_t *data, uint16_t len)
 {
+  uint32_t now;
   uint16_t i;
 
   if ((data == NULL) || (len == 0U))
@@ -898,10 +993,21 @@ void CanGateway_RxFeed(const uint8_t *data, uint16_t len)
     return;
   }
 
+  now = HAL_GetTick();
+  if ((gateway_parser_state != GATEWAY_PARSER_WAIT_START_0) &&
+      ((uint32_t)(now - uart_parser_last_tick) >= UART_PARSER_TIMEOUT_MS))
+  {
+    /* 半帧超时后丢弃旧缓存，当前 data 继续参与新的帧头搜索。 */
+    uart_rx_index = 0U;
+    uart_rx_expected_size = 0U;
+    gateway_parser_state = GATEWAY_PARSER_WAIT_START_0;
+  }
+
   /* 接收驱动在主循环中调用此入口，复用统一 AA55 协议状态机。 */
   for (i = 0U; i < len; i++)
   {
     UartParser_PushByte(data[i]);
+    uart_parser_last_tick = now;
   }
 }
 
@@ -912,6 +1018,38 @@ uint8_t CanGateway_CanTxReady(void)
   __DMB();
   used = (uint16_t)((can_tx_head - can_tx_tail) & CAN_QUEUE_MASK);
   return (used < CAN_TX_QUEUE_HIGH_WATERMARK) ? 1U : 0U;
+}
+
+static uint8_t CanGateway_UsagePercent(uint16_t used, uint16_t capacity)
+{
+  uint32_t percent;
+
+  if (capacity == 0U)
+  {
+    return 0U;
+  }
+  percent = ((uint32_t)used * 100U) / capacity;
+  return (percent > 100U) ? 100U : (uint8_t)percent;
+}
+
+void CanGateway_GetQueueUsage(uint8_t *rx_percent,
+                              uint8_t *tx_percent)
+{
+  uint16_t rx_used;
+  uint16_t tx_used;
+
+  __DMB();
+  rx_used = (uint16_t)((can_rx_head - can_rx_tail) & CAN_QUEUE_MASK);
+  tx_used = (uint16_t)((can_tx_head - can_tx_tail) & CAN_QUEUE_MASK);
+
+  if (rx_percent != NULL)
+  {
+    *rx_percent = CanGateway_UsagePercent(rx_used, CAN_QUEUE_SIZE - 1U);
+  }
+  if (tx_percent != NULL)
+  {
+    *tx_percent = CanGateway_UsagePercent(tx_used, CAN_QUEUE_SIZE - 1U);
+  }
 }
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
@@ -1028,6 +1166,7 @@ HAL_StatusTypeDef CanGateway_Init(const CanGatewayTransportOps_t *transport)
    * transport->context（如果非 NULL）指向的实例必须在网关运行期间有效。
    */
   gateway_transport = *transport;
+  uart_parser_last_tick = HAL_GetTick();
 
   Crc8Hw_Init();
 

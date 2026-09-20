@@ -5,26 +5,27 @@
  * 因此本文件不包含 CAN/FDCAN 头文件，也不访问 CAN 队列或 CAN 控制器。
  */
 
-#define SYSTEM_HEARTBEAT_PERIOD_MS   1000U
-#define SYSTEM_HEARTBEAT_PACKET_SIZE 20U
+#define SYSTEM_HEARTBEAT_PERIOD_MS   1000U /* 两次 PING 的最短周期，单位为毫秒。 */
+#define SYSTEM_HEARTBEAT_PAYLOAD_SIZE 5U /* 五个队列占用率字段的字节数。 */
+#define SYSTEM_HEARTBEAT_PACKET_SIZE (16U + SYSTEM_HEARTBEAT_PAYLOAD_SIZE + 4U) /* 完整包长度。 */
 
-#define SYSTEM_FRAME_START            0xAAU
-#define SYSTEM_FRAME_FAMILY           0x58U
-#define SYSTEM_FRAME_VERSION          0x01U
-#define SYSTEM_CMD_PING               0x01U
-#define SYSTEM_FRAME_FLAGS            0x00U
-#define SYSTEM_TARGET_SYSTEM          0x00U
-#define SYSTEM_FRAME_END_FAMILY       0x58U
-#define SYSTEM_FRAME_END              0xAAU
+#define SYSTEM_FRAME_START            0xAAU /* 帧头固定字节。 */
+#define SYSTEM_FRAME_FAMILY           0x58U /* 系统心跳协议族。 */
+#define SYSTEM_FRAME_VERSION          0x01U /* 当前协议版本。 */
+#define SYSTEM_CMD_PING               0x01U /* 在线心跳命令。 */
+#define SYSTEM_FRAME_FLAGS            0x00U /* PING 使用的标志位。 */
+#define SYSTEM_TARGET_SYSTEM          0x00U /* 心跳目标系统编号。 */
+#define SYSTEM_FRAME_END_FAMILY       0x58U /* 帧尾协议族字节。 */
+#define SYSTEM_FRAME_END              0xAAU /* 帧尾固定字节。 */
 
-static SystemHeartbeatTransportOps_t heartbeat_transport = {0};
-static uint32_t heartbeat_last_tick = 0U;
-static uint32_t heartbeat_sequence = 0U;
+static SystemHeartbeatTransportOps_t heartbeat_transport = {0}; /* 注册的传输回调副本。 */
+static uint32_t heartbeat_last_tick = 0U; /* 上次成功提交心跳的 tick。 */
+static uint32_t heartbeat_sequence = 0U; /* 下一个心跳包的序号。 */
 
 /**
  * @brief 按规范计算 CRC16-CCITT。
  *
- * 多项式为 0x1021，初值为 0xFFFF。输入从 FAMILY 开始，到 TIMESTAMP_US
+ * 多项式为 0x1021，初值为 0xFFFF。输入从 FAMILY 开始，到状态 payload
  * 最后一个字节结束；不包含帧头 AA、CRC 自身和帧尾 58 AA。
  */
 static uint16_t SystemHeartbeat_Crc16(const uint8_t *data, uint16_t length)
@@ -68,18 +69,22 @@ static void SystemHeartbeat_WriteU32Le(uint8_t *dst, uint32_t value)
 }
 
 /**
- * @brief 组装并发送一帧无 payload 的 AA58 System PING。
+ * @brief 组装并发送一帧带运行状态的 AA58 System PING。
  *
- * 固定帧格式如下（共 20 字节）：
+ * 固定帧格式如下（共 25 字节）：
  *
- *   AA 58 01 01 00 00 SEQ(4) 00 00 TIMESTAMP_US(4) CRC16 58 AA
+ *   AA 58 01 01 00 00 SEQ(4) 05 00 TIMESTAMP_US(4)
+ *   RX% TX% CAN_RX% CAN_TX% FLOW% CRC16 58 AA
  *
  * 该包只代表设备与上位机之间的公共通信链路仍在工作，不携带 CAN ID、
- * CAN 数据或 CAN 状态，因此上位机可以独立于 CAN 网关解析它。
+ * CAN 数据或 CAN 帧内容，因此上位机可以独立于 CAN 网关解析它。payload
+ * 的 5 个字节依次为输入缓冲、输出缓冲、CAN 接收队列、CAN 发送队列和
+ * 连续传输逻辑块队列的占用百分比。
  */
 static void SystemHeartbeat_Send(void)
 {
   uint8_t packet[SYSTEM_HEARTBEAT_PACKET_SIZE] = {0};
+  SystemHeartbeatMetrics_t metrics = {0};
   uint16_t crc;
   uint32_t timestamp_us;
   SystemHeartbeatIoResult_t result;
@@ -92,18 +97,31 @@ static void SystemHeartbeat_Send(void)
   packet[5] = SYSTEM_TARGET_SYSTEM;
 
   SystemHeartbeat_WriteU32Le(&packet[6], heartbeat_sequence);
-  /* 无 payload，PAYLOAD_LEN 位于偏移 10，保持 0。 */
+  packet[10] = SYSTEM_HEARTBEAT_PAYLOAD_SIZE;
+  packet[11] = 0U;
 
   /* 当前系统时基为毫秒，将其换算成协议要求的微秒时间戳。 */
   timestamp_us = HAL_GetTick() * 1000U;
   SystemHeartbeat_WriteU32Le(&packet[12], timestamp_us);
 
-  /* CRC 覆盖偏移 1..15：FAMILY 至 TIMESTAMP_US。 */
-  crc = SystemHeartbeat_Crc16(&packet[1], 15U);
-  packet[16] = (uint8_t)(crc & 0xFFU);
-  packet[17] = (uint8_t)((crc >> 8U) & 0xFFU);
-  packet[18] = SYSTEM_FRAME_END_FAMILY;
-  packet[19] = SYSTEM_FRAME_END;
+  if (heartbeat_transport.get_metrics != NULL)
+  {
+    heartbeat_transport.get_metrics(heartbeat_transport.metrics_context,
+                                    &metrics);
+  }
+  packet[16] = metrics.input_buffer_percent;
+  packet[17] = metrics.output_buffer_percent;
+  packet[18] = metrics.can_rx_buffer_percent;
+  packet[19] = metrics.can_tx_buffer_percent;
+  packet[20] = metrics.flow_buffer_percent;
+
+  /* CRC 覆盖偏移 1..20：FAMILY 至 5 字节状态 payload。 */
+  crc = SystemHeartbeat_Crc16(&packet[1],
+                              (uint16_t)(15U + SYSTEM_HEARTBEAT_PAYLOAD_SIZE));
+  packet[21] = (uint8_t)(crc & 0xFFU);
+  packet[22] = (uint8_t)((crc >> 8U) & 0xFFU);
+  packet[23] = SYSTEM_FRAME_END_FAMILY;
+  packet[24] = SYSTEM_FRAME_END;
 
   result = heartbeat_transport.send_packet(heartbeat_transport.context,
                                             packet,

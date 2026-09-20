@@ -22,8 +22,11 @@ extern "C" {
  */
 typedef enum
 {
+  /** 数据已经复制到传输层队列，调用方可以复用输入缓冲区。 */
   CAN_GATEWAY_IO_OK = 0,
+  /** 传输层当前没有可用队列空间，本次数据未被接收。 */
   CAN_GATEWAY_IO_BUSY,
+  /** 参数、配置或底层设备错误，本次数据未被接收。 */
   CAN_GATEWAY_IO_ERROR
 } CanGatewayIoResult_t;
 
@@ -55,9 +58,39 @@ typedef CanGatewayIoResult_t (*CanGatewaySendPacketFn)(
  */
 typedef struct
 {
+  /** 外部协议包发送回调；必须非阻塞且在返回前复制异步发送数据。 */
   CanGatewaySendPacketFn send_packet;
+  /** 发送回调使用的私有上下文；无状态实现时为 NULL。 */
   void *context;
 } CanGatewayTransportOps_t;
+
+/**
+ * @brief 由上层可靠数据通道提交的一个 CAN 帧。
+ *
+ * 该结构只描述已经准备好的物理 CAN 帧；如何产生这些帧由上层协议决定。
+ * 提交函数只把帧复制进核心软件队列，不等待总线发送完成。
+ */
+typedef struct
+{
+  /** CAN 标识符；是否扩展帧由 flags 中的 CAN 标志决定。 */
+  uint32_t id;
+  /** CAN_GATEWAY 协议帧标志位。 */
+  uint8_t flags;
+  /** data 中有效字节数，经典 CAN 不超过 8，CAN FD 不超过 64。 */
+  uint8_t len;
+  /** CAN 负载缓冲区；未使用区域不参与发送。 */
+  uint8_t data[64];
+} CanGatewayCanFrame_t;
+
+/**
+ * @brief 跟踪 CAN 帧被 FDCAN 发送路径消费后的通知函数。
+ *
+ * success=1 表示 HAL 已接受该帧进入 FDCAN 硬件 TX FIFO；success=0 表示
+ * 帧校验或硬件提交失败。该通知在主循环上下文执行，不在中断中调用。
+ */
+typedef void (*CanGatewayTxCompletionFn)(void *context,
+                                         uint32_t token,
+                                         uint8_t success);
 
 /*
  * ========================= 最小使用示例 =========================
@@ -137,12 +170,49 @@ void CanGateway_Process(void);
 void CanGateway_RxFeed(const uint8_t *data, uint16_t length);
 
 /**
+ * @brief 将一个已经校验好的 CAN 帧放入核心发送队列。
+ *
+ * 可靠上层（例如逻辑固件块通道）使用此入口，不需要复制 AA55 的单帧
+ * 编码。返回 BUSY 时表示本次帧没有被接收，调用方必须保留并稍后重试；
+ * 返回 OK 只表示进入软件队列，实际提交 FDCAN 仍由 CanGateway_Process()
+ * 完成。
+ */
+CanGatewayIoResult_t CanGateway_QueueCanFrame(
+    const CanGatewayCanFrame_t *frame);
+
+/**
+ * @brief 提交一个带完成 token 的 CAN 帧。
+ *
+ * 入队成功后，核心最终会针对该 token 调用一次完成通知；返回 BUSY/ERROR
+ * 时帧没有入队，也不会产生异步通知。
+ */
+CanGatewayIoResult_t CanGateway_QueueTrackedCanFrame(
+    const CanGatewayCanFrame_t *frame,
+    uint32_t token);
+
+/**
+ * @brief 注册可靠上层使用的 CAN 发送完成通知。
+ */
+HAL_StatusTypeDef CanGateway_SetTxCompletionCallback(
+    CanGatewayTxCompletionFn callback,
+    void *context);
+
+/**
  * @brief 查询外部输入是否还可以安全进入 CAN 软件发送队列。
  *
  * 返回 0 时，传输层应暂缓继续接收新的完整外部报文，等待主循环把
  * 已排队报文提交给 FDCAN。该查询只用于流控，不改变 AA55 协议格式。
  */
 uint8_t CanGateway_CanTxReady(void);
+
+/**
+ * @brief 获取 CAN 收发软件队列的占用百分比。
+ *
+ * 输出为 0~100 的整数百分比，供系统状态或诊断模块读取；函数只读取
+ * 队列指针，不会改变队列内容，也不执行发送或接收操作。
+ */
+void CanGateway_GetQueueUsage(uint8_t *rx_percent,
+                              uint8_t *tx_percent);
 
 #ifdef __cplusplus
 }

@@ -1,31 +1,51 @@
 #include "usb_can_gateway.h"
 
+#include "firmware_flow.h"
 #include "usbd_cdc_if.h"
 
 typedef struct
 {
+  /** 当前队列槽保存的有效协议包长度。 */
   uint16_t len;
+  /** 当前队列槽保存的协议包字节。 */
   uint8_t data[USB_CAN_PACKET_SIZE];
 } UsbCanTxPacket_t;
 
 #define USB_CAN_RX_RING_MASK  (USB_CAN_RX_RING_SIZE - 1U)
 #define USB_CAN_TX_QUEUE_MASK (USB_CAN_TX_QUEUE_SIZE - 1U)
+/* 路由器半帧超过该时间没有新字节时，丢弃旧长度并重新同步。 */
+#define USB_PROTOCOL_ROUTE_TIMEOUT_MS 1000U
 
-static uint8_t usb_can_rx_ring[USB_CAN_RX_RING_SIZE];
-static volatile uint16_t usb_can_rx_head = 0U;
-static volatile uint16_t usb_can_rx_tail = 0U;
-static volatile uint8_t usb_can_rx_paused = 0U;
+static uint8_t usb_can_rx_ring[USB_CAN_RX_RING_SIZE]; /* USB 回调写入的 RX 字节环。 */
+static volatile uint16_t usb_can_rx_head = 0U; /* RX 环写入索引。 */
+static volatile uint16_t usb_can_rx_tail = 0U; /* RX 环读取索引。 */
+static volatile uint8_t usb_can_rx_paused = 0U; /* 是否暂停提交 USB OUT 接收。 */
 
-static UsbCanTxPacket_t usb_can_tx_queue[USB_CAN_TX_QUEUE_SIZE];
-static volatile uint16_t usb_can_tx_head = 0U;
-static volatile uint16_t usb_can_tx_tail = 0U;
-static volatile uint8_t usb_can_tx_busy = 0U;
-static volatile uint32_t usb_can_tx_start_tick = 0U;
+static UsbCanTxPacket_t usb_can_tx_queue[USB_CAN_TX_QUEUE_SIZE]; /* 待发送 TX 槽位。 */
+static volatile uint16_t usb_can_tx_head = 0U; /* TX 入队索引。 */
+static volatile uint16_t usb_can_tx_tail = 0U; /* 当前发送槽索引。 */
+static volatile uint8_t usb_can_tx_busy = 0U; /* 当前槽是否等待 CDC 完成。 */
+static volatile uint32_t usb_can_tx_start_tick = 0U; /* 当前传输开始 tick。 */
 
-static volatile uint32_t usb_can_rx_drop_count = 0U;
-static volatile uint32_t usb_can_tx_drop_count = 0U;
-static volatile uint32_t usb_can_tx_error_count = 0U;
-static volatile uint32_t usb_can_tx_stall_count = 0U;
+static volatile uint32_t usb_can_rx_drop_count = 0U; /* RX 环满丢弃的字节数。 */
+static volatile uint32_t usb_can_tx_drop_count = 0U; /* TX 队列满丢弃的包数。 */
+static volatile uint32_t usb_can_tx_error_count = 0U; /* CDC 提交错误次数。 */
+static volatile uint32_t usb_can_tx_stall_count = 0U; /* TX busy 超时恢复次数。 */
+
+typedef enum
+{
+  USB_PROTOCOL_WAIT_START = 0U,
+  USB_PROTOCOL_WAIT_FAMILY,
+  USB_PROTOCOL_AA55,
+  USB_PROTOCOL_AA59
+} UsbProtocolRouteState_t;
+
+static UsbProtocolRouteState_t usb_protocol_route_state =
+    USB_PROTOCOL_WAIT_START;
+static uint16_t usb_protocol_route_count = 0U;
+static uint16_t usb_protocol_route_expected = 0U;
+static uint8_t usb_protocol_route_header[16];
+static uint32_t usb_protocol_route_last_tick = 0U;
 
 static uint16_t UsbCanGateway_RxFree(void)
 {
@@ -49,6 +69,132 @@ static uint16_t UsbCanGateway_TxUsed(void)
   head = usb_can_tx_head;
   tail = usb_can_tx_tail;
   return (uint16_t)((head - tail) & USB_CAN_TX_QUEUE_MASK);
+}
+
+static void UsbCanGateway_RouteReset(void)
+{
+  usb_protocol_route_state = USB_PROTOCOL_WAIT_START;
+  usb_protocol_route_count = 0U;
+  usb_protocol_route_expected = 0U;
+}
+
+static void UsbCanGateway_RouteToParser(uint8_t byte)
+{
+  if (usb_protocol_route_state == USB_PROTOCOL_AA59)
+  {
+    FirmwareFlow_RxFeed(&byte, 1U);
+  }
+  else
+  {
+    CanGateway_RxFeed(&byte, 1U);
+  }
+}
+
+/**
+ * @brief 按 AA55/AA59 帧族把字节流交给唯一的协议解析器。
+ *
+ * 两种协议都使用 AA 起始字节，不能让两个解析器同时消费同一份负载；
+ * 否则 AA59 数据中偶然出现 AA55 可能被误解析成 CAN 命令。路由器只做
+ * 帧族和长度识别，不解析 CRC，也不执行任何业务。
+ */
+static void UsbCanGateway_RouteByte(uint8_t byte)
+{
+  uint8_t header[2] = {0xAAU, byte};
+  uint32_t now = HAL_GetTick();
+
+  if ((usb_protocol_route_state != USB_PROTOCOL_WAIT_START) &&
+      ((uint32_t)(now - usb_protocol_route_last_tick) >=
+       USB_PROTOCOL_ROUTE_TIMEOUT_MS))
+  {
+    /* 当前字节继续进入下面的 WAIT_START 分支，允许它成为新帧头。 */
+    UsbCanGateway_RouteReset();
+  }
+  usb_protocol_route_last_tick = now;
+
+  switch (usb_protocol_route_state)
+  {
+    case USB_PROTOCOL_WAIT_START:
+      if (byte == 0xAAU)
+      {
+        usb_protocol_route_state = USB_PROTOCOL_WAIT_FAMILY;
+      }
+      break;
+
+    case USB_PROTOCOL_WAIT_FAMILY:
+      if ((byte == 0x55U) || (byte == 0x59U))
+      {
+        usb_protocol_route_state = (byte == 0x59U) ?
+                                   USB_PROTOCOL_AA59 : USB_PROTOCOL_AA55;
+        usb_protocol_route_count = 2U;
+        usb_protocol_route_expected = 0U;
+        usb_protocol_route_header[0] = 0xAAU;
+        usb_protocol_route_header[1] = byte;
+        UsbCanGateway_RouteToParser(0xAAU);
+        UsbCanGateway_RouteToParser(byte);
+      }
+      else
+      {
+        /* 噪声不丢失新的 AA 候选；无效字节本身交给两个解析器丢弃。 */
+        CanGateway_RxFeed(&header[0], 1U);
+        FirmwareFlow_RxFeed(&header[0], 1U);
+        CanGateway_RxFeed(&byte, 1U);
+        FirmwareFlow_RxFeed(&byte, 1U);
+        UsbCanGateway_RouteReset();
+        if (byte == 0xAAU)
+        {
+          usb_protocol_route_state = USB_PROTOCOL_WAIT_FAMILY;
+        }
+      }
+      break;
+
+    case USB_PROTOCOL_AA55:
+      UsbCanGateway_RouteToParser(byte);
+      usb_protocol_route_count++;
+      if (usb_protocol_route_count == 3U)
+      {
+        usb_protocol_route_expected = (uint16_t)byte + 6U;
+        if ((byte < 8U) || (byte > 72U))
+        {
+          UsbCanGateway_RouteReset();
+        }
+      }
+      else if ((usb_protocol_route_expected != 0U) &&
+               (usb_protocol_route_count >= usb_protocol_route_expected))
+      {
+        UsbCanGateway_RouteReset();
+      }
+      break;
+
+    case USB_PROTOCOL_AA59:
+      UsbCanGateway_RouteToParser(byte);
+      if (usb_protocol_route_count < sizeof(usb_protocol_route_header))
+      {
+        usb_protocol_route_header[usb_protocol_route_count] = byte;
+      }
+      usb_protocol_route_count++;
+      if (usb_protocol_route_count == 16U)
+      {
+        uint16_t payload_length =
+            (uint16_t)usb_protocol_route_header[10] |
+            ((uint16_t)usb_protocol_route_header[11] << 8U);
+        usb_protocol_route_expected = payload_length + 20U;
+        if ((usb_protocol_route_header[2] != 1U) ||
+            (payload_length > FW_FLOW_MAX_PAYLOAD))
+        {
+          UsbCanGateway_RouteReset();
+        }
+      }
+      else if ((usb_protocol_route_expected != 0U) &&
+               (usb_protocol_route_count >= usb_protocol_route_expected))
+      {
+        UsbCanGateway_RouteReset();
+      }
+      break;
+
+    default:
+      UsbCanGateway_RouteReset();
+      break;
+  }
 }
 
 /**
@@ -106,6 +252,30 @@ static SystemHeartbeatIoResult_t UsbCanGateway_SendSystemAdapter(
   return SYSTEM_HEARTBEAT_IO_ERROR;
 }
 
+/**
+ * @brief 为系统心跳提供各层软件队列的当前占用率。
+ *
+ * 这里是传输适配层与诊断状态之间的连接点。心跳核心只知道通用的
+ * SystemHeartbeatMetrics_t，不直接依赖 USB、CAN 或 AA59 的内部变量。
+ */
+static void UsbCanGateway_GetSystemMetrics(
+    void *context,
+    SystemHeartbeatMetrics_t *metrics)
+{
+  (void)context;
+
+  if (metrics == NULL)
+  {
+    return;
+  }
+
+  UsbCanGateway_GetBufferUsage(&metrics->input_buffer_percent,
+                               &metrics->output_buffer_percent);
+  CanGateway_GetQueueUsage(&metrics->can_rx_buffer_percent,
+                           &metrics->can_tx_buffer_percent);
+  metrics->flow_buffer_percent = FirmwareFlow_GetQueueUsage();
+}
+
 static const CanGatewayTransportOps_t usb_can_transport_ops =
 {
   UsbCanGateway_SendAdapter,
@@ -115,6 +285,8 @@ static const CanGatewayTransportOps_t usb_can_transport_ops =
 static const SystemHeartbeatTransportOps_t usb_system_transport_ops =
 {
   UsbCanGateway_SendSystemAdapter,
+  NULL,
+  UsbCanGateway_GetSystemMetrics,
   NULL
 };
 
@@ -217,7 +389,7 @@ static void UsbCanGateway_ProcessRx(void)
     __DMB();
     byte = usb_can_rx_ring[tail];
     usb_can_rx_tail = (uint16_t)((tail + 1U) & USB_CAN_RX_RING_MASK);
-    CanGateway_RxFeed(&byte, 1U);
+    UsbCanGateway_RouteByte(byte);
     processed++;
   }
 
@@ -334,6 +506,8 @@ void UsbCanGateway_OnConfigured(void)
   usb_can_tx_busy = 0U;
   usb_can_tx_start_tick = 0U;
   usb_can_rx_paused = 0U;
+  UsbCanGateway_RouteReset();
+  usb_protocol_route_last_tick = HAL_GetTick();
 }
 
 void UsbCanGateway_OnDeconfigured(void)
@@ -345,6 +519,44 @@ void UsbCanGateway_OnDeconfigured(void)
   usb_can_tx_busy = 0U;
   usb_can_tx_start_tick = 0U;
   usb_can_rx_paused = 0U;
+  UsbCanGateway_RouteReset();
+  usb_protocol_route_last_tick = HAL_GetTick();
+}
+
+static uint8_t UsbCanGateway_UsagePercent(uint16_t used, uint16_t capacity)
+{
+  uint32_t percent;
+
+  if (capacity == 0U)
+  {
+    return 0U;
+  }
+  percent = ((uint32_t)used * 100U) / capacity;
+  return (percent > 100U) ? 100U : (uint8_t)percent;
+}
+
+void UsbCanGateway_GetBufferUsage(uint8_t *rx_percent,
+                                  uint8_t *tx_percent)
+{
+  uint16_t rx_used;
+  uint16_t tx_used;
+
+  __DMB();
+  rx_used = (uint16_t)((usb_can_rx_head - usb_can_rx_tail) &
+                       USB_CAN_RX_RING_MASK);
+  tx_used = (uint16_t)((usb_can_tx_head - usb_can_tx_tail) &
+                       USB_CAN_TX_QUEUE_MASK);
+
+  if (rx_percent != NULL)
+  {
+    *rx_percent = UsbCanGateway_UsagePercent(rx_used,
+                                              USB_CAN_RX_RING_SIZE - 1U);
+  }
+  if (tx_percent != NULL)
+  {
+    *tx_percent = UsbCanGateway_UsagePercent(tx_used,
+                                              USB_CAN_TX_QUEUE_SIZE - 1U);
+  }
 }
 
 void UsbCanGateway_Process(void)
