@@ -104,7 +104,8 @@ typedef struct
 {
   ImuSensor_TxFn tx;            /* 可为 NULL：所有请求异步回 IO_ERROR。 */
   void *tx_user;                /* 透传给 tx 的上下文。 */
-  uint64_t request_timeout_us;  /* 0 = 默认 1000000us。 */
+  uint64_t request_timeout_us;  /* 0 = 按命令默认（版本 1s / 校准 30s）；
+                                   非 0 对全部待确认请求统一覆盖。 */
 } ImuSensor_Config;
 
 /** 单个异步请求的完成结果（PopResult 弹出）。 */
@@ -235,7 +236,8 @@ int ImuSensor_GetParameter(uint16_t id, uint32_t *value_out);
  * 受理即可能发送 UART 帧；0x60/0x61 发出后立即产生 UNCONFIRMED 结果，
  * 不等待任何回包。0x80/0x70/0x71 为待确认请求，同一时刻仅一个；待确认
  * 请求在飞期间所有新请求（含无回复命令）保守返回 BUSY，超时产生
- * TIMEOUT 结果。
+ * TIMEOUT 结果。Config.request_timeout_us=0 时默认超时：版本查询 1s、
+ * 0x70/0x71 校准 30s；显式非 0 值对全部待确认请求统一覆盖。
  */
 int ImuSensor_Request(uint8_t op, uint32_t arg, uint64_t now_us,
                       uint32_t *host_seq_out);

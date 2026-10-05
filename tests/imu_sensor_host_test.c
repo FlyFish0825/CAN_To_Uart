@@ -525,6 +525,57 @@ static void Test_TimeoutAndBusy(void)
   assert(r.result == IMU_SENSOR_RES_UNCONFIRMED);
 }
 
+/** 默认超时（request_timeout_us=0）：版本查询 1s、0x70/0x71 校准 30s。 */
+static void Test_DefaultTimeouts(void)
+{
+  ImuSensor_Result r;
+  uint32_t seq = 0U;
+
+  TestReset(0, 0); /* 显式 0 → 按命令取默认。 */
+  ImuSensor_SetPinsBlocked(0U);
+
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_GET_VERSION, 0U, 0ULL, &seq) == 0);
+  ImuSensor_Process(999999ULL);
+  assert(ImuSensor_PopResult(&r) == 0);
+  ImuSensor_Process(1000000ULL);
+  assert(ImuSensor_PopResult(&r) == 1);
+  assert(r.result == IMU_SENSOR_RES_TIMEOUT);
+
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_CAL_ACCEL_GYRO_START, 0U,
+                           2000000ULL, &seq) == 0);
+  ImuSensor_Process(2000000ULL + 30000000ULL - 1ULL);
+  assert(ImuSensor_PopResult(&r) == 0);
+  ImuSensor_Process(2000000ULL + 30000000ULL);
+  assert(ImuSensor_PopResult(&r) == 1);
+  assert(r.result == IMU_SENSOR_RES_TIMEOUT);
+}
+
+/** 显式非 0 超时对版本与校准统一覆盖（便于 host 测试缩短等待）。 */
+static void Test_ExplicitTimeoutOverride(void)
+{
+  ImuSensor_Result r;
+  uint32_t seq = 0U;
+
+  TestReset(0, 5000ULL); /* 非 0：版本与校准统一 5ms。 */
+  ImuSensor_SetPinsBlocked(0U);
+
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_GET_VERSION, 0U, 100000ULL,
+                           &seq) == 0);
+  ImuSensor_Process(104999ULL);
+  assert(ImuSensor_PopResult(&r) == 0);
+  ImuSensor_Process(105000ULL);
+  assert(ImuSensor_PopResult(&r) == 1);
+  assert(r.result == IMU_SENSOR_RES_TIMEOUT);
+
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_CAL_MAG_START, 0U, 200000ULL,
+                           &seq) == 0);
+  ImuSensor_Process(204999ULL);
+  assert(ImuSensor_PopResult(&r) == 0);
+  ImuSensor_Process(205000ULL);
+  assert(ImuSensor_PopResult(&r) == 1);
+  assert(r.result == IMU_SENSOR_RES_TIMEOUT);
+}
+
 /** 校准有 ACK：0x81 匹配原命令；状态 0 视为设备报告失败。 */
 static void Test_CalAck(void)
 {
@@ -778,6 +829,8 @@ int main(void)
   Test_UnalignedOffsets();
   Test_ParamAndRequests();
   Test_TimeoutAndBusy();
+  Test_DefaultTimeouts();
+  Test_ExplicitTimeoutOverride();
   Test_CalAck();
   Test_TxError();
   Test_Unsupported();

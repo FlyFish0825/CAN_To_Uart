@@ -25,7 +25,10 @@
 #define IMU_SENSOR_RESULT_Q_SIZE 8U  /* 异步结果 FIFO 深度。 */
 #define IMU_SENSOR_FRAME_MAX 64U     /* 原生帧总长上限。 */
 #define IMU_SENSOR_FRAME_MIN 5U      /* 7E 23 LEN FUNC SUM 的理论下限。 */
-#define IMU_SENSOR_DEFAULT_TIMEOUT_US 1000000ULL
+/* request_timeout_us=0 时的默认待确认超时：版本查询 1s，0x70/0x71 校准 30s
+ * （校准实机耗时远长于版本查询）。显式非 0 值对全部命令统一覆盖。 */
+#define IMU_SENSOR_VERSION_DEFAULT_TIMEOUT_US 1000000ULL
+#define IMU_SENSOR_CAL_DEFAULT_TIMEOUT_US 30000000ULL
 
 /* 原生功能字。 */
 #define IMU_NATIVE_FUNC_VERSION_RSP 0x01U /* 0x80 的回包：3 个版本字节。 */
@@ -948,9 +951,21 @@ int ImuSensor_Request(uint8_t op, uint32_t arg, uint64_t now_us,
   {
     if (expect_reply != 0U)
     {
-      uint64_t timeout = (imu_cfg.request_timeout_us != 0ULL)
-                             ? imu_cfg.request_timeout_us
-                             : IMU_SENSOR_DEFAULT_TIMEOUT_US;
+      uint64_t timeout;
+
+      if (imu_cfg.request_timeout_us != 0ULL)
+      {
+        timeout = imu_cfg.request_timeout_us;
+      }
+      else if ((native == IMU_NATIVE_FUNC_CAL_AGM) ||
+               (native == IMU_NATIVE_FUNC_CAL_MAG))
+      {
+        timeout = IMU_SENSOR_CAL_DEFAULT_TIMEOUT_US;
+      }
+      else
+      {
+        timeout = IMU_SENSOR_VERSION_DEFAULT_TIMEOUT_US;
+      }
 
       imu_pending.active = 1U;
       imu_pending.op = op;
