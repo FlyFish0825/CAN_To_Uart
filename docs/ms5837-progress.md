@@ -167,4 +167,8 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 ## 6. 提交
 
 * 分支：`feature/depth-ms5837-20261006`
-* 提交：见本文件所在提交（只包含上表列出的自身文件，未 `git add .`，未 push，未合并 main）。
+* 实现提交：`1130aca` “功能：新增MS5837深度计I2C3驱动与主机测试（02BA/30BA补偿、CRC4、非阻塞转换、显式零点）”
+  （8 个文件、3547 行新增：`Core/Inc/i2c.h`、`Core/Src/i2c.c`、`Core/Inc/ms5837.h`、`Core/Src/ms5837.c`、
+  `tests/ms5837_host_test.c`、`tests/run_ms5837_host_test.ps1`、`docs/ms5837.md`、`docs/ms5837-progress.md`）。
+* 只提交了本模块自己的文件（未 `git add .`，未改动/回退他人文件，未 push，未合并 main）。
+* 提交时 Git 提示 “LF will be replaced by CRLF”，来自本机 `core.autocrlf=true`，与仓库既有文件一致。
