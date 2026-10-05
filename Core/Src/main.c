@@ -26,6 +26,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+/* 手写协议核心、AA59 固件流控、AA58 心跳和 USB 队列适配层接口。 */
 #include "can_gateway_core.h"
 #include "firmware_flow.h"
 #include "system_heartbeat.h"
@@ -34,34 +35,35 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+/* 当前应用不在 CubeMX 主文件中新增私有类型。 */
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* 当前应用没有需要放在生成主文件中的私有常量。 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+/* 当前应用没有额外的私有宏；协议常量由各手写模块自主管理。 */
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+/* 网关状态保存在协议和 USB 模块内部，主文件不复制这些状态。 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
-
+/* 当前用户区不声明新的静态函数。 */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+/* 预留用户辅助代码区；协议处理函数位于独立手写模块。 */
 /* USER CODE END 0 */
 
 /**
@@ -72,7 +74,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /* 复位后的最早用户区；当前不在外设初始化前访问协议模块。 */
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
@@ -84,14 +86,14 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  /* HAL 初始化后的用户区；协议注册需等待 USB、FDCAN 等外设完成初始化。 */
   /* USER CODE END Init */
 
   /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  /* 时钟配置完成后的用户区；当前无额外的系统级初始化动作。 */
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -126,6 +128,7 @@ int main(void)
   {
     Error_Handler();
   }
+  /* 三个模块均注册成功后，主循环才开始消费协议和传输队列。 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -135,6 +138,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* 以下调用均为非阻塞轮询，保持 USB 回调和 FDCAN 中断路径足够短。 */
     /* 先推进可靠逻辑块，随后由核心把已入队的物理帧提交给 FDCAN。 */
     FirmwareFlow_Process();
 
@@ -254,6 +258,7 @@ void MPU_Config(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
+  /* 初始化失败时停止继续处理队列，避免在外设状态未知时发送协议数据。 */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
@@ -272,6 +277,7 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
+  /* 断言参数保留给调试器；当前不在 USB/CAN 路径中输出诊断文本。 */
   /* User can add his own implementation to report the file name and line number,
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
