@@ -55,6 +55,18 @@ extern "C" {
 #define MS5837_FILTER_K_MAX           0.99f
 #define MS5837_GRAVITY                9.80665f /* m/s^2。 */
 
+/*
+ * 采样周期预算（SetOsr / SetOutputRateHz / SetModel 的共同约束）：
+ *   needed_ms = 2 × (最大转换时间 + MS5837_CONVERSION_MARGIN_MS) + MS5837_SCHEDULE_TX_BUDGET_MS
+ *   必须 <= 1000 / output_rate_hz，否则返回 MS5837_ERR_PARAM。
+ * 每次转换的等待都从“I2C 命令真正发完”之后重新取 HAL_GetTick() 再计算，
+ * 并额外加 1 ms 余量，避免毫秒相位导致提前读取未完成的转换。
+ * 参考：30BA OSR4096 → 2×(10+1)+2 = 24 ms，所以 25/40 Hz 可以，50 Hz 不行；
+ *       30BA OSR8192 → 2×(19+1)+2 = 42 ms，所以 20 Hz 可以，25 Hz 不行。
+ */
+#define MS5837_CONVERSION_MARGIN_MS  1U /* 命令完成后额外等待的毫秒数。 */
+#define MS5837_SCHEDULE_TX_BUDGET_MS 2U /* 一帧内 4 次短 I2C 事务的预算。 */
+
 /* PROM 读取与复位时序。 */
 #define MS5837_PROM_WORDS        8U /* 8 个 16 位字，字 0 含 4 位 CRC。 */
 #define MS5837_RESET_DELAY_MS    10U /* 复位后等待期间不占用主循环，仅为保守余量。 */
@@ -201,10 +213,10 @@ uint8_t Ms5837_IsZeroValid(void);
 Ms5837Result_t Ms5837_SetModel(uint8_t model); /* 0 / 2 / 30。 */
 uint8_t Ms5837_GetModel(void);
 
-Ms5837Result_t Ms5837_SetOsr(uint16_t osr); /* 256~8192，且需满足当前采样率。 */
+Ms5837Result_t Ms5837_SetOsr(uint16_t osr); /* 256~8192，且需满足当前采样率的周期预算。 */
 uint16_t Ms5837_GetOsr(void);
 
-Ms5837Result_t Ms5837_SetOutputRateHz(uint16_t rate_hz); /* 1~100，且需容纳一次转换周期。 */
+Ms5837Result_t Ms5837_SetOutputRateHz(uint16_t rate_hz); /* 1~100，且需容纳一次保守采样周期。 */
 uint16_t Ms5837_GetOutputRateHz(void);
 
 Ms5837Result_t Ms5837_SetWaterDensity(float kg_m3); /* 900~1300。 */
@@ -269,7 +281,9 @@ uint16_t Ms5837_MaxConversionTimeMs(uint8_t model, uint16_t osr);
  * @param model  MS5837_MODEL_02BA 或 MS5837_MODEL_30BA；其它值返回 0。
  * @param pressure_raw 输出整数压力：30BA 单位 0.1 mbar，02BA 单位 0.01 mbar（=Pa）。
  * @param temperature_centi_c 输出 0.01 °C。
- * @return 1 表示已按型号补偿，0 表示型号未知、未写任何输出。
+ * @return 1 表示已按型号补偿；0 表示未写任何输出，原因包括：
+ *         型号未确认、prom 为空指针、**d1/d2 超过 24 位**、或 d1/d2 等于 0 / 0xFFFFFF
+ *         （无效转换码字，绝不能据此发布测量值）。
  */
 uint8_t Ms5837_Compensate(uint8_t model,
                           const uint16_t prom[MS5837_PROM_WORDS],
