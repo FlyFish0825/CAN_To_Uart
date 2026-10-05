@@ -100,14 +100,15 @@ mag_units、quat_wxyz、euler_rpy_rad、baro_*），无伪造字段。
 | 2 | `CONFIG_UNKNOWN` 恒置位 | 无原生读回，配置永远无法确认；UNCONFIRMED 的 rate/mode 下发不清除该位（统筹 2026-10-06 指示的严格解释，含测试） |
 | 3 | `MODEL_CONFIRMED` 恒 0 | 无原生型号读回，禁止凭空确认 |
 | 4 | 帧时间戳=分块到达时刻，不做块内字节回推 | 上位机时间戳本身 ms 级（ms*1000），回推收益 <87µs/字节；如需可后续补 |
-| 5 | 默认请求超时 1s；单一在飞；在飞期间一切请求（含 0x60/0x61）BUSY | 保守策略，避免校准期间混入未定义时序命令 |
+| 5 | 默认超时（`request_timeout_us=0`）：版本查询 1s、0x70/0x71 校准 30s；显式非 0 值对全部待确认请求统一覆盖。单一在飞；在飞期间一切请求（含 0x60/0x61）BUSY | 校准实机耗时远长于版本查询，不能共用 1s；保守策略避免校准期间混入未定义时序命令 |
 | 6 | rate/mode 缓存=最后成功下发的值，GET 恒 UNCONFIRMED | 原文明确无原生读回 |
 | 7 | 0xA0 复位不暴露 | AA5B REBOOT 预留 UNSUPPORTED；后端未提供复位请求 |
 
 变更记录：
 
 - `3a07363`：初始提交（当时 0x70/0x71 映射与 0x81 语义为假设；CONFIG_UNKNOWN 按 rate+mode 均下发清除）。
-- 本提交：0x70/0x71/0x81/+5F 转为原文已核实（文档更正，实现本就一致）；`CONFIG_UNKNOWN` 改为恒置位，UNCONFIRMED 的下发不再清除该位（`.c`/`.h`/测试同步修改）。
+- `4ea6084`：0x70/0x71/0x81/+5F 转为原文已核实（文档更正，实现本就一致）；`CONFIG_UNKNOWN` 改为恒置位，UNCONFIRMED 的下发不再清除该位。
+- 本次修正（校准超时分档）：`request_timeout_us=0` 时版本查询默认 1s、0x70/0x71 校准默认 30s，不再共用；显式非 0 值统一覆盖；新增默认/覆盖两个测试用例。API 与 Config 结构未变。
 
 ## 6. 主机测试覆盖（对照统筹要求）
 
@@ -145,7 +146,9 @@ mag_units、quat_wxyz、euler_rpy_rad、baro_*），无伪造字段。
 无法采到 IMU 数据（IMU TX→PA10）。H750 DMA/正式后端联调仍未开始、未通过。**
 
 - 方法：PowerShell `System.IO.Ports.SerialPort`，115200 8N1、无流控、DTR/RTS 关、
-  RX-only 10 秒、零写入；结束后 `Close()` 确认 `is-open=False`。
+  RX-only 10 秒、零写入；结束后 `Close()` 确认 `is-open=False`。注意：RX-only/零写入
+  只证明未主动发送数据，**不能证明 WCH-Link 物理 TX 引脚为高阻态**；PA10 共驱风险
+  须由硬件断开解决。
 - 依据数据认定：横幅字符串与 500ms 周期逐字对应 `imu_uart_debug.c` 自环自测代码，
   且已烧录构建的 `IMU_DBG_SELFTEST_ENABLE=1`（早于"不自环"规则），重烧即消除；
   与统筹方在 COM11（CDC）看到 IMU 十六进制文本自洽——IMU 数据只出现在 PA10→固件→CDC 路径。
