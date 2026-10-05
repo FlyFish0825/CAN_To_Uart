@@ -1,3 +1,10 @@
+/**
+ * @file usb_can_gateway.c
+ * @brief USB CDC 与 AA55/AA59 协议模块之间的非阻塞队列适配。
+ *
+ * CDC 回调和主循环通过 RX/TX 环形队列交接；路由状态机先识别 AA55 或
+ * AA59 帧族，再把整段字节交给唯一对应的解析器，避免两个协议同时消费。
+ */
 #include "usb_can_gateway.h"
 
 #include "firmware_flow.h"
@@ -11,8 +18,8 @@ typedef struct
   uint8_t data[USB_CAN_PACKET_SIZE];
 } UsbCanTxPacket_t;
 
-#define USB_CAN_RX_RING_MASK  (USB_CAN_RX_RING_SIZE - 1U)
-#define USB_CAN_TX_QUEUE_MASK (USB_CAN_TX_QUEUE_SIZE - 1U)
+#define USB_CAN_RX_RING_MASK  (USB_CAN_RX_RING_SIZE - 1U) /* RX 环索引掩码。 */
+#define USB_CAN_TX_QUEUE_MASK (USB_CAN_TX_QUEUE_SIZE - 1U) /* TX 队列索引掩码。 */
 /* 路由器半帧超过该时间没有新字节时，丢弃旧长度并重新同步。 */
 #define USB_PROTOCOL_ROUTE_TIMEOUT_MS 1000U
 
@@ -34,19 +41,20 @@ static volatile uint32_t usb_can_tx_stall_count = 0U; /* TX busy 超时恢复次
 
 typedef enum
 {
-  USB_PROTOCOL_WAIT_START = 0U,
-  USB_PROTOCOL_WAIT_FAMILY,
-  USB_PROTOCOL_AA55,
-  USB_PROTOCOL_AA59
+  USB_PROTOCOL_WAIT_START = 0U, /* 尚未发现 AA 帧头。 */
+  USB_PROTOCOL_WAIT_FAMILY, /* 已收到 AA，等待 55 或 59。 */
+  USB_PROTOCOL_AA55, /* 当前字节流归 AA55 CAN 网关解析器。 */
+  USB_PROTOCOL_AA59 /* 当前字节流归 AA59 固件流控解析器。 */
 } UsbProtocolRouteState_t;
 
 static UsbProtocolRouteState_t usb_protocol_route_state =
-    USB_PROTOCOL_WAIT_START;
-static uint16_t usb_protocol_route_count = 0U;
-static uint16_t usb_protocol_route_expected = 0U;
-static uint8_t usb_protocol_route_header[16];
-static uint32_t usb_protocol_route_last_tick = 0U;
+    USB_PROTOCOL_WAIT_START; /* 当前帧族路由状态。 */
+static uint16_t usb_protocol_route_count = 0U; /* 当前帧已路由的字节数。 */
+static uint16_t usb_protocol_route_expected = 0U; /* 根据长度字段计算的完整帧长度。 */
+static uint8_t usb_protocol_route_header[16]; /* AA59 固定头部暂存区。 */
+static uint32_t usb_protocol_route_last_tick = 0U; /* 路由器最近收到字节的时间。 */
 
+/** 返回 RX 环形缓冲可写的空闲字节数，保留一个空槽区分满/空。 */
 static uint16_t UsbCanGateway_RxFree(void)
 {
   uint16_t head;
@@ -60,6 +68,7 @@ static uint16_t UsbCanGateway_RxFree(void)
   return (uint16_t)((USB_CAN_RX_RING_SIZE - 1U) - used);
 }
 
+/** 返回 TX 环形队列当前已占用的包槽位数。 */
 static uint16_t UsbCanGateway_TxUsed(void)
 {
   uint16_t head;
@@ -71,6 +80,7 @@ static uint16_t UsbCanGateway_TxUsed(void)
   return (uint16_t)((head - tail) & USB_CAN_TX_QUEUE_MASK);
 }
 
+/** 清除协议族路由的半帧状态，等待下一个 AA 帧头。 */
 static void UsbCanGateway_RouteReset(void)
 {
   usb_protocol_route_state = USB_PROTOCOL_WAIT_START;
@@ -78,6 +88,7 @@ static void UsbCanGateway_RouteReset(void)
   usb_protocol_route_expected = 0U;
 }
 
+/** 将字节转交给当前唯一拥有该帧的协议解析器。 */
 static void UsbCanGateway_RouteToParser(uint8_t byte)
 {
   if (usb_protocol_route_state == USB_PROTOCOL_AA59)
@@ -368,6 +379,7 @@ HAL_StatusTypeDef UsbCanGateway_TxEnqueue(const uint8_t *data, uint16_t len)
   return HAL_OK;
 }
 
+/** 在主循环预算内从 RX 环取字节并执行协议路由。 */
 static void UsbCanGateway_ProcessRx(void)
 {
   uint16_t processed = 0U;
@@ -434,6 +446,7 @@ void UsbCanGateway_RxMarkPaused(void)
   usb_can_rx_paused = 1U;
 }
 
+/** 启动一个待发送 USB IN 包，并处理 CDC busy/超时恢复。 */
 static void UsbCanGateway_ProcessTx(void)
 {
   uint16_t tail;

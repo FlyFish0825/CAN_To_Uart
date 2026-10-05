@@ -22,7 +22,7 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
-
+/* CDC 回调只依赖 USB 网关的队列接口，不直接解析 AA55/AA59 协议。 */
 #include "usb_can_gateway.h"
 
 /* USER CODE END INCLUDE */
@@ -33,7 +33,7 @@
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-
+/* USB 网关状态由 usb_can_gateway.c 私有保存，本文件不重复维护队列。 */
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -51,7 +51,7 @@
   */
 
 /* USER CODE BEGIN PRIVATE_TYPES */
-
+/* 当前 CDC 适配层不新增私有类型。 */
 /* USER CODE END PRIVATE_TYPES */
 
 /**
@@ -64,6 +64,7 @@
   */
 
 /* USER CODE BEGIN PRIVATE_DEFINES */
+/* 当前 CDC 适配层不新增私有宏；缓冲区和水位常量由网关头文件提供。 */
 /* USER CODE END PRIVATE_DEFINES */
 
 /**
@@ -76,7 +77,7 @@
   */
 
 /* USER CODE BEGIN PRIVATE_MACRO */
-
+/* 当前 CDC 适配层不定义宏。 */
 /* USER CODE END PRIVATE_MACRO */
 
 /**
@@ -96,7 +97,7 @@ uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
-
+/* CubeMX 提供的 UserRxBufferFS/UserTxBufferFS 仍由 CDC 模板管理。 */
 /* USER CODE END PRIVATE_VARIABLES */
 
 /**
@@ -111,7 +112,7 @@ uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* USER CODE BEGIN EXPORTED_VARIABLES */
-
+/* 当前没有额外导出的 CDC 变量。 */
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**
@@ -130,7 +131,7 @@ static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
-
+/* 自定义 CDC 辅助函数原型由本文件后部的用户实现区提供。 */
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -154,6 +155,7 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 static int8_t CDC_Init_FS(void)
 {
   /* USER CODE BEGIN 3 */
+  /* 把 CubeMX 缓冲区交给 USB CDC 类，并清除网关残留发送状态。 */
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
@@ -169,6 +171,7 @@ static int8_t CDC_Init_FS(void)
 static int8_t CDC_DeInit_FS(void)
 {
   /* USER CODE BEGIN 4 */
+  /* USB 反初始化时保留网关队列数据，只清理当前 CDC 发送状态。 */
   UsbCanGateway_OnDeconfigured();
   return (USBD_OK);
   /* USER CODE END 4 */
@@ -184,6 +187,7 @@ static int8_t CDC_DeInit_FS(void)
 static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 {
   /* USER CODE BEGIN 5 */
+  /* 控制请求由 CDC 类模板处理；本网关不在控制请求中承载业务协议。 */
   switch(cmd)
   {
     case CDC_SEND_ENCAPSULATED_COMMAND:
@@ -265,6 +269,7 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  /* Buf/Len 属于 USB OUT 回调上下文，必须在本次回调内完成必要的入队。 */
   /* USB OUT 回调只搬字节到 8 KB 环形缓冲，不在中断中解析 AA55 协议。 */
   if ((Buf != NULL) && (Len != NULL) && (*Len <= UINT16_MAX))
   {
@@ -304,6 +309,7 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
+  /* Buf/Len 是当前待发送包；本函数只提交给 CDC，不等待传输完成。 */
   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
 
   /* 电脑尚未完成 USB 枚举/配置时，CDC 类实例可能还没有创建。
@@ -340,6 +346,7 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 {
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 13 */
+  /* 回调参数由 USB 栈提供；网关只需要完成通知推进 TX 队列。 */
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
@@ -362,6 +369,7 @@ void CDC_ResetTransmitState_FS(void)
   USBD_CDC_HandleTypeDef *hcdc =
       (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
 
+  /* 超时恢复只清除 CDC 类的 busy 状态，不删除网关中尚未发送的数据。 */
   if ((hcdc == NULL) ||
       (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED))
   {
@@ -381,6 +389,7 @@ uint8_t CDC_ResumeReceive_FS(void)
   USBD_CDC_HandleTypeDef *hcdc =
       (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
 
+  /* 仅在设备已配置且 CDC 类实例有效时重新提交 OUT 接收。 */
   if ((hcdc == NULL) ||
       (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED))
   {
