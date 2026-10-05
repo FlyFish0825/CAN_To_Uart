@@ -1,5 +1,5 @@
-#ifndef __I2C_H__
-#define __I2C_H__
+#ifndef __SENSOR_I2C_BUS_H__
+#define __SENSOR_I2C_BUS_H__
 
 #ifdef __cplusplus
 extern "C" {
@@ -8,7 +8,11 @@ extern "C" {
 #include <stdint.h>
 
 /*
- * 极简 I2C 主设备事务层。
+ * 极简 I2C 主设备事务层（传感器总线包装）。
+ *
+ * 文件名刻意不叫 i2c.c/i2c.h，避免与 STM32CubeMX 生成的 Core/Src/i2c.c、Core/Inc/i2c.h
+ * （里面有 MX_I2C3_Init / HAL_I2C_MspInit）冲突。HAL 层的 I2C3 初始化由集成方负责，
+ * 本模块只要求把已经初始化好的句柄通过 I2c_Init() 传进来。
  *
  * 设计目标只有两条：
  *  1. 每次事务都带明确的毫秒超时，最坏情况下不会把主循环卡住；
@@ -119,4 +123,4 @@ I2cBusResult_t I2c_WriteRead(const uint8_t *tx,
 }
 #endif
 
-#endif /* __I2C_H__ */
+#endif /* __SENSOR_I2C_BUS_H__ */
