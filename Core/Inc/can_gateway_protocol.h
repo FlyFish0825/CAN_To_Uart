@@ -1,3 +1,10 @@
+/**
+ * @file can_gateway_protocol.h
+ * @brief AA55 外部 CAN 网关协议的布局和数据路径说明。
+ *
+ * 具体状态机和队列实现位于 can_gateway_core.c；本文件只保留不会被
+ * CubeMX 重新生成覆盖的协议契约，供固件、上位机和抓包工具对照。
+ */
 #ifndef __CAN_GATEWAY_PROTOCOL_H__
 #define __CAN_GATEWAY_PROTOCOL_H__
 

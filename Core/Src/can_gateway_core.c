@@ -1,3 +1,11 @@
+/**
+ * @file can_gateway_core.c
+ * @brief AA55 协议解析、CAN 双向软件队列和 FDCAN 主循环调度。
+ *
+ * 外部输入路径为“字节流 -> CRC/长度校验 -> CAN TX 队列 -> FDCAN FIFO”，
+ * 反向路径为“FDCAN RX FIFO -> CAN RX 队列 -> AA55 封装 -> 外部发送接口”。
+ * 中断只负责把硬件事件快速放入队列，所有协议和队列消费都在主循环完成。
+ */
 #include "can_gateway_core.h"
 #include "fdcan.h"
 
@@ -10,17 +18,25 @@ typedef CanGatewayCanFrame_t CanFrame_t;
  */
 typedef struct
 {
+  /** 已匹配的 CAN 标识符、标志和数据长度。 */
   CanFrame_t frame;
+  /** 可靠流控块使用的异步完成令牌。 */
   uint32_t token;
+  /** 非零表示发送后必须调用完成回调。 */
   uint8_t tracked;
 } CanTxQueueEntry_t;
 
 typedef struct
 {
+  /** 目标名义比特率，单位 bit/s。 */
   uint32_t bitrate;
+  /** FDCAN 时钟分频系数。 */
   uint32_t prescaler;
+  /** 同步跳转宽度。 */
   uint32_t sjw;
+  /** 时间段 1 的时间量子数。 */
   uint32_t seg1;
+  /** 时间段 2 的时间量子数。 */
   uint32_t seg2;
 } CanBitTiming_t;
 
@@ -36,14 +52,14 @@ typedef enum
   GATEWAY_PARSER_READ_BODY          /* 已知总长度，接收剩余字段 */
 } GatewayParserState_t;
 
-#define CAN_QUEUE_SIZE          64U
-#define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U)
+#define CAN_QUEUE_SIZE          64U /* RX/TX 软件环形队列的槽位数，必须为 2 的幂。 */
+#define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U) /* 环形索引掩码。 */
 /* 保留一段余量，不能等到 63 个槽位全部占满才停止接收。 */
 #define CAN_TX_QUEUE_HIGH_WATERMARK 48U
 /* 成功状态只做低频诊断，不为每个数据帧生成一个 USB 回包。 */
-#define GATEWAY_STATUS_REPORT_INTERVAL_MS 100U
+#define GATEWAY_STATUS_REPORT_INTERVAL_MS 100U /* 诊断状态包的最短上报间隔。 */
 /* 硬件 TX FIFO 长时间没有释放槽位时，触发一次控制器恢复。 */
-#define CAN_TX_FIFO_STALL_TIMEOUT_MS 100U
+#define CAN_TX_FIFO_STALL_TIMEOUT_MS 100U /* FDCAN TX FIFO 无空槽时的恢复等待时间。 */
 /* USB 字节流中半帧超过该时间仍未收齐，认为本帧已损坏并重新找帧头。 */
 #define UART_PARSER_TIMEOUT_MS  1000U
 /*
@@ -51,45 +67,45 @@ typedef enum
  * CAN_ID、FLAGS、LEN 和 DATA，不包含帧头、CRC、帧尾；完整帧总长为
  * BODY_LEN + 6。普通数据帧的 BODY_LEN 范围为 8..72。
  */
-#define UART_PACKET_SIZE        78U
-#define UART_PACKET_BODY_LEN    72U
-#define UART_PACKET_MIN_BODY_LEN 8U
-#define UART_CONFIG_RESPONSE_BODY_LEN 17U
-#define UART_FRAME_START_0      0xAAU
-#define UART_FRAME_START_1      0x55U
-#define UART_FRAME_END_0        0x55U
-#define UART_FRAME_END_1        0xAAU
-#define UART_BOOT_TEST_ID       0x7FFU
-#define UART_RX_STATUS_ID       0x7FEU
-#define CAN_PUT_STATUS_ID       0x7FDU
-#define UART_CRC_ERROR_ID       0x7FCU
-#define UART_PROTOCOL_ERROR_ID  0x7FBU
-#define CAN_PUT_ERROR_ID        0x7FAU
+#define UART_PACKET_SIZE        78U /* AA55 最大完整帧长度。 */
+#define UART_PACKET_BODY_LEN    72U /* AA55 普通数据帧最大 BODY_LEN。 */
+#define UART_PACKET_MIN_BODY_LEN 8U /* SEQ/CAN_ID/FLAGS/LEN 固定字段长度。 */
+#define UART_CONFIG_RESPONSE_BODY_LEN 17U /* 配置响应的 BODY_LEN。 */
+#define UART_FRAME_START_0      0xAAU /* AA55 帧头第一个字节。 */
+#define UART_FRAME_START_1      0x55U /* AA55 帧头第二个字节。 */
+#define UART_FRAME_END_0        0x55U /* AA55 帧尾第一个字节。 */
+#define UART_FRAME_END_1        0xAAU /* AA55 帧尾第二个字节。 */
+#define UART_BOOT_TEST_ID       0x7FFU /* 启动自检报文使用的标准 ID。 */
+#define UART_RX_STATUS_ID       0x7FEU /* USB/外部接收状态诊断 ID。 */
+#define CAN_PUT_STATUS_ID       0x7FDU /* CAN 入队成功诊断 ID。 */
+#define UART_CRC_ERROR_ID       0x7FCU /* AA55 CRC 错误诊断 ID。 */
+#define UART_PROTOCOL_ERROR_ID  0x7FBU /* AA55 格式错误诊断 ID。 */
+#define CAN_PUT_ERROR_ID        0x7FAU /* CAN 发送/控制器错误诊断 ID。 */
 
-#define CAN_FLAG_EXTENDED       0x01U
-#define CAN_FLAG_FD             0x02U
-#define CAN_FLAG_BRS            0x04U
-#define CAN_FLAG_REMOTE         0x08U
-#define CAN_FLAG_VALID_MASK     0x0FU
+#define CAN_FLAG_EXTENDED       0x01U /* 使用 29 位扩展 ID。 */
+#define CAN_FLAG_FD             0x02U /* 使用 CAN FD 格式。 */
+#define CAN_FLAG_BRS            0x04U /* CAN FD 启用比特率切换。 */
+#define CAN_FLAG_REMOTE         0x08U /* 经典 CAN 远程帧。 */
+#define CAN_FLAG_VALID_MASK     0x0FU /* 允许的 CAN 标志位集合。 */
 
-#define UART_FLAG_CONTROL       0x80U
-#define UART_CMD_SET_BITRATE    0x01U
-#define UART_RSP_SET_BITRATE    0x81U
+#define UART_FLAG_CONTROL       0x80U /* AA55 FLAGS 中表示配置控制帧。 */
+#define UART_CMD_SET_BITRATE    0x01U /* 设置名义/数据比特率命令。 */
+#define UART_RSP_SET_BITRATE    0x81U /* 设置比特率响应命令。 */
 
-#define UART_CFG_OK             0x00U
-#define UART_CFG_BAD_RATE       0x01U
-#define UART_CFG_APPLY_FAILED   0x02U
+#define UART_CFG_OK             0x00U /* 配置已接受并生效。 */
+#define UART_CFG_BAD_RATE       0x01U /* 请求比特率不在预置表中。 */
+#define UART_CFG_APPLY_FAILED   0x02U /* 硬件重启或应用配置失败。 */
 /* CAN 接收软件队列：中断负责写入，主循环负责取出并封装上报。 */
-static CanFrame_t can_rx_queue[CAN_QUEUE_SIZE];
-static volatile uint16_t can_rx_head = 0U;
-static volatile uint16_t can_rx_tail = 0U;
+static CanFrame_t can_rx_queue[CAN_QUEUE_SIZE]; /* ISR 写入、主循环消费的 CAN RX 队列。 */
+static volatile uint16_t can_rx_head = 0U; /* RX 队列下一个写入位置。 */
+static volatile uint16_t can_rx_tail = 0U; /* RX 队列下一个消费位置。 */
 
 /* CAN 发送软件队列：协议解析后写入，主循环再提交给 FDCAN 硬件 FIFO。 */
-static CanTxQueueEntry_t can_tx_queue[CAN_QUEUE_SIZE];
-static volatile uint16_t can_tx_head = 0U;
-static volatile uint16_t can_tx_tail = 0U;
-static CanGatewayTxCompletionFn can_tx_completion_callback = NULL;
-static void *can_tx_completion_context = NULL;
+static CanTxQueueEntry_t can_tx_queue[CAN_QUEUE_SIZE]; /* 外部命令待发 CAN 队列。 */
+static volatile uint16_t can_tx_head = 0U; /* TX 队列下一个写入位置。 */
+static volatile uint16_t can_tx_tail = 0U; /* TX 队列当前待提交位置。 */
+static CanGatewayTxCompletionFn can_tx_completion_callback = NULL; /* 可靠块完成通知。 */
+static void *can_tx_completion_context = NULL; /* 完成通知的私有上下文。 */
 
 /*
  * 协议接收状态：
@@ -100,13 +116,13 @@ static void *can_tx_completion_context = NULL;
  *   等于 BODY_LEN+6，用于判断何时调用提交函数；
  * - uart_tx_sequence：输出协议帧使用的 16 位序号，每发送一帧递增。
  */
-static uint8_t uart_rx_packet[UART_PACKET_SIZE];
-static uint8_t uart_rx_index = 0U;
-static uint8_t uart_rx_expected_size = 0U;
-static uint32_t uart_parser_last_tick = 0U;
-static uint16_t uart_tx_sequence = 0U;
-static CanGatewayTransportOps_t gateway_transport = {0};
-static GatewayParserState_t gateway_parser_state = GATEWAY_PARSER_WAIT_START_0;
+static uint8_t uart_rx_packet[UART_PACKET_SIZE]; /* 当前 AA55 半帧缓存。 */
+static uint8_t uart_rx_index = 0U; /* 当前缓存下一个写入偏移。 */
+static uint8_t uart_rx_expected_size = 0U; /* BODY_LEN 确认后的完整帧长度。 */
+static uint32_t uart_parser_last_tick = 0U; /* 最近一次收到 AA55 字节的时间。 */
+static uint16_t uart_tx_sequence = 0U; /* 外部上报帧序号。 */
+static CanGatewayTransportOps_t gateway_transport = {0}; /* 外部传输适配器副本。 */
+static GatewayParserState_t gateway_parser_state = GATEWAY_PARSER_WAIT_START_0; /* AA55 状态机。 */
 
 /*
  * 运行统计计数。计数只用于诊断，不参与协议状态机；声明为 volatile，
@@ -127,15 +143,15 @@ static volatile uint8_t can_recovery_pending = 0U;
 static volatile uint8_t can_tx_fifo_stall_active = 0U;
 static volatile uint32_t can_tx_fifo_stall_tick = 0U;
 
-static volatile uint8_t bitrate_change_pending = 0U;
-static uint32_t pending_nominal_bps = 1000000U;
-static uint32_t pending_data_bps = 8000000U;
-static uint16_t pending_config_sequence = 0U;
-static uint32_t current_nominal_bps = 1000000U;
-static uint32_t current_data_bps = 8000000U;
-static volatile uint8_t config_response_pending = 0U;
-static uint8_t config_response_status = UART_CFG_OK;
-static uint16_t config_response_sequence = 0U;
+static volatile uint8_t bitrate_change_pending = 0U; /* 主循环待应用的配置请求标志。 */
+static uint32_t pending_nominal_bps = 1000000U; /* 待应用的 CAN 名义比特率。 */
+static uint32_t pending_data_bps = 8000000U; /* 待应用的 CAN FD 数据比特率。 */
+static uint16_t pending_config_sequence = 0U; /* 请求对应的 AA55 序号。 */
+static uint32_t current_nominal_bps = 1000000U; /* 当前生效的名义比特率。 */
+static uint32_t current_data_bps = 8000000U; /* 当前生效的 CAN FD 数据比特率。 */
+static volatile uint8_t config_response_pending = 0U; /* 是否等待发送配置响应。 */
+static uint8_t config_response_status = UART_CFG_OK; /* 配置响应中的状态码。 */
+static uint16_t config_response_sequence = 0U; /* 配置响应回显的请求序号。 */
 
 static const CanBitTiming_t nominal_timing_table[] =
 {
@@ -148,6 +164,7 @@ static const CanBitTiming_t nominal_timing_table[] =
   {1000000U,   5U, 3U, 12U, 3U }
 };
 
+/* CAN FD 数据相位允许的比特率及其预计算时序参数。 */
 static const CanBitTiming_t data_timing_table[] =
 {
   { 500000U, 10U, 3U, 12U, 3U },
@@ -158,6 +175,7 @@ static const CanBitTiming_t data_timing_table[] =
   {8000000U,  1U, 2U,  7U, 2U }
 };
 
+/** 初始化 STM32 CRC 外设，使其实现 CRC-8/ATM（多项式 0x07）。 */
 static void Crc8Hw_Init(void)
 {
   __HAL_RCC_CRC_CLK_ENABLE();
@@ -168,6 +186,7 @@ static void Crc8Hw_Init(void)
   SET_BIT(CRC->CR, CRC_CR_RESET);
 }
 
+/** 在临界区内计算 AA55 帧 CRC，避免并发访问共享 CRC 外设。 */
 static uint8_t Crc8AtmHw(const uint8_t *data, uint16_t len)
 {
   uint32_t primask = __get_PRIMASK();
@@ -209,6 +228,7 @@ static uint8_t Crc8AtmHw(const uint8_t *data, uint16_t len)
   return (uint8_t)value16;
 }
 
+/** 将 HAL/FDCAN DLC 编码转换为实际数据字节数。 */
 static uint8_t CanDlcToLength(uint32_t dlc)
 {
   switch (dlc)
@@ -233,6 +253,7 @@ static uint8_t CanDlcToLength(uint32_t dlc)
   }
 }
 
+/** 将实际数据长度转换为 FDCAN 可接受的 DLC 编码。 */
 static uint8_t CanLengthToDlc(uint8_t len, uint32_t *dlc)
 {
   if (dlc == NULL)
@@ -263,6 +284,7 @@ static uint8_t CanLengthToDlc(uint8_t len, uint32_t *dlc)
   return 1U;
 }
 
+/** 校验 CAN ID、帧类型、远程帧限制和 CAN/CAN FD 长度是否合法。 */
 static uint8_t CanFrame_Validate(const CanFrame_t *frame)
 {
   uint32_t dummy_dlc;
@@ -291,6 +313,7 @@ static uint8_t CanFrame_Validate(const CanFrame_t *frame)
   return 1U;
 }
 
+/** 调用已注册的外部发送适配器，并把抽象结果映射为 HAL 状态。 */
 static HAL_StatusTypeDef GatewayTx_Enqueue(const uint8_t *data, uint16_t len)
 {
   CanGatewayIoResult_t result;
@@ -372,6 +395,7 @@ static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
   return HAL_OK;
 }
 
+/** 发送启动自检用的固定 8 字节 AA55 状态帧。 */
 static void Gateway_SendBootTestPacket(void)
 {
   CanFrame_t frame = {0};
@@ -389,6 +413,7 @@ static void Gateway_SendBootTestPacket(void)
   (void)Gateway_SendCanPacket(&frame);
 }
 
+/** 将 8 字节诊断文本封装为指定标准 CAN ID 的状态帧。 */
 static HAL_StatusTypeDef Gateway_SendStatusPacket(uint32_t id,
                                                   const char text[8])
 {
@@ -404,6 +429,7 @@ static HAL_StatusTypeDef Gateway_SendStatusPacket(uint32_t id,
   return Gateway_SendCanPacket(&frame);
 }
 
+/** 消费一个 CAN RX 队列元素并封装为外部 AA55 上报包。 */
 static void CanRx_ProcessTransport(void)
 {
   /*
@@ -532,6 +558,7 @@ static void CanTx_ProcessBus(void)
   CanTx_NotifyCompletion(&entry, 1U);
 }
 
+/** 在给定的名义或数据时序表中查找目标比特率。 */
 static const CanBitTiming_t *FindTiming(const CanBitTiming_t *table,
                                         uint32_t count,
                                         uint32_t bitrate)
@@ -547,6 +574,7 @@ static const CanBitTiming_t *FindTiming(const CanBitTiming_t *table,
   return NULL;
 }
 
+/** 读取 AA55 控制字段中的小端序 32 位数值。 */
 static uint32_t ReadU32Le(const uint8_t *p)
 {
   return ((uint32_t)p[0]) |
@@ -555,6 +583,7 @@ static uint32_t ReadU32Le(const uint8_t *p)
          ((uint32_t)p[3] << 24U);
 }
 
+/** 写入 AA55 配置响应中的小端序 32 位数值。 */
 static void WriteU32Le(uint8_t *p, uint32_t value)
 {
   p[0] = (uint8_t)(value & 0xFFU);
@@ -563,6 +592,7 @@ static void WriteU32Le(uint8_t *p, uint32_t value)
   p[3] = (uint8_t)((value >> 24U) & 0xFFU);
 }
 
+/** 配置 FDCAN RX、错误和 TX FIFO 空闲通知中断。 */
 static HAL_StatusTypeDef CanGateway_ActivateNotifications(void)
 {
   return HAL_FDCAN_ActivateNotification(
@@ -657,6 +687,7 @@ static HAL_StatusTypeDef ApplyCanBitrate(uint32_t nominal_bps,
   return HAL_OK;
 }
 
+/** 组装并发送比特率配置响应 AA55 控制包。 */
 static void Gateway_SendConfigResponse(void)
 {
   uint8_t packet[UART_PACKET_SIZE] = {0};
@@ -750,6 +781,7 @@ HAL_StatusTypeDef CanGateway_SetTxCompletionCallback(
   return HAL_OK;
 }
 
+/** 将已通过 AA55 校验的数据包转换并放入 CAN TX 队列。 */
 static void QueueCanTxFromPacket(const uint8_t *packet)
 {
   CanFrame_t frame;
@@ -785,6 +817,7 @@ static void QueueCanTxFromPacket(const uint8_t *packet)
   uart_valid_packet_count++;
 }
 
+/** 处理 AA55 控制帧，目前负责校验和申请比特率变更。 */
 static void HandleControlPacket(const uint8_t *packet)
 {
   uint32_t nominal_bps;
@@ -833,6 +866,7 @@ static void HandleControlPacket(const uint8_t *packet)
  *
  * 校验失败时只增加对应错误计数并返回，不会把不完整数据送入 CAN 队列。
  */
+/** 校验完整 AA55 帧尾/CRC，并分派控制帧或 CAN 数据帧。 */
 static void UartParser_CommitPacket(void)
 {
   uint8_t crc_index;
@@ -880,6 +914,7 @@ static void UartParser_CommitPacket(void)
  * 当帧头或长度非法时，立即回到寻找 AA 55 的状态，保证后续数据可以重新
  * 对齐，而不会因为一个坏字节永久卡在错误位置。
  */
+/** 向 AA55 增量解析状态机输入一个字节。 */
 static void UartParser_PushByte(uint8_t byte)
 {
   switch (gateway_parser_state)
