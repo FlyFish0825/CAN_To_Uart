@@ -31,6 +31,8 @@
 #include "firmware_flow.h"
 #include "system_heartbeat.h"
 #include "usb_can_gateway.h"
+/* 【调试分支】IMU 串口读取与 CDC 文本打印模块。 */
+#include "imu_uart_debug.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -64,6 +66,11 @@ static void MPU_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 /* 预留用户辅助代码区；协议处理函数位于独立手写模块。 */
+/*
+ * 【imu-uart1-debug 调试分支】置 1：关闭 AA58 心跳，启用 IMU 串口直打
+ * 调试；置 0：恢复心跳、停用调试打印。该开关仅用于测试分支，不进 main。
+ */
+#define IMU_UART_DEBUG 1
 /* USER CODE END 0 */
 
 /**
@@ -123,12 +130,26 @@ int main(void)
   /*
    * 单独注册公共链路心跳。它使用 AA58 System PING 协议，不经过 CAN 网关
    * 解析器，也不携带 CAN ID/数据；发送时只复用同一外部传输队列。
+   *
+   * 【调试分支】IMU 直打调试期间关闭 AA58 心跳，避免心跳帧混入 COM11
+   * 观察输出；IMU_UART_DEBUG 置 0 后恢复。
    */
+#if !IMU_UART_DEBUG
   if (SystemHeartbeat_Init(UsbCanGateway_GetSystemTransport()) != HAL_OK)
   {
     Error_Handler();
   }
+#endif
   /* 三个模块均注册成功后，主循环才开始消费协议和传输队列。 */
+
+  /*
+   * 【调试分支】启动 IMU 串口读取：USART1（PA9/PA10，921600）DMA 循环
+   * 接收，主循环把新收到的字节按十六进制文本行写入 USB CDC 发送队列。
+   */
+  if (ImuUartDebug_Init() != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -148,8 +169,15 @@ int main(void)
      */
     CanGateway_Process();
 
+#if !IMU_UART_DEBUG
     /* 每秒检查一次公共链路心跳，未到周期时立即返回，不阻塞主循环。 */
     SystemHeartbeat_Process();
+#endif
+
+#if IMU_UART_DEBUG
+    /* 【调试分支】IMU 串口读取与 CDC 文本打印；心跳已临时关闭。 */
+    ImuUartDebug_Process();
+#endif
 
     /*
      * 第二步运行 USB 传输层：搬运 RX 环形缓冲中的字节、启动一个 USB TX
