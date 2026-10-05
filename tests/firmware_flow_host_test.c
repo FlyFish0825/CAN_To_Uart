@@ -1,3 +1,11 @@
+/**
+ * @file firmware_flow_host_test.c
+ * @brief 不依赖 STM32 HAL 的 AA59 固件流控主机测试。
+ *
+ * 本文件提供最小 HAL/CAN 桩并直接编译 firmware_flow.c，覆盖协议 CRC、
+ * 半包输入、经典 CAN/CAN FD 分帧、credit、队列反压和 ACK 重试；它不代表
+ * 已在真实 USB、FDCAN 或目标板上运行。
+ */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,8 +51,8 @@ typedef void (*CanGatewayTxCompletionFn)(void *context,
 
 #include "../Core/Inc/firmware_flow.h"
 
-#define TEST_MAX_CAN_FRAMES  4096U
-#define TEST_MAX_ACK_PACKETS 1024U
+#define TEST_MAX_CAN_FRAMES  4096U /* CAN 入队桩可记录的最大帧数。 */
+#define TEST_MAX_ACK_PACKETS 1024U /* 外部 ACK 发送桩可记录的最大包数。 */
 
 static uint32_t test_tick; /* HAL_GetTick() 主机桩返回的可控时间。 */
 static uint8_t test_can_ready = 1U; /* 主机桩报告的 CAN 队列可用状态。 */
@@ -60,6 +68,7 @@ static void *test_completion_context; /* 完成回调的上下文桩值。 */
 
 uint32_t HAL_GetTick(void)
 {
+  /* 用可控时钟替代 MCU SysTick，使 ACK 间隔和解析超时可重复测试。 */
   return test_tick;
 }
 
@@ -71,6 +80,7 @@ uint8_t CanGateway_CanTxReady(void)
 CanGatewayIoResult_t CanGateway_QueueCanFrame(
     const CanGatewayCanFrame_t *frame)
 {
+  /* 该桩只记录逻辑入队结果，不模拟真实 FDCAN FIFO。 */
   if (test_can_result != CAN_GATEWAY_IO_OK)
   {
     return test_can_result;
@@ -135,9 +145,11 @@ static const CanGatewayTransportOps_t test_transport =
 
 static uint16_t Test_ReadU16Le(const uint8_t *data)
 {
+  /* 测试协议字段均按小端序编码。 */
   return (uint16_t)data[0] | ((uint16_t)data[1] << 8U);
 }
 
+/** 从测试 ACK 的固定字段读取小端序 32 位值。 */
 static uint32_t Test_ReadU32Le(const uint8_t *data)
 {
   return (uint32_t)data[0] |
@@ -146,12 +158,14 @@ static uint32_t Test_ReadU32Le(const uint8_t *data)
          ((uint32_t)data[3] << 24U);
 }
 
+/** 向测试协议缓冲区写入小端序 16 位值。 */
 static void Test_WriteU16Le(uint8_t *data, uint16_t value)
 {
   data[0] = (uint8_t)value;
   data[1] = (uint8_t)(value >> 8U);
 }
 
+/** 向测试协议缓冲区写入小端序 32 位值。 */
 static void Test_WriteU32Le(uint8_t *data, uint32_t value)
 {
   data[0] = (uint8_t)value;
@@ -224,11 +238,12 @@ static void Test_Reset(void)
   assert(FirmwareFlow_Init(&test_transport) == HAL_OK);
 }
 
+/** 构造 BEGIN 包并检查初始 ACK 的会话、credit 和队列容量字段。 */
 static void Test_SendBegin(uint32_t firmware_size)
 {
-  uint8_t payload[4];
-  uint8_t packet[FW_FLOW_RX_PACKET_SIZE];
-  uint16_t length;
+  uint8_t payload[4]; /* BEGIN 的固件总长度字段。 */
+  uint8_t packet[FW_FLOW_RX_PACKET_SIZE]; /* AA59 测试包缓存。 */
+  uint16_t length; /* 实际构造出的完整包长度。 */
 
   Test_WriteU32Le(payload, firmware_size);
   length = Test_BuildPacket(FW_FLOW_CMD_BEGIN,
@@ -244,16 +259,17 @@ static void Test_SendBegin(uint32_t firmware_size)
   assert(test_ack_packets[0][24] == FW_FLOW_STATUS_OK);
 }
 
+/** 构造 DATA_BLOCK 包；数据内容按 offset 递增便于验证转发结果。 */
 static void Test_SendBlock(uint32_t can_id,
                            uint8_t can_flags,
                            uint32_t block_index,
                            uint32_t offset,
                            uint8_t valid_len)
 {
-  uint8_t payload[FW_FLOW_MAX_PAYLOAD];
-  uint8_t packet[FW_FLOW_RX_PACKET_SIZE];
-  uint16_t length;
-  uint8_t i;
+  uint8_t payload[FW_FLOW_MAX_PAYLOAD]; /* DATA_BLOCK 头和数据。 */
+  uint8_t packet[FW_FLOW_RX_PACKET_SIZE]; /* AA59 测试包缓存。 */
+  uint16_t length; /* 实际构造出的完整包长度。 */
+  uint8_t i; /* 填充递增测试数据的索引。 */
 
   memset(payload, 0, sizeof(payload));
   Test_WriteU32Le(&payload[0], can_id);
@@ -274,8 +290,8 @@ static void Test_SendBlock(uint32_t can_id,
 
 static uint16_t Test_AckCreditSum(uint32_t start_index)
 {
-  uint32_t i;
-  uint16_t total = 0U;
+  uint32_t i; /* ACK 记录遍历索引。 */
+  uint16_t total = 0U; /* 累计返还的 credit。 */
   for (i = start_index; i < test_ack_count; i++)
   {
     total = (uint16_t)(total + Test_ReadU16Le(&test_ack_packets[i][20]));
@@ -283,6 +299,7 @@ static uint16_t Test_AckCreditSum(uint32_t start_index)
   return total;
 }
 
+/** 验证经典 CAN 按 8 字节拆帧以及每块只返还一次 credit。 */
 static void Test_ClassicLengths(void)
 {
   static const uint8_t lengths[] = {1U, 7U, 8U, 9U, 23U, 63U, 64U};
@@ -315,6 +332,7 @@ static void Test_ClassicLengths(void)
   }
 }
 
+/** 将任意逻辑长度映射为 CAN FD 的合法 DLC 数据长度。 */
 static uint8_t Test_ExpectedFdLength(uint8_t length)
 {
   if (length <= 8U) return length;
@@ -327,6 +345,7 @@ static uint8_t Test_ExpectedFdLength(uint8_t length)
   return 64U;
 }
 
+/** 验证 CAN FD 单帧长度向上取整和填充字节规则。 */
 static void Test_FdLengths(void)
 {
   static const uint8_t lengths[] = {1U, 7U, 8U, 9U, 23U, 63U, 64U};
@@ -355,6 +374,7 @@ static void Test_FdLengths(void)
   }
 }
 
+/** 验证多块连续传输、顺序推进、末块标记和累计 credit。 */
 static void Test_MultiBlock(uint32_t firmware_size)
 {
   uint32_t block_index = 0U;
@@ -391,6 +411,7 @@ static void Test_MultiBlock(uint32_t firmware_size)
   assert(Test_AckCreditSum(first_ack) == block_index);
 }
 
+/** 验证初始 credit/高水位满载时拒绝新块，并在腾空后重试。 */
 static void Test_QueueFullAndRetry(void)
 {
   uint32_t i;
@@ -429,6 +450,7 @@ static void Test_QueueFullAndRetry(void)
   assert(fw_last_completed_block == 16U);
 }
 
+/** 验证 CAN 下游不可用时保留队首块，恢复后继续发送。 */
 static void Test_CanBusyAndFailure(void)
 {
   Test_Reset();
@@ -469,6 +491,7 @@ static void Test_CanBusyAndFailure(void)
   assert(Test_ReadU16Le(&test_ack_packets[test_ack_count - 1U][20]) == 0U);
 }
 
+/** 验证 ACK 传输层 BUSY 时不重复扣 credit，恢复后只发送一次。 */
 static void Test_AckBusyRetry(void)
 {
   uint32_t ack_before;
@@ -493,6 +516,7 @@ static void Test_AckBusyRetry(void)
   assert(test_ack_count == ack_before + 1U);
 }
 
+/** 验证 CRC 错误包被拒绝并产生 INVALID_BLOCK 强制 ACK。 */
 static void Test_InvalidCrc(void)
 {
   uint8_t payload[4];
