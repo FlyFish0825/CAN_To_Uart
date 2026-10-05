@@ -47,7 +47,11 @@ typedef struct
   uint8_t busy; /* 1 = 返回 HAL_BUSY。 */
   uint8_t model; /* 仿真设备真实型号，决定转换时间。 */
   uint8_t conversion; /* 0 空闲 / 1 D1 / 2 D2。 */
+  uint32_t conversion_command_ms; /* 收到转换命令的时刻。 */
   uint32_t conversion_ready_ms; /* 转换完成的时刻。 */
+  uint32_t min_conv_wait_ms; /* 观测到的最小“命令→读 ADC”间隔。 */
+  uint8_t min_conv_wait_valid; /* 是否已记录过转换等待。 */
+  uint32_t tx_time_ms; /* 每次 HAL I2C 事务占用总线的毫秒数（模拟真实事务耗时）。 */
   uint32_t d1_value; /* D1 目标值。 */
   uint32_t d2_value; /* D2 目标值。 */
   uint32_t early_reads; /* 提前读 ADC 的次数（期望 0）。 */
@@ -116,6 +120,10 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
 
   command = data[0];
   sim_log_command(command);
+  if (sim.tx_time_ms != 0U)
+  {
+    test_tick += sim.tx_time_ms; /* 事务本身占用总线时间，验证驱动的等待不受相位影响。 */
+  }
 
   if (command == 0x1EU) /* 复位 */
   {
@@ -132,6 +140,7 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
       return HAL_ERROR;
     }
     sim.conversion = 1U;
+    sim.conversion_command_ms = test_tick;
     sim.conversion_ready_ms = test_tick + sim_conversion_ms(sim.model, index);
     return HAL_OK;
   }
@@ -143,6 +152,7 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
       return HAL_ERROR;
     }
     sim.conversion = 2U;
+    sim.conversion_command_ms = test_tick;
     sim.conversion_ready_ms = test_tick + sim_conversion_ms(sim.model, index);
     return HAL_OK;
   }
@@ -162,9 +172,16 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
   if (command == 0x00U) /* ADC 读 */
   {
     uint32_t value = (sim.conversion == 1U) ? sim.d1_value : sim.d2_value;
+    uint32_t waited;
     if ((sim.conversion == 0U) || ((int32_t)(test_tick - sim.conversion_ready_ms) < 0))
     {
       sim.early_reads++; /* 转换未完成就被读取：驱动等待时间不足。 */
+    }
+    waited = test_tick - sim.conversion_command_ms;
+    if ((sim.min_conv_wait_valid == 0U) || (waited < sim.min_conv_wait_ms))
+    {
+      sim.min_conv_wait_ms = waited;
+      sim.min_conv_wait_valid = 1U;
     }
     sim.read_buffer[0] = (uint8_t)((value >> 16) & 0xFFU);
     sim.read_buffer[1] = (uint8_t)((value >> 8) & 0xFFU);
@@ -202,6 +219,10 @@ HAL_StatusTypeDef HAL_I2C_Master_Receive(I2C_HandleTypeDef *hi2c,
   }
   memcpy(data, sim.read_buffer, size);
   sim.read_pending = 0U;
+  if (sim.tx_time_ms != 0U)
+  {
+    test_tick += sim.tx_time_ms;
+  }
   return HAL_OK;
 }
 
@@ -717,7 +738,9 @@ static void Test_CommandSequence(void)
   CHECK(first_d1 == 0x40U);
   CHECK(first_d2 == 0x50U);
 
-  /* OSR8192 → 0x4A/0x5A。 */
+  /* OSR8192 的周期预算是 42 ms，25 Hz 放不下：先降到 20 Hz；此时 D1=0x4A、D2=0x5A。 */
+  CHECK(Ms5837_SetOsr(MS5837_OSR_8192) == MS5837_ERR_PARAM);
+  CHECK(Ms5837_SetOutputRateHz(20U) == MS5837_OK);
   CHECK(Ms5837_SetOsr(MS5837_OSR_8192) == MS5837_OK);
   sim.command_count = 0U;
   Ms5837_ClearNewSampleFlag();
@@ -961,16 +984,44 @@ static void Test_ParameterValidation(void)
   CHECK(Ms5837_SetOutputRateHz(101U) == MS5837_ERR_PARAM);
   CHECK(Ms5837_SetOutputRateHz(10U) == MS5837_OK);
 
-  /* 采样率必须容得下一次 D1+D2 转换：100 Hz = 10 ms < 2*9.04 ms。 */
+  /*
+   * 周期预算 = 2×(最大转换时间 + 1 ms 余量) + 2 ms 事务预算，必须 ≤ 1000/rate。
+   * 30BA OSR4096 → 24 ms：50 Hz(20 ms) 拒绝，40 Hz(25 ms) 允许，25 Hz 允许。
+   */
   CHECK(Ms5837_SetOsr(MS5837_OSR_4096) == MS5837_OK);
-  CHECK(Ms5837_SetOutputRateHz(100U) == MS5837_ERR_PARAM);
-  CHECK(Ms5837_SetOutputRateHz(50U) == MS5837_OK); /* 20 ms >= 2*9.04 ms */
-  CHECK(Ms5837_SetOutputRateHz(25U) == MS5837_OK);
-  /* OSR8192 在 25 Hz 下刚好放得下（2*18.08 = 36.16 ms <= 40 ms）。 */
-  CHECK(Ms5837_SetOsr(MS5837_OSR_8192) == MS5837_OK);
-  /* 但 50 Hz 放不下。 */
   CHECK(Ms5837_SetOutputRateHz(50U) == MS5837_ERR_PARAM);
+  CHECK(Ms5837_SetOutputRateHz(40U) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(25U) == MS5837_OK);
+
+  /* 30BA OSR8192 → 42 ms：25 Hz(40 ms) 拒绝，20 Hz(50 ms) 允许；回到 25 Hz 又被拒。 */
+  CHECK(Ms5837_SetOsr(MS5837_OSR_8192) == MS5837_ERR_PARAM);
+  CHECK(Ms5837_SetOutputRateHz(20U) == MS5837_OK);
+  CHECK(Ms5837_SetOsr(MS5837_OSR_8192) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(25U) == MS5837_ERR_PARAM);
+  CHECK(Ms5837_SetOutputRateHz(20U) == MS5837_OK);
+
+  /* 30BA OSR2048 → 14 ms：25 Hz 允许，100 Hz(10 ms) 拒绝。 */
+  CHECK(Ms5837_SetOsr(MS5837_OSR_2048) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(25U) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(100U) == MS5837_ERR_PARAM);
+  CHECK(Ms5837_SetOutputRateHz(50U) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(10U) == MS5837_OK);
+
+  /* 30BA OSR256 → 6 ms：100 Hz 允许。 */
+  CHECK(Ms5837_SetOsr(MS5837_OSR_256) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(100U) == MS5837_OK);
+
+  /* 02BA 的最大转换时间更短：OSR4096 → 22 ms，25 Hz/40 Hz 允许；OSR8192 → 40 ms，25 Hz 正好允许。 */
+  CHECK(Ms5837_SetModel(MS5837_MODEL_02BA) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(25U) == MS5837_OK);
   CHECK(Ms5837_SetOsr(MS5837_OSR_4096) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(40U) == MS5837_OK);
+  CHECK(Ms5837_SetOutputRateHz(50U) == MS5837_ERR_PARAM); /* 20 ms < 22 ms */
+  CHECK(Ms5837_SetOutputRateHz(25U) == MS5837_OK);
+  CHECK(Ms5837_SetOsr(MS5837_OSR_8192) == MS5837_OK); /* 2×(18+1)+2 = 40 ms ≤ 40 ms */
+  CHECK(Ms5837_SetOutputRateHz(25U) == MS5837_OK);
+  CHECK(Ms5837_SetOsr(MS5837_OSR_4096) == MS5837_OK);
+  CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
 
   /* 型号只允许 0/2/30。 */
   CHECK(Ms5837_SetModel(1U) == MS5837_ERR_PARAM);
@@ -1233,12 +1284,85 @@ static void Test_NonBlockingConversionWait(void)
 
   CHECK(Ms5837_HasNewSample() != 0U);
   CHECK(blocked == 0U);
-  /* OSR4096 两个方向各 9.04 ms：样本至少要跨 20 次主循环调用才会出现。 */
-  CHECK(calls >= 20U);
+  /* OSR4096 两个方向各 9.04 ms，各含 1 ms 余量 → 22 ms：样本至少跨 22 次主循环调用。 */
+  CHECK(calls >= 22U);
   /* 单次 Process 最多：读一次 ADC（读事务）+ 发一条 D2 转换命令。 */
   CHECK(max_transactions <= 3U);
   /* 驱动从未提前读取 ADC（否则转换时间检查形同虚设）。 */
   CHECK(sim.early_reads == 0U);
+  /* 实际等待不得少于 数据手册最大值 + 1 ms 余量。 */
+  CHECK(sim.min_conv_wait_valid != 0U);
+  CHECK(sim.min_conv_wait_ms >= Ms5837_MaxConversionTimeMs(MS5837_MODEL_30BA, MS5837_OSR_4096) +
+                                    MS5837_CONVERSION_MARGIN_MS);
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 15b. 周期时序（25 Hz） */
+/*
+ * 关键回归：转换等待绝不能额外累加到采样周期上。
+ * 这里让一次 HAL 事务真实占用 1 ms，逐毫秒推进主循环，检查
+ *   - 相邻样本时间戳间隔 == 1000/25 = 40 ms（不是 40 + 20 ms 的 ~16 Hz）；
+ *   - 每次“命令 → 读 ADC”的等待 ≥ 数据手册最大转换时间 + 1 ms；
+ *   - 没有提前读 ADC、没有超期连发追赶。
+ */
+static void Test_CycleTimingAt25Hz(void)
+{
+  Ms5837Sample_t sample;
+  uint32_t stamps[6];
+  uint8_t count = 0U;
+  uint8_t i;
+  uint32_t conversions;
+
+  TEST_BEGIN("CycleTimingAt25Hz");
+
+  harness_start(MS5837_MODEL_30BA, 5000000U, 6981794U);
+  CHECK(Ms5837_GetOsr() == MS5837_OSR_4096);
+  CHECK(Ms5837_GetOutputRateHz() == 25U);
+
+  sim.tx_time_ms = 1U; /* 之后每次 I2C 事务都推进 1 ms，模拟真实总线耗时。 */
+  conversions = sim.tx_count + sim.rx_count;
+  Ms5837_ClearNewSampleFlag();
+
+  while ((count < 6U) && (test_tick < 20000U))
+  {
+    uint32_t tick_before = test_tick;
+    Ms5837_Process();
+    /* 允许事务自身推进 tick；单次调用最多 3 次事务（读 ADC + 发下一条转换命令）。 */
+    if ((test_tick - tick_before) > 3U * sim.tx_time_ms)
+    {
+      CHECK(0);
+    }
+    if (Ms5837_HasNewSample() != 0U)
+    {
+      Ms5837_ClearNewSampleFlag();
+      CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+      stamps[count] = sample.timestamp_ms;
+      count++;
+    }
+    test_tick++;
+  }
+
+  CHECK(count == 6U);
+  for (i = 1U; i < count; i++)
+  {
+    uint32_t delta = stamps[i] - stamps[i - 1U];
+    /* 25 Hz → 40 ms。允许 ±1 ms 的毫秒对齐误差，但绝不允许 55 ms 这种“周期 + 转换”叠加。 */
+    CHECK(delta <= 41U);
+    CHECK(delta >= 39U);
+  }
+  /* 实测采样率应接近 25 Hz，明显高于修复前的 ~16 Hz。 */
+  CHECK((stamps[count - 1U] - stamps[0]) <= (uint32_t)((count - 1U) * 41U));
+  CHECK(sim.early_reads == 0U);
+  CHECK(sim.min_conv_wait_ms >= Ms5837_MaxConversionTimeMs(MS5837_MODEL_30BA, MS5837_OSR_4096) +
+                                    MS5837_CONVERSION_MARGIN_MS);
+  CHECK((sim.tx_count + sim.rx_count) > conversions);
+  printf("        样本时间戳: %u %u %u %u %u %u ms；间隔 %u/%u/%u/%u/%u ms；"
+         "最小转换等待 %u ms（要求 >= %u ms）\n",
+         stamps[0], stamps[1], stamps[2], stamps[3], stamps[4], stamps[5],
+         stamps[1] - stamps[0], stamps[2] - stamps[1], stamps[3] - stamps[2],
+         stamps[4] - stamps[3], stamps[5] - stamps[4],
+         sim.min_conv_wait_ms,
+         Ms5837_MaxConversionTimeMs(MS5837_MODEL_30BA, MS5837_OSR_4096) + MS5837_CONVERSION_MARGIN_MS);
   TEST_END();
 }
 
@@ -1339,6 +1463,206 @@ static void Test_SampleMetadataAndFreshness(void)
   TEST_END();
 }
 
+/* ---------------------------------------------------------------- 17b. 假 PROM（CRC 碰巧通过） */
+/*
+ * 全 0 / 全 0xFFFF 的 C1~C6 在 I2C 卡死或空器件时很常见，而且可能碰上 CRC 自洽。
+ * 仿真里用 sim_set_prom_from_coefficients() 生成“CRC 正确”的 PROM，
+ * 因此这里的拒绝只可能来自内容可信度检查，而不是 CRC 检查。
+ */
+static void Test_PromContentSanity(void)
+{
+  Ms5837Stats_t stats;
+  Ms5837Stats_t stats_before;
+  Ms5837Sample_t sample;
+  uint16_t bogus[MS5837_PROM_WORDS];
+  uint8_t index;
+
+  TEST_BEGIN("PromContentSanity");
+
+  /* 全 0 的 C1~C6。 */
+  memset(bogus, 0, sizeof(bogus));
+  sim_reset();
+  sim.model = MS5837_MODEL_30BA;
+  test_tick = 0U;
+  I2c_Init(&fake_handle);
+  Ms5837_RestoreDefaults();
+  CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
+  sim_set_prom_from_coefficients(bogus);
+  /* 先确认这个假 PROM 的 CRC 是自洽的（否则测不到内容检查这一层）。 */
+  CHECK((sim.prom[0] >> 12) == Ms5837_Crc4(sim.prom));
+  CHECK(Ms5837_GetStats(&stats_before) == MS5837_OK);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  {
+    uint32_t step;
+    for (step = 0U; step < 300U; step++)
+    {
+      Ms5837_Process();
+      test_tick++;
+    }
+  }
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_PROM_VALID) == 0U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_RAW_VALID) == 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_ERR_NO_SAMPLE);
+  CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
+  CHECK(stats.errors > stats_before.errors);
+  CHECK(stats.crc_errors > stats_before.crc_errors);
+
+  /* 全 0xFFFF 的 C1~C6。 */
+  for (index = 1U; index <= 6U; index++)
+  {
+    bogus[index] = 0xFFFFU;
+  }
+  bogus[0] = 0U;
+  bogus[7] = 0U;
+  sim_set_prom_from_coefficients(bogus);
+  CHECK((sim.prom[0] >> 12) == Ms5837_Crc4(sim.prom));
+  CHECK(Ms5837_GetStats(&stats_before) == MS5837_OK);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  {
+    uint32_t step;
+    for (step = 0U; step < 300U; step++)
+    {
+      Ms5837_Process();
+      test_tick++;
+    }
+  }
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_PROM_VALID) == 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_ERR_NO_SAMPLE);
+  CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
+  CHECK(stats.crc_errors > stats_before.crc_errors);
+
+  /* 换回正常 PROM 后必须能上线出帧。 */
+  sim_set_prom_from_coefficients(prom_cross);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  CHECK(run_until(pred_prom_valid, 400U) != 0U);
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_PRESSURE_VALID) != 0U);
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17c. 无效转换码字 */
+static void Test_InvalidConversionRejected(void)
+{
+  Ms5837Sample_t sample;
+  Ms5837Stats_t stats;
+  Ms5837Stats_t stats_before;
+  uint32_t seq_before;
+
+  TEST_BEGIN("InvalidConversionRejected");
+
+  harness_start(MS5837_MODEL_30BA, 5000000U, 6981794U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  seq_before = sample.sequence;
+  CHECK(Ms5837_GetStats(&stats_before) == MS5837_OK);
+
+  /* D1 全 0。 */
+  sim.d1_value = 0U;
+  Ms5837_ClearNewSampleFlag();
+  {
+    uint32_t step;
+    for (step = 0U; step < 400U; step++)
+    {
+      Ms5837_Process();
+      test_tick++;
+    }
+  }
+  CHECK(Ms5837_HasNewSample() == 0U); /* 不得发布新样本 */
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_RAW_VALID) == 0U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_PRESSURE_VALID) == 0U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_DEPTH_VALID) == 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(sample.sequence == seq_before); /* 序号没有推进 */
+  CHECK(MS5837_IS_NAN(sample.pressure_pa));
+  CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
+  CHECK(stats.last_error == (uint32_t)MS5837_ERR_NOT_READY);
+  CHECK(stats.good_frames == stats_before.good_frames);
+  /* 总线本身没坏：ONLINE 保留。 */
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_ONLINE) != 0U);
+
+  /* D1 全 1（0xFFFFFF）。 */
+  sim.d1_value = 0xFFFFFFU;
+  CHECK(Ms5837_GetStats(&stats_before) == MS5837_OK);
+  {
+    uint32_t step;
+    for (step = 0U; step < 400U; step++)
+    {
+      Ms5837_Process();
+      test_tick++;
+    }
+  }
+  CHECK(Ms5837_HasNewSample() == 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(sample.sequence == seq_before);
+  CHECK(MS5837_IS_NAN(sample.pressure_pa));
+  CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
+  CHECK(stats.good_frames == stats_before.good_frames);
+
+  /* D1 恢复正常，但 D2 全 1。 */
+  sim.d1_value = 5000000U;
+  sim.d2_value = 0xFFFFFFU;
+  CHECK(Ms5837_GetStats(&stats_before) == MS5837_OK);
+  {
+    uint32_t step;
+    for (step = 0U; step < 400U; step++)
+    {
+      Ms5837_Process();
+      test_tick++;
+    }
+  }
+  CHECK(Ms5837_HasNewSample() == 0U);
+  CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
+  CHECK(stats.good_frames == stats_before.good_frames);
+
+  /* 恢复正常：必须重新出有效样本。 */
+  sim.d2_value = 6981794U;
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 600U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(sample.sequence == seq_before + 1U);
+  CHECK((sample.status & MS5837_STATUS_PRESSURE_VALID) != 0U);
+  CHECK(!MS5837_IS_NAN(sample.pressure_pa));
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17d. 纯函数输入校验 */
+static void Test_CompensateInputValidation(void)
+{
+  int64_t pressure_raw = 12345;
+  int32_t temperature = 6789;
+
+  TEST_BEGIN("CompensateInputValidation");
+
+  /* 超过 24 位的输入必须拒绝，且不得写输出。 */
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, prom_cross, 0x01000000U, 6800000U,
+                          &pressure_raw, &temperature) == 0U);
+  CHECK(pressure_raw == 12345);
+  CHECK(temperature == 6789);
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, prom_cross, 5000000U, 0xFFFFFFFFU,
+                          &pressure_raw, &temperature) == 0U);
+  CHECK(pressure_raw == 12345);
+  CHECK(temperature == 6789);
+  CHECK(Ms5837_Compensate(MS5837_MODEL_02BA, prom_02ba_example, 0xFFFFFF00U, 8077636U,
+                          &pressure_raw, &temperature) == 0U);
+
+  /* 0 / 0xFFFFFF 是无效转换码字，同样拒绝。 */
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, prom_cross, 0U, 6800000U,
+                          &pressure_raw, &temperature) == 0U);
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, prom_cross, 5000000U, 0xFFFFFFU,
+                          &pressure_raw, &temperature) == 0U);
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, prom_cross, 0xFFFFFFU, 6800000U,
+                          &pressure_raw, &temperature) == 0U);
+  CHECK(pressure_raw == 12345);
+  CHECK(temperature == 6789);
+
+  /* 边界之内的正常输入照常工作（24 位最大值附近仍可补偿）。 */
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, prom_cross, 0xFFFFFEU, 0xFFFFFEU,
+                          &pressure_raw, &temperature) == 1U);
+  /* 允许输出指针为空（只算不取）。 */
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, prom_cross, 5000000U, 6800000U, 0, 0) == 1U);
+  TEST_END();
+}
+
 /* ---------------------------------------------------------------- 18. I2C 层 */
 static void Test_I2cBusLayer(void)
 {
@@ -1427,7 +1751,11 @@ int main(void)
   Test_OfflineDevice();
   Test_BusTimeout();
   Test_NonBlockingConversionWait();
+  Test_CycleTimingAt25Hz();
   Test_PromCrcFailure();
+  Test_PromContentSanity();
+  Test_InvalidConversionRejected();
+  Test_CompensateInputValidation();
   Test_SampleMetadataAndFreshness();
   Test_I2cBusLayer();
 

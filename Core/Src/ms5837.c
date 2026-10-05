@@ -22,6 +22,17 @@
 #define MS5837_I2C_TIMEOUT_MS      I2C_BUS_DEFAULT_TIMEOUT_MS /* 单次 I2C 事务短超时。 */
 #define MS5837_NAN_BITS            0x7FC00000UL /* 标准 quiet NaN 位模式。 */
 #define MS5837_SAMPLE_NEVER_MS     0xFFFFFFFFUL /* 从未采样的时间戳。 */
+#define MS5837_ADC_MAX             0x00FFFFFFU /* 24 位 ADC 满量程码字。 */
+
+/*
+ * 转换等待的保守化：
+ *  - deadline 必须在 I2C 命令真正发完之后重新取 HAL_GetTick()，否则命令传输占用的时间
+ *    会让等待变短（毫秒相位提前，可能读到还没完成的转换）；
+ *  - 再额外加 1 ms 余量，保证跨过毫秒边界时也不会提前读；
+ *  - 一个采样周期至少容纳 2 次这样的保守等待，外加 4 次短事务的预算。
+ */
+#define MS5837_CONVERSION_MARGIN_MS 1U /* 命令完成后额外等待的毫秒数。 */
+#define MS5837_SCHEDULE_TX_BUDGET_MS 2U /* 一帧内 4 次短 I2C 事务的预算。 */
 
 /* ---------------------------------------------------------------- 状态机 */
 typedef enum
@@ -55,6 +66,7 @@ typedef struct
   uint8_t filter_valid; /* 滤波状态是否可用。 */
   uint8_t prom_index; /* 正在读取的 PROM 字下标。 */
   uint32_t deadline_ms; /* 当前状态的到期时刻（等待或下一次动作）。 */
+  uint32_t cycle_start_ms; /* 本采样周期发出 D1 命令的时刻（周期调度的锚点）。 */
   uint32_t status; /* 实时状态字。 */
   uint32_t d1_raw; /* 本次周期的 D1。 */
   uint32_t d2_raw; /* 本次周期的 D2。 */
@@ -77,6 +89,7 @@ static Ms5837Sensor_t ms5837 =
   .filter_valid = 0U,
   .prom_index = 0U,
   .deadline_ms = 0U,
+  .cycle_start_ms = 0U,
   .status = 0U,
   .d1_raw = 0U,
   .d2_raw = 0U,
@@ -185,8 +198,22 @@ static uint8_t ms5837_schedule_fits(uint8_t model, uint16_t osr, uint16_t rate_h
     return 0U;
   }
   period_ms = 1000U / (uint32_t)rate_hz;
-  needed_ms = 2U * ms5837_conversion_time_ms(model, osr);
+  /* 两次保守等待（每次含 1 ms 余量）+ 一帧内 4 次短事务的预算。 */
+  needed_ms = (2U * (ms5837_conversion_time_ms(model, osr) + MS5837_CONVERSION_MARGIN_MS)) +
+              MS5837_SCHEDULE_TX_BUDGET_MS;
   return (needed_ms <= period_ms) ? 1U : 0U;
+}
+
+/* 本次转换的等待时长：按“命令已发完”的时刻计算，并含 1 ms 余量。 */
+static uint32_t ms5837_conversion_deadline(uint8_t model, uint16_t osr, uint32_t command_done_ms)
+{
+  return command_done_ms + ms5837_conversion_time_ms(model, osr) + MS5837_CONVERSION_MARGIN_MS;
+}
+
+/* 24 位 ADC 结果是否可用：全 0 / 全 1 是典型“无有效转换”码字，不能当有效数据发布。 */
+static uint8_t ms5837_adc_value_valid(uint32_t value)
+{
+  return ((value != 0U) && (value != MS5837_ADC_MAX)) ? 1U : 0U;
 }
 
 static Ms5837Result_t ms5837_map_i2c(I2cBusResult_t result)
@@ -265,6 +292,54 @@ static void ms5837_record_error(Ms5837Result_t error, uint32_t now)
   ms5837.deadline_ms = now + MS5837_RETRY_DELAY_MS;
 }
 
+/*
+ * 转换结果无效（全 0 / 全 1）：总线本身没报错，所以保留 ONLINE，
+ * 但必须清掉“新鲜数据”位并把已发布样本的测量字段置回 NaN，
+ * 绝不把无效码字留下的旧值当成新测量值。
+ */
+static void ms5837_record_invalid_conversion(uint32_t now)
+{
+  ms5837.stats.errors++;
+  ms5837.stats.last_error = (uint32_t)MS5837_ERR_NOT_READY;
+  ms5837.status &= ~(MS5837_STATUS_RAW_VALID | MS5837_STATUS_PRESSURE_VALID |
+                     MS5837_STATUS_TEMPERATURE_VALID | MS5837_STATUS_DEPTH_VALID);
+  ms5837.sample.pressure_raw = 0;
+  ms5837.sample.temperature_centi_c = 0;
+  ms5837.sample.pressure_pa = ms5837_nan();
+  ms5837.sample.temperature_c = ms5837_nan();
+  ms5837.sample.depth_raw_m = ms5837_nan();
+  ms5837.sample.depth_filtered_m = ms5837_nan();
+  ms5837.sample.status = ms5837.status;
+  ms5837.filter_valid = 0U;
+  ms5837.state = MS5837_STATE_IDLE;
+  ms5837.deadline_ms = now + MS5837_RETRY_DELAY_MS;
+}
+
+/*
+ * PROM 内容可信度检查：CRC 通过也可能碰上全 0 / 全 0xFFFF 的假 PROM
+ * （典型的 I2C 卡死或空器件特征）。真实模块的 C1~C6 是工厂标定值，
+ * 不可能 6 个字全 0 或全 0xFFFF。
+ */
+static uint8_t ms5837_prom_sane(const uint16_t prom[MS5837_PROM_WORDS])
+{
+  uint8_t index;
+  uint8_t all_zero = 1U;
+  uint8_t all_ones = 1U;
+
+  for (index = 1U; index <= 6U; index++)
+  {
+    if (prom[index] != 0x0000U)
+    {
+      all_zero = 0U;
+    }
+    if (prom[index] != 0xFFFFU)
+    {
+      all_ones = 0U;
+    }
+  }
+  return (uint8_t)((all_zero == 0U) && (all_ones == 0U));
+}
+
 /* ---------------------------------------------------------------- 补偿 */
 uint8_t Ms5837_Crc4(const uint16_t prom[MS5837_PROM_WORDS])
 {
@@ -334,6 +409,15 @@ uint8_t Ms5837_Compensate(uint8_t model,
     return 0U;
   }
   if ((model != MS5837_MODEL_02BA) && (model != MS5837_MODEL_30BA))
+  {
+    return 0U;
+  }
+  /* 输入必须是 24 位 ADC 码字；超出范围或等于全 0/全 1 的一律不补偿、不写输出。 */
+  if ((d1 > MS5837_ADC_MAX) || (d2 > MS5837_ADC_MAX))
+  {
+    return 0U;
+  }
+  if ((ms5837_adc_value_valid(d1) == 0U) || (ms5837_adc_value_valid(d2) == 0U))
   {
     return 0U;
   }
@@ -512,6 +596,8 @@ static void ms5837_start_cycle(uint32_t now)
     ms5837_record_error(MS5837_ERR_PARAM, now);
     return;
   }
+  /* 周期锚点：下一次采样基于这个时刻 + 周期，而不是“转换结束时刻 + 周期”。 */
+  ms5837.cycle_start_ms = now;
   result = ms5837_write_command((uint8_t)(MS5837_CMD_CONVERT_D1_BASE + (uint8_t)(osr_index << 1)));
   if (result != I2C_BUS_OK)
   {
@@ -519,7 +605,9 @@ static void ms5837_start_cycle(uint32_t now)
     return;
   }
   ms5837.state = MS5837_STATE_CONVERT_D1;
-  ms5837.deadline_ms = now + ms5837_conversion_time_ms(ms5837.config.model, ms5837.config.osr);
+  /* 命令真正发完之后再取 tick，再加数据手册最大转换时间 + 1 ms 余量。 */
+  ms5837.deadline_ms = ms5837_conversion_deadline(ms5837.config.model, ms5837.config.osr,
+                                                  HAL_GetTick());
 }
 
 static void ms5837_read_d1(uint32_t now)
@@ -534,6 +622,12 @@ static void ms5837_read_d1(uint32_t now)
     return;
   }
   ms5837.status |= MS5837_STATUS_ONLINE;
+  if (ms5837_adc_value_valid(ms5837.d1_raw) == 0U)
+  {
+    /* 全 0 / 全 1：转换无效，不发起 D2，也不发布任何数据。 */
+    ms5837_record_invalid_conversion(HAL_GetTick());
+    return;
+  }
   if (osr_index == 0xFFU)
   {
     ms5837_record_error(MS5837_ERR_PARAM, now);
@@ -546,13 +640,17 @@ static void ms5837_read_d1(uint32_t now)
     return;
   }
   ms5837.state = MS5837_STATE_CONVERT_D2;
-  ms5837.deadline_ms = now + ms5837_conversion_time_ms(ms5837.config.model, ms5837.config.osr);
+  /* 同样以 D2 命令发完的时刻为基准。 */
+  ms5837.deadline_ms = ms5837_conversion_deadline(ms5837.config.model, ms5837.config.osr,
+                                                  HAL_GetTick());
 }
 
 static void ms5837_read_d2(uint32_t now)
 {
   I2cBusResult_t result;
   uint32_t period_ms;
+  uint32_t completed_ms;
+  uint32_t next_start_ms;
 
   result = ms5837_read_adc(&ms5837.d2_raw);
   if (result != I2C_BUS_OK)
@@ -561,10 +659,27 @@ static void ms5837_read_d2(uint32_t now)
     return;
   }
   ms5837.status |= MS5837_STATUS_ONLINE;
+  if (ms5837_adc_value_valid(ms5837.d2_raw) == 0U)
+  {
+    ms5837_record_invalid_conversion(HAL_GetTick());
+    return;
+  }
+
+  completed_ms = HAL_GetTick();
   ms5837.state = MS5837_STATE_IDLE;
+  /*
+   * 调度锚定在周期开始时刻：本帧耗掉的转换等待不会累加到下一个周期上，
+   * 因此 25 Hz/4096 的实际采样间隔仍是 40 ms，而不是 40 + 20 ms。
+   * 若已经超期（例如卡了一下），直接从现在开始下一帧，不做补偿性连发追赶。
+   */
   period_ms = 1000U / (uint32_t)ms5837.config.output_rate_hz;
-  ms5837.deadline_ms = now + period_ms;
-  ms5837_finish_sample(now);
+  next_start_ms = ms5837.cycle_start_ms + period_ms;
+  if (ms5837_deadline_reached(completed_ms, next_start_ms) != 0U)
+  {
+    next_start_ms = completed_ms;
+  }
+  ms5837.deadline_ms = next_start_ms;
+  ms5837_finish_sample(completed_ms);
 }
 
 static void ms5837_process_prom(uint32_t now)
@@ -594,7 +709,9 @@ static void ms5837_process_prom(uint32_t now)
   ms5837.prom[7] = 0U;
   crc_read = (uint8_t)((ms5837.prom[0] >> 12) & 0x0FU);
   crc_calc = Ms5837_Crc4(ms5837.prom);
-  if (crc_read != crc_calc)
+  /* CRC 不符，或 CRC 碰巧通过但内容明显不可信（C1~C6 全 0 / 全 0xFFFF），
+     都按“PROM 不可信”处理：不置 PROM_VALID、不发布任何测量值。 */
+  if ((crc_read != crc_calc) || (ms5837_prom_sane(ms5837.prom) == 0U))
   {
     ms5837.status &= ~(MS5837_STATUS_PROM_VALID | MS5837_STATUS_ONLINE |
                        MS5837_STATUS_RAW_VALID | MS5837_STATUS_PRESSURE_VALID |
