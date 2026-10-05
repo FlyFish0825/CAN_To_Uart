@@ -733,11 +733,9 @@ int ImuSensor_GetSample(ImuSensor_Sample *out, uint64_t now_us)
   {
     status |= IMU_SENSOR_STATUS_PIN_BLOCKED;
   }
-  /* 无原生读回：速率/模式从未下发过即视为配置未知。 */
-  if (!(imu_rate_have != 0U) || !(imu_mode_have != 0U))
-  {
-    status |= IMU_SENSOR_STATUS_CONFIG_UNKNOWN;
-  }
+  /* 无原生读回：配置永远无法确认，CONFIG_UNKNOWN 恒置位；
+   * UNCONFIRMED 的 rate/mode 下发（缓存更新）不改变该位。 */
+  status |= IMU_SENSOR_STATUS_CONFIG_UNKNOWN;
 
   memset(out, 0, sizeof(*out));
   out->status = status;

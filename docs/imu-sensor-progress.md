@@ -63,8 +63,8 @@ RESULT/status 一致，AA5B 层可直抄。建议映射：
 | 03 GET_PARAMETER | `GetParameter` | 1=有缓存→RESULT 7 UNCONFIRMED+值；0=RESULT 8 NOT_READY；-1=RESULT 1 UNSUPPORTED |
 | 04 SET_PARAMETER | `Request(SET_RATE/SET_MODE)` | 结果恒 7 UNCONFIRMED（原生无回复），BAD_VALUE 同步返回 |
 | 05/0A/0B SAVE/SELFTEST/REBOOT | `Request` 返回 UNSUPPORTED | 预留 |
-| 09 CALIBRATE type=1 | `Request(CAL_ACCEL_GYRO_START/CLEAR)` | 原生 0x70（映射假设，见 §5） |
-| 09 CALIBRATE type=2 | `Request(CAL_MAG_START/CLEAR)` | 原生 0x71（映射假设，见 §5） |
+| 09 CALIBRATE type=1 | `Request(CAL_ACCEL_GYRO_START/CLEAR)` | 原生 0x70（原文已核实：陀螺仪+加速度；未实机） |
+| 09 CALIBRATE type=2 | `Request(CAL_MAG_START/CLEAR)` | 原生 0x71（原文已核实：磁力计；未实机） |
 | 09 CALIBRATE type=3 | UNSUPPORTED | 0x73 长度表矛盾 |
 
  Stream80/81/85 载荷字段与 `ImuSensor_Sample` 一一对应（accel_g、gyro_rad_s、
@@ -90,18 +90,24 @@ mag_units、quat_wxyz、euler_rpy_rad、baro_*），无伪造字段。
 
 ## 5. 假设与未核实事项（评审重点）
 
-| # | 假设 | 依据/风险 |
+统筹方 2026-10-06 复核附件原文，以下三点由"映射假设"转为**原文已核实（仍未实机）**，
+实现与之一致，无需改码：**0x70=陀螺仪+加速度校准、0x71=磁力计；0x81 status
+0=失败、1=成功；校准请求带 +5F 后缀**。
+
+| # | 事项 | 说明 |
 |---|---|---|
-| 1 | 0x70=accel+gyro 校准、0x71=mag 校准 | 表格只写 "Native70/71 calibration action0\|1"，未指明对应关系；若相反，交换两个枚举的 native 值即可 |
-| 2 | 0x81 status：1=成功→OK，0=失败→IO_ERROR | 表格只给 `[original_cmd,status0|1]`，未给语义；若相反，`ImuSensor_HandleCalAck` 一行取反 |
-| 3 | 校准请求帧 `7E 23 07 70/71 action 5F SUM` | 由 "+5F" 约定与版本请求字面量推断；校验和算法本身由统筹文档 `7E 23 07 80 01 00 29` 字面量锚定（测试逐字节断言） |
-| 4 | MAG 单位保持中性（`mag_units`，800/32767） | 表格明确未命名物理单位，未写 uT |
-| 5 | `CONFIG_UNKNOWN`=自开机起 rate 与 mode 均未成功下发过 | 解释性语义（无原生读回，无法确认真机当前配置） |
-| 6 | `MODEL_CONFIRMED` 恒 0 | 无原生型号读回，禁止凭空确认 |
-| 7 | 帧时间戳=分块到达时刻，不做块内字节回推 | 上位机时间戳本身 ms 级（ms*1000），回推收益 <87µs/字节；如需可后续补 |
-| 8 | 默认请求超时 1s；单一在飞；在飞期间一切请求（含 0x60/0x61）BUSY | 保守策略，避免校准期间混入未定义时序命令 |
-| 9 | rate/mode 缓存=最后成功下发的值，GET 恒 UNCONFIRMED | 统筹文档明确无原生读回 |
-| 10 | 0xA0 复位不暴露 | AA5B REBOOT 预留 UNSUPPORTED；后端未提供复位请求 |
+| 1 | MAG 单位保持中性（`mag_units`，800/32767） | 表格明确未命名物理单位，未写 uT |
+| 2 | `CONFIG_UNKNOWN` 恒置位 | 无原生读回，配置永远无法确认；UNCONFIRMED 的 rate/mode 下发不清除该位（统筹 2026-10-06 指示的严格解释，含测试） |
+| 3 | `MODEL_CONFIRMED` 恒 0 | 无原生型号读回，禁止凭空确认 |
+| 4 | 帧时间戳=分块到达时刻，不做块内字节回推 | 上位机时间戳本身 ms 级（ms*1000），回推收益 <87µs/字节；如需可后续补 |
+| 5 | 默认请求超时 1s；单一在飞；在飞期间一切请求（含 0x60/0x61）BUSY | 保守策略，避免校准期间混入未定义时序命令 |
+| 6 | rate/mode 缓存=最后成功下发的值，GET 恒 UNCONFIRMED | 原文明确无原生读回 |
+| 7 | 0xA0 复位不暴露 | AA5B REBOOT 预留 UNSUPPORTED；后端未提供复位请求 |
+
+变更记录：
+
+- `3a07363`：初始提交（当时 0x70/0x71 映射与 0x81 语义为假设；CONFIG_UNKNOWN 按 rate+mode 均下发清除）。
+- 本提交：0x70/0x71/0x81/+5F 转为原文已核实（文档更正，实现本就一致）；`CONFIG_UNKNOWN` 改为恒置位，UNCONFIRMED 的下发不再清除该位（`.c`/`.h`/测试同步修改）。
 
 ## 6. 主机测试覆盖（对照统筹要求）
 
@@ -127,7 +133,7 @@ mag_units、quat_wxyz、euler_rpy_rad、baro_*），无伪造字段。
 ## 7. 硬件未验证清单（NOT TESTED，勿当已验证引用）
 
 - 真实 IMU 的 7E23 数据帧**未上机解码**：PA9/PA10 当前被 WCH-Link 占用，按统筹要求默认 `pins_blocked=1`，不驱动引脚、不自环、不自动校准、不烧录。
-- 全部原生命令（0x60/0x61/0x80/0x70/0x71）**未发往真机**，0x81 回包语义未实测。
+- 全部原生命令（0x60/0x61/0x80/0x70/0x71）**未发往真机**；0x81 的 status 语义已按附件原文核实，但回包行为未实测。
 - 波特率/时序/字节间隔未实测（模块按分块时间戳工作，不依赖波特率常量）。
 - 本模块从未在 STM32 上运行；目标侧仅交叉编译检查通过。
 - 解锁引脚（`ImuSensor_SetPinsBlocked(0)`）与任何实机操作，等待用户明确指示后由统筹方执行。
