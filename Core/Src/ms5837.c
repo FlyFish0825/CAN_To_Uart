@@ -340,6 +340,24 @@ static uint8_t ms5837_prom_sane(const uint16_t prom[MS5837_PROM_WORDS])
   return (uint8_t)((all_zero == 0U) && (all_ones == 0U));
 }
 
+/*
+ * OSR / 型号变更时丢弃正在进行的半周期。
+ *
+ * 已发出的转换命令对应的等待时长是按“旧配置”算的；若新配置需要更长的等待，
+ * 继续沿用旧 deadline 就会提前读到未完成的转换。这里直接丢掉半周期，
+ * 回到 IDLE 并按新配置重新走一遍完整的 D1+D2，绝不中途缩短等待。
+ */
+static void ms5837_abort_half_cycle(void)
+{
+  if ((ms5837.state == MS5837_STATE_CONVERT_D1) || (ms5837.state == MS5837_STATE_CONVERT_D2))
+  {
+    ms5837.d1_raw = 0U;
+    ms5837.d2_raw = 0U;
+    ms5837.state = MS5837_STATE_IDLE;
+    ms5837.deadline_ms = HAL_GetTick(); /* 立即用新配置重新开始完整周期。 */
+  }
+}
+
 /* ---------------------------------------------------------------- 补偿 */
 uint8_t Ms5837_Crc4(const uint16_t prom[MS5837_PROM_WORDS])
 {
@@ -929,13 +947,11 @@ Ms5837Result_t Ms5837_Zero(void)
                                                          : MS5837_ERR_NOT_READY;
   }
 
-  ms5837.config.surface_pressure_pa = ms5837.sample.pressure_pa;
-  ms5837.zero_valid = 1U;
-  ms5837.status |= MS5837_STATUS_ZERO_VALID;
-  ms5837.filter_valid = 0U; /* 新零点：滤波从当前原始深度重新起步。 */
-  ms5837_apply_depth();
-  ms5837.sample.status = ms5837.status;
-  return MS5837_OK;
+  /*
+   * 直接复用 SetSurfacePressurePa 的校验（有限值 + 10000~200000 Pa），
+   * 否则可能建立一个 GET_PARAMETER 认为越界的 P0，出现“ZERO 成功但参数读不回来”的矛盾状态。
+   */
+  return Ms5837_SetSurfacePressurePa(ms5837.sample.pressure_pa);
 }
 
 Ms5837Result_t Ms5837_ClearZero(void)
@@ -973,6 +989,8 @@ Ms5837Result_t Ms5837_RestoreDefaults(void)
 /* ---------------------------------------------------------------- 参数 */
 Ms5837Result_t Ms5837_SetModel(uint8_t model)
 {
+  uint8_t changed;
+
   if ((model != MS5837_MODEL_UNKNOWN) && (model != MS5837_MODEL_02BA) &&
       (model != MS5837_MODEL_30BA))
   {
@@ -984,6 +1002,7 @@ Ms5837Result_t Ms5837_SetModel(uint8_t model)
     return MS5837_ERR_PARAM;
   }
 
+  changed = (model != ms5837.config.model) ? 1U : 0U;
   ms5837.config.model = model;
   ms5837.stats.model = model;
 
@@ -1006,6 +1025,18 @@ Ms5837Result_t Ms5837_SetModel(uint8_t model)
   ms5837.sample.depth_raw_m = ms5837_nan();
   ms5837.sample.depth_filtered_m = ms5837_nan();
   ms5837.filter_valid = 0U;
+
+  /*
+   * 型号变了：旧的 P0 很可能是用错误型号算出来的，因此连同零点一起清除；
+   * 同时丢弃按旧型号转换时间计算等待的半周期（例如 02BA → 30BA 会变慢）。
+   * 同一个型号重复设置（changed == 0）时两者都不做，保持幂等。
+   */
+  if (changed != 0U)
+  {
+    (void)Ms5837_ClearZero();
+    ms5837_abort_half_cycle();
+  }
+
   ms5837.sample.status = ms5837.status;
   return MS5837_OK;
 }
@@ -1027,6 +1058,8 @@ Ms5837Result_t Ms5837_SetOsr(uint16_t osr)
   }
   ms5837.config.osr = osr;
   ms5837.stats.osr = osr;
+  /* 转换时间变了：丢弃按旧 OSR 计算等待的半周期，按新 OSR 重新开始。 */
+  ms5837_abort_half_cycle();
   return MS5837_OK;
 }
 

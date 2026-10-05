@@ -266,6 +266,15 @@ static const uint16_t prom_cross[MS5837_PROM_WORDS] = {
     0x0000U, 40000U, 36000U, 20000U, 22000U, 26646U, 26146U, 0x0000U};
 
 /*
+ * 涉及 Ms5837_Zero() 的用例必须使用“物理合理”的原始值：
+ * ZERO 复用参数 0103 的 10000~200000 Pa 校验，因此这里给出约 1 atm 的向量。
+ */
+#define TEST_D2_25C          6981794U /* prom_cross 下约 25 °C。 */
+#define TEST_D1_SURFACE      3914352U /* prom_cross + 30BA → 101330 Pa。 */
+#define TEST_D1_DIVE         4014352U /* prom_cross + 30BA → ≈176 kPa（≈7.4 m）。 */
+#define TEST_D1_SURFACE_02BA 6413836U /* prom_cross + 02BA → 101325 Pa。 */
+
+/*
  * 数据手册公式的独立复现（直接照抄流程图，除法用有符号右移 = 向负无穷取整）。
  * 只用于交叉验证驱动结果，不参与驱动内部计算。
  */
@@ -872,10 +881,10 @@ static void Test_ZeroAndDepth(void)
 
   TEST_BEGIN("ZeroAndDepth");
 
-  /* 第一帧：D1=5000000 作为水面零点。 */
+  /* 第一帧：约 1 atm（101330 Pa，落在参数 0103 的 10000~200000 Pa 内）作为水面零点。 */
   sim_reset();
   sim.model = MS5837_MODEL_30BA;
-  sim.d1_value = 5000000U;
+  sim.d1_value = TEST_D1_SURFACE;
   sim.d2_value = d2_25c;
   test_tick = 0U;
   I2c_Init(&fake_handle);
@@ -886,7 +895,7 @@ static void Test_ZeroAndDepth(void)
   Ms5837_ClearNewSampleFlag();
   CHECK(run_until(pred_new_sample, 400U) != 0U);
   CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
-  pa1 = ref_pressure_pa(MS5837_MODEL_30BA, prom_cross, 5000000U, d2_25c);
+  pa1 = ref_pressure_pa(MS5837_MODEL_30BA, prom_cross, TEST_D1_SURFACE, d2_25c);
   CHECK(nearly_equal(sample.pressure_pa, pa1, 1.0f));
 
   /* 显式采集零点（AA5B ZERO_DEPTH 语义）。 */
@@ -897,12 +906,12 @@ static void Test_ZeroAndDepth(void)
   CHECK(nearly_equal(sample.depth_filtered_m, 0.0f, 1e-6f));
   CHECK(nearly_equal(sample.surface_pressure_pa, pa1, 1.0f));
 
-  /* 第二帧：加大 D1 模拟下潜，深度必须与 (P-P0)/(rho*g) 一致。 */
-  sim.d1_value = 5100000U;
+  /* 第二帧：加大 D1 模拟下潜（≈176 kPa ≈ 7.4 m），深度必须与 (P-P0)/(rho*g) 一致。 */
+  sim.d1_value = TEST_D1_DIVE;
   Ms5837_ClearNewSampleFlag();
   CHECK(run_until(pred_new_sample, 400U) != 0U);
   CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
-  pa2 = ref_pressure_pa(MS5837_MODEL_30BA, prom_cross, 5100000U, d2_25c);
+  pa2 = ref_pressure_pa(MS5837_MODEL_30BA, prom_cross, TEST_D1_DIVE, d2_25c);
   depth_expected = (pa2 - pa1) / (MS5837_WATER_DENSITY_DEFAULT * MS5837_GRAVITY);
   CHECK(depth_expected > 7.0f);
   CHECK(depth_expected < 8.0f);
@@ -942,7 +951,7 @@ static void Test_FilterK(void)
 
   TEST_BEGIN("FilterK");
 
-  harness_start(MS5837_MODEL_30BA, 5000000U, 6981794U);
+  harness_start(MS5837_MODEL_30BA, TEST_D1_SURFACE, TEST_D2_25C);
   CHECK(Ms5837_Zero() == MS5837_OK);
   CHECK(Ms5837_SetFilterK(0.9f) == MS5837_OK);
   /* 改变零点后滤波重新起步：下一帧的滤波值必须等于原始值。 */
@@ -953,7 +962,7 @@ static void Test_FilterK(void)
   CHECK(nearly_equal(sample.depth_filtered_m, first, 1e-6f));
 
   /* 阶跃后滤波值必须落在旧值与新值之间。 */
-  sim.d1_value = 5100000U;
+  sim.d1_value = TEST_D1_DIVE;
   Ms5837_ClearNewSampleFlag();
   CHECK(run_until(pred_new_sample, 400U) != 0U);
   CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
@@ -1663,6 +1672,209 @@ static void Test_CompensateInputValidation(void)
   TEST_END();
 }
 
+/* ---------------------------------------------------------------- 17e. 型号切换清零点 */
+static void Test_ModelChangeClearsZero(void)
+{
+  Ms5837Sample_t sample;
+  uint8_t type = 0U;
+  uint8_t length = 0U;
+  uint8_t value[4];
+  float pa = 0.0f;
+
+  TEST_BEGIN("ModelChangeClearsZero");
+
+  harness_start(MS5837_MODEL_30BA, TEST_D1_SURFACE, TEST_D2_25C);
+  CHECK(Ms5837_Zero() == MS5837_OK);
+  CHECK(Ms5837_IsZeroValid() == 1U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_ZERO_VALID) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK((sample.status & MS5837_STATUS_DEPTH_VALID) != 0U);
+
+  /* 同一型号重复设置：幂等，零点保留。 */
+  CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
+  CHECK(Ms5837_IsZeroValid() == 1U);
+
+  /* 换成另一种型号：旧 P0 可能是错误型号算的，必须清除零点与滤波。 */
+  CHECK(Ms5837_SetModel(MS5837_MODEL_02BA) == MS5837_OK);
+  CHECK(Ms5837_IsZeroValid() == 0U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_ZERO_VALID) == 0U);
+  CHECK(Ms5837_GetSurfacePressurePa(&pa) == MS5837_ERR_NO_ZERO);
+  CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_ERR_NO_ZERO);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(MS5837_IS_NAN(sample.depth_raw_m));
+  CHECK(MS5837_IS_NAN(sample.depth_filtered_m));
+  CHECK(MS5837_IS_NAN(sample.surface_pressure_pa));
+  CHECK((sample.status & MS5837_STATUS_DEPTH_VALID) == 0U);
+
+  /* 重新建立零点（此时型号是 02BA，用 02BA 的合理原始值）后再换成 unknown：同样必须清除。 */
+  sim.d1_value = TEST_D1_SURFACE_02BA;
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_Zero() == MS5837_OK);
+  CHECK(Ms5837_IsZeroValid() == 1U);
+  CHECK(Ms5837_SetModel(MS5837_MODEL_UNKNOWN) == MS5837_OK);
+  CHECK(Ms5837_IsZeroValid() == 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(MS5837_IS_NAN(sample.depth_raw_m));
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17f. Zero 的范围校验 */
+static void Test_ZeroValidatesRange(void)
+{
+  Ms5837Sample_t sample;
+  float pa = 0.0f;
+  uint8_t type = 0U;
+  uint8_t length = 0U;
+  uint8_t value[4];
+  float p0 = 0.0f;
+
+  TEST_BEGIN("ZeroValidatesRange");
+
+  /* 压力低于 10000 Pa：ZERO 必须失败且不建立零点（不能留下 GET_PARAMETER 认为越界的 P0）。 */
+  sim_reset();
+  sim.model = MS5837_MODEL_30BA;
+  sim.d1_value = 50000U; /* 远低于量程下沿 → 补偿压力为负。 */
+  sim.d2_value = 6981794U;
+  test_tick = 0U;
+  I2c_Init(&fake_handle);
+  Ms5837_RestoreDefaults();
+  CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  CHECK(run_until(pred_prom_valid, 200U) != 0U);
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(sample.pressure_pa < MS5837_SURFACE_PRESSURE_MIN);
+  CHECK(Ms5837_Zero() == MS5837_ERR_PARAM);
+  CHECK(Ms5837_IsZeroValid() == 0U);
+  CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_ERR_NO_ZERO);
+  CHECK(MS5837_IS_NAN(sample.depth_raw_m));
+
+  /* 压力高于 200000 Pa 同样被拒。 */
+  sim.d1_value = 0xFFFFFEU;
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(sample.pressure_pa > MS5837_SURFACE_PRESSURE_MAX);
+  CHECK(Ms5837_Zero() == MS5837_ERR_PARAM);
+  CHECK(Ms5837_IsZeroValid() == 0U);
+
+  /* 回到量程内：ZERO 成功，并且读回来的 P0 与样本压力一致、不再越界。 */
+  sim.d1_value = TEST_D1_SURFACE;
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(Ms5837_Zero() == MS5837_OK);
+  CHECK(Ms5837_IsZeroValid() == 1U);
+  CHECK(Ms5837_GetSurfacePressurePa(&pa) == MS5837_OK);
+  CHECK(nearly_equal(pa, sample.pressure_pa, 1e-3f));
+  CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_OK);
+  CHECK(type == MS5837_PARAM_TYPE_F32);
+  CHECK(length == 4U);
+  memcpy(&p0, value, sizeof(p0));
+  CHECK(nearly_equal(p0, sample.pressure_pa, 1e-3f));
+  CHECK((p0 >= MS5837_SURFACE_PRESSURE_MIN) && (p0 <= MS5837_SURFACE_PRESSURE_MAX));
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17g. 转换中改配置 */
+/*
+ * 半周期丢弃：转换等待是按旧配置算的，改 OSR/型号后必须重新走完整周期，
+ * 绝不能沿用旧 deadline（否则 256 → 8192 会在 2 ms 后就去读需要 18.08 ms 的转换）。
+ */
+static void Test_ConfigChangeDuringConversion(void)
+{
+  uint32_t index;
+  uint32_t first_d1 = 0U;
+  uint8_t saw_aborted_d2 = 0U;
+
+  TEST_BEGIN("ConfigChangeDuringConversion");
+
+  /* 起点 OSR256（等待只有 1+1 ms），保证能在 D1/D2 转换途中改配置。 */
+  sim_reset();
+  sim.model = MS5837_MODEL_30BA;
+  sim.d1_value = 5000000U;
+  sim.d2_value = 6981794U;
+  test_tick = 0U;
+  I2c_Init(&fake_handle);
+  Ms5837_RestoreDefaults();
+  CHECK(Ms5837_SetOutputRateHz(20U) == MS5837_OK);
+  CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
+  CHECK(Ms5837_SetOsr(MS5837_OSR_256) == MS5837_OK);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  CHECK(run_until(pred_prom_valid, 200U) != 0U);
+
+  /* 启动一个周期，停在 D1 转换中（此时已经下发 0x40）。 */
+  Ms5837_ClearNewSampleFlag();
+  while ((ms5837.state != MS5837_STATE_CONVERT_D1) && (test_tick < 500U))
+  {
+    Ms5837_Process();
+    test_tick++;
+  }
+  CHECK(ms5837.state == MS5837_STATE_CONVERT_D1);
+  sim.command_count = 0U;
+  sim.min_conv_wait_valid = 0U;
+  sim.min_conv_wait_ms = 0U;
+
+  /* 转换途中把 OSR 从 256 改成 8192：必须丢弃半周期，用新 OSR 重新开始。 */
+  CHECK(Ms5837_SetOsr(MS5837_OSR_8192) == MS5837_OK);
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 2000U) != 0U);
+
+  /* 改动后第一条转换命令必须是新的 D1（0x4A），说明旧半周期被丢弃、重新从 D1 开始。 */
+  for (index = 0U; index < sim.command_count; index++)
+  {
+    if ((sim.command_log[index] & 0xF0U) == 0x40U)
+    {
+      first_d1 = sim.command_log[index];
+      break;
+    }
+    if ((sim.command_log[index] & 0xF0U) == 0x50U)
+    {
+      saw_aborted_d2 = 1U; /* 改动后还先出现 D2 说明旧半周期没被丢弃。 */
+    }
+  }
+  CHECK(first_d1 == 0x4AU);
+  CHECK(saw_aborted_d2 == 0U);
+  /* 新的等待必须按 OSR8192 计算：>= 18.08 → 19 ms + 1 ms 余量。 */
+  CHECK(sim.min_conv_wait_valid != 0U);
+  CHECK(sim.min_conv_wait_ms >= Ms5837_MaxConversionTimeMs(MS5837_MODEL_30BA, MS5837_OSR_8192) +
+                                    MS5837_CONVERSION_MARGIN_MS);
+  CHECK(sim.early_reads == 0U);
+
+  /* 型号切换同理：02BA/30BA 的最大转换时间不同，切换后必须重新走完整周期。 */
+  CHECK(Ms5837_SetOsr(MS5837_OSR_4096) == MS5837_OK);
+  Ms5837_ClearNewSampleFlag();
+  while ((ms5837.state != MS5837_STATE_CONVERT_D1) && (test_tick < 20000U))
+  {
+    Ms5837_Process();
+    test_tick++;
+  }
+  CHECK(ms5837.state == MS5837_STATE_CONVERT_D1);
+  sim.command_count = 0U;
+  sim.min_conv_wait_valid = 0U;
+  sim.min_conv_wait_ms = 0U;
+  CHECK(Ms5837_SetModel(MS5837_MODEL_02BA) == MS5837_OK);
+  CHECK(ms5837.state == MS5837_STATE_IDLE); /* 半周期被丢弃 */
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 2000U) != 0U);
+  first_d1 = 0U;
+  for (index = 0U; index < sim.command_count; index++)
+  {
+    if ((sim.command_log[index] & 0xF0U) == 0x40U)
+    {
+      first_d1 = sim.command_log[index];
+      break;
+    }
+  }
+  CHECK(first_d1 == 0x48U); /* OSR4096 的 D1 */
+  CHECK(sim.min_conv_wait_ms >= Ms5837_MaxConversionTimeMs(MS5837_MODEL_02BA, MS5837_OSR_4096) +
+                                    MS5837_CONVERSION_MARGIN_MS);
+  CHECK(sim.early_reads == 0U);
+  TEST_END();
+}
+
 /* ---------------------------------------------------------------- 18. I2C 层 */
 static void Test_I2cBusLayer(void)
 {
@@ -1756,6 +1968,9 @@ int main(void)
   Test_PromContentSanity();
   Test_InvalidConversionRejected();
   Test_CompensateInputValidation();
+  Test_ModelChangeClearsZero();
+  Test_ZeroValidatesRange();
+  Test_ConfigChangeDuringConversion();
   Test_SampleMetadataAndFreshness();
   Test_I2cBusLayer();
 

@@ -111,6 +111,12 @@ PS> .\build\ms5837_host_test.exe
 [  OK  ] InvalidConversionRejected
 [ RUN  ] CompensateInputValidation
 [  OK  ] CompensateInputValidation
+[ RUN  ] ModelChangeClearsZero
+[  OK  ] ModelChangeClearsZero
+[ RUN  ] ZeroValidatesRange
+[  OK  ] ZeroValidatesRange
+[ RUN  ] ConfigChangeDuringConversion
+[  OK  ] ConfigChangeDuringConversion
 [ RUN  ] SampleMetadataAndFreshness
 [  OK  ] SampleMetadataAndFreshness
 [ RUN  ] I2cBusLayer
@@ -119,7 +125,7 @@ ms5837_host_test: PASS
 (exit 0)
 ```
 
-共 22 组测试，全部 PASS；`-O2` 构建同样 `PASS`（`gcc -std=c11 -Wall -Wextra -Werror -O2 ...`）。
+共 25 组测试，全部 PASS；`-O2` 构建同样 `PASS`（`gcc -std=c11 -Wall -Wextra -Werror -O2 ...`）。
 一键脚本：`powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_ms5837_host_test.ps1`（结果同上）。
 
 ### 3.2 目标交叉编译（只编译，不烧录、不启动 OpenOCD、不占用串口）
@@ -158,6 +164,9 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 | `PromContentSanity` | CRC **自洽**但 C1~C6 全 0 / 全 0xFFFF 的假 PROM：先断言该 PROM 的 CRC 确实通过，再断言驱动拒绝（不置 PROM_VALID、无样本、`crc_errors` 增长）；换回正常 PROM 后恢复上线 |
 | `InvalidConversionRejected` | D1=0 / D1=0xFFFFFF / D2=0xFFFFFF：不产生新样本、序号不推进、RAW/PRESSURE/DEPTH 位清零、已发布样本测量字段变 NaN、`last_error=ERR_NOT_READY`、`good_frames` 不增长、ONLINE 保留；恢复正常后序号 +1 且数据有效 |
 | `CompensateInputValidation` | 纯函数拒绝 >24 位输入与 0/0xFFFFFF 输入且不写输出；24 位边界内正常工作；输出指针可为 NULL |
+| `ModelChangeClearsZero` | 同型号重复设置幂等（零点保留）；30BA→02BA 与 02BA→unknown 都必须清零点与滤波：`ZERO_VALID` 清、`GetSurfacePressurePa`/`GetParam(0103)` 返回 `NO_ZERO`、深度/滤波深度/`surface_pressure_pa` 变 NaN |
+| `ZeroValidatesRange` | 压力 <10000 Pa 与 >200000 Pa 时 `Ms5837_Zero()` 返回 `ERR_PARAM` 且不建立零点（`GetParam(0103)` 仍是 `NO_ZERO`）；量程内成功且 `GetSurfacePressurePa`/`GetParam(0103)` 读回的 P0 与样本压力一致并落在 10000~200000 Pa |
+| `ConfigChangeDuringConversion` | 在 `CONVERT_D1` 途中把 OSR 256→8192：旧半周期被丢弃（改动后第一条转换命令是新的 D1 `0x4A`，不会先出现被中断的 D2）、新等待 ≥ 19+1 ms、提前读 0 次；型号 30BA→02BA 途中同样丢弃半周期并重新走完整周期 |
 | `PromCrcFailure` | PROM 被破坏：PROM_VALID/RAW_VALID 清、`crc_errors` 增长、无样本、`GetProm` 返回 `NOT_READY`；修复后自动恢复并正常出帧 |
 | `SampleMetadataAndFreshness` | 序号递增、时间戳推进、样本年龄；总线故障后旧样本不得再报告 PRESSURE_VALID/DEPTH_VALID，但 PROM_VALID 保留 |
 | `I2cBusLayer` | 未绑定句柄拒绝事务；7 位地址范围校验；空指针/0 长度/超长拒绝；超时 0→5 ms、过大→50 ms 截断；HAL BUSY/ERROR/TIMEOUT 映射；错误地址被拒 |
@@ -176,6 +185,9 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 | 4) 转换 deadline 用发命令前的 now，毫秒相位可能提前读 | 改为命令发完之后重新 `HAL_GetTick()`，再加 `ceil(最大转换时间) + MS5837_CONVERSION_MARGIN_MS(1 ms)` | 同一测试断言最小“命令→读 ADC”等待 11 ms（≥ 10 + 1）且提前读 0 次 |
 | 5) `schedule_fits` 余量不足 | 改为 `2 × (最大转换时间 + 1 ms) + MS5837_SCHEDULE_TX_BUDGET_MS(2 ms) ≤ 1000/f_s`：30BA OSR4096 → 24 ms（25/40 Hz 可，50 Hz 否）、OSR8192 → 42 ms（20 Hz 可，25 Hz 否）；02BA OSR8192 → 40 ms（25 Hz 可） | `ParameterValidation` 覆盖上述全部边界；`ms5837.h` 公开两个余量常量 |
 | 6) 假 PROM（CRC 碰巧通过）与无效转换会被当成有效数据 | PROM 增加内容可信度检查（C1~C6 全 0 / 全 0xFFFF → 不置 PROM_VALID）；D1/D2 = 0 或 0xFFFFFF → 不发布样本、测量字段置 NaN、序号不推进；`Ms5837_Compensate()` 拒绝 >24 位与 0/0xFFFFFF 输入 | 新增 `PromContentSanity`（先断言假 PROM 的 CRC 自洽，再断言被拒）、`InvalidConversionRejected`、`CompensateInputValidation` |
+| 7) 型号切换必须清除旧水面零点与滤波（旧 P0 可能是错误型号算出来的） | `SetModel()` 在型号真正变化时调用 `ClearZero()` 并作废已发布样本补偿值；同型号重复设置保持幂等不清零点 | 新增 `ModelChangeClearsZero`：30BA→02BA、02BA→unknown 均断言 `ZERO_VALID` 清、`GET_PARAMETER(0103)` 由 OK 变 `NO_ZERO`、深度变 NaN；30BA→30BA 零点保留 |
+| 8) `Ms5837_Zero()` 未做范围校验，可能产生 `GET_PARAMETER` 认为越界的 P0 | `Zero()` 直接复用 `SetSurfacePressurePa()`（有限值 + 10000~200000 Pa）；越界返回 `ERR_PARAM` 且不建立零点，已有有效零点不被破坏 | 新增 `ZeroValidatesRange`：越界（<10000 / >200000 Pa）被拒且 `0103` 仍为 `NO_ZERO`；量程内成功后 `0103` 读回的 P0 与样本压力一致 |
+| 9) OSR/型号在 D1/D2 转换途中变更会沿用旧 deadline（可能提前读） | 新增 `ms5837_abort_half_cycle()`：`SetOsr()`/`SetModel()` 在 `CONVERT_D1/D2` 时丢弃半周期、清半截 D1/D2，回 IDLE 用新配置重新走完整周期 | 新增 `ConfigChangeDuringConversion`：256→8192 途中改配置后必须先出现新的 D1 `0x4A`（不能先出现被中断的 D2）、最小等待 ≥ 19+1 ms、提前读 0 次；型号切换同理 |
 
 ## 5. 未做 / 未验证（重要）
 
@@ -197,7 +209,8 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
   （8 个文件、3547 行新增；总线文件名在评审后由 `i2c.c/i2c.h` 改名为 `sensor_i2c_bus.c/.h`）。
 * 文档提交：`e53785f` “文档：记录MS5837深度计实现提交与验证证据”。
 * 评审修正提交 1：`d753e54` “修正：传感器总线改名以避开CubeMX i2c.c/h，并固化PROM 7字读取断言”。
-* 评审修正提交 2：本文件所在提交 “修正：周期调度不累加转换等待、命令后重取tick加余量，并拒绝假PROM/无效转换”，
+* 评审修正提交 2：`7d73313` “修正：周期调度不累加转换等待、命令后重取tick加余量，并拒绝假PROM/无效转换”。
+* 评审修正提交 3：本文件所在提交 “修正：型号切换清零点、Zero 复用范围校验、转换途中改配置丢弃半周期”，
   只包含 `Core/Inc/ms5837.h`、`Core/Src/ms5837.c`、`tests/ms5837_host_test.c`、`docs/ms5837.md`、
   `docs/ms5837-progress.md`。
 * 只提交了本模块自己的文件（未 `git add .`，未改动/回退他人文件，未 push，未合并 main）。
