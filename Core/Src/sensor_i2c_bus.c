@@ -1,4 +1,4 @@
-#include "i2c.h"
+#include "sensor_i2c_bus.h"
 
 static I2C_HandleTypeDef *i2c_bus_handle = 0; /* 绑定的 HAL I2C 句柄。 */
 static uint8_t i2c_bus_device7 = I2C_BUS_MS5837_ADDRESS7; /* 当前 7 位从地址。 */

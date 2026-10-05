@@ -7,8 +7,8 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `Core/Inc/i2c.h` | I2C 事务层接口（短超时、7 位地址、结果码、主机测试替身开关 `I2C_HOST_TEST`） |
-| `Core/Src/i2c.c` | 基于 `HAL_I2C_Master_Transmit/Receive` 的同步短事务实现 |
+| `Core/Inc/sensor_i2c_bus.h` | 传感器 I2C 事务层接口（短超时、7 位地址、结果码、主机测试替身开关 `I2C_HOST_TEST`）。**刻意不叫 i2c.h**，避免与 CubeMX 生成的 `Core/Inc/i2c.h` 冲突 |
+| `Core/Src/sensor_i2c_bus.c` | 基于 `HAL_I2C_Master_Transmit/Receive` 的同步短事务实现；不定义 `MX_I2C3_Init` |
 | `Core/Inc/ms5837.h` | MS5837 驱动接口、参数表、状态位、样本/统计结构 |
 | `Core/Src/ms5837.c` | 非阻塞状态机、CRC4、02BA/30BA 一阶+二阶补偿、零点、滤波、参数 |
 | `tests/ms5837_host_test.c` | 主机单元测试（含 I2C 从设备仿真与转换时间模型） |
@@ -117,14 +117,14 @@ ms5837_host_test: PASS
 
 ```
 PS> arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -std=c11 -Wall -Wextra -Werror -O2 \
-      -DSTM32H750xx -DUSE_HAL_DRIVER -c Core/Src/i2c.c     -o i2c.o
+      -DSTM32H750xx -DUSE_HAL_DRIVER -c Core/Src/sensor_i2c_bus.c -o bus.o
 (exit 0)   text 400   data 1   bss 5
 PS> ... -c Core/Src/ms5837.c -o ms5837.o
 (exit 0)   text 4365  data 176 bss 0
 ```
 
 `-Wall -Wextra -Werror` 下无告警，说明驱动可被现有 CubeMX/HAL 工程直接编译。
-本次未调用 CMake（CMake 由协调人合入 `Core/Src/i2c.c`、`Core/Src/ms5837.c` 后再跑）。
+本次未调用 CMake（CMake 由协调人合入 `Core/Src/sensor_i2c_bus.c`、`Core/Src/ms5837.c` 后再跑）。
 
 ## 4. 测试覆盖内容
 
@@ -135,7 +135,7 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 | `OfficialExample02ba` | 数据手册算例：20.00 °C / 1100.02 mbar（`pressure_raw=110002`） |
 | `TemperatureBranches` | 30BA 低温、极低温（< −15 °C，叠加项）、高温分支；02BA 低温；unknown 型号不补偿、不写输出 |
 | `ModelDifference` | 同一原始数据在 02BA/30BA 下结果不同；两型号最大转换时间表逐项对照；unknown 取较慢一侧 |
-| `CommandSequence` | 第一条命令是复位 0x1E；PROM 读地址 0xA0..0xAC 齐全；OSR4096/256/8192 → D1 0x48/0x40/0x4A、D2 0x58/0x50/0x5A |
+| `CommandSequence` | 第一条命令是复位 0x1E；PROM **恰好 7 次**读且顺序为 0xA0/0xA2/0xA4/0xA6/0xA8/0xAA/0xAC，**整个命令日志里不允许出现 0xAE**；OSR4096/256/8192 → D1 0x48/0x40/0x4A、D2 0x58/0x50/0x5A |
 | `UnknownModelDefault` | 默认 unknown：RAW_VALID 有、CONFIG_UNKNOWN 置位、压力/温度/深度全 NaN（非 0）；`Ms5837_Zero()` 返回 `ERR_MODEL_UNKNOWN`；显式设型号后下一帧出有效值 |
 | `NoZeroMeansNoDepth` | 无零点时深度 NaN、DEPTH_VALID=0、`GetParam(0103)` 返回 `ERR_NO_ZERO`；显式设定后深度按 `(P−P0)/(rho·g)` 计算；清除零点后回到 NaN |
 | `ZeroAndDepth` | 显式 `Ms5837_Zero()` 采零点 → 深度≈0；D1 阶跃后深度与独立参考压力计算的期望值一致（含 02BA 的 Pa/LSB 换算） |
@@ -151,6 +151,14 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 
 主机测试里的从设备仿真带**独立复制的数据手册最大转换时间表**：驱动若提前读 ADC 会被记为违规
 （`early_reads`），当前为 0。
+仿真设备对 PROM 命令 index>6（即 0xAE 及以后）返回 `HAL_ERROR`，因此“能上线”本身就证明驱动不依赖第 8 个字。
+
+## 4.1 集成评审修正记录（2026-10-06）
+
+| 评审意见 | 处理 | 证据 |
+| --- | --- | --- |
+| 1) 自写 `i2c.c/h` 会与 CubeMX 生成的 `Core/Src/i2c.c`、`Core/Inc/i2c.h` 冲突，需改名 | 已 `git mv` 为 `Core/Inc/sensor_i2c_bus.h`、`Core/Src/sensor_i2c_bus.c`；头文件保护宏改为 `__SENSOR_I2C_BUS_H__`；`ms5837.c`、测试、文档全部更新。**HAL I2C3 初始化（GPIO/时钟/`MX_I2C3_Init`/`MspInit`）归集成方**，本模块只 `I2c_Init(&hi2c3)` 绑定句柄，不定义任何 `MX_*` 符号。驱动/总线对外函数名保持不变（`I2c_*`、`Ms5837_*`），接口无破坏性改动 | 重新编译 + 全部测试 PASS；`arm-none-eabi-gcc -Werror` 交叉编译 `sensor_i2c_bus.c` 通过 |
+| 2) 30BA 物理 PROM 只有 7 个 16 位字（0xA0..0xAC），CRC4 的第 8 字由软件置 0，不得要求读 AE | 核查结果：读取循环**本来就只读 7 个字**（`MS5837_CMD_PROM_WORD_COUNT = 7`，逐字 0xA0..0xAC，随后 `ms5837.prom[7] = 0`），从未下发 0xAE。为防回归，`CommandSequence` 测试已加显式断言：PROM 读恰好 7 次且顺序为 0xA0,0xA2,0xA4,0xA6,0xA8,0xAA,0xAC，命令日志中不得出现 0xAE；仿真设备对 index>6 返回 `HAL_ERROR`，能上线即证明不依赖第 8 个字 | `ms5837_host_test: PASS`；源码注释同步说明“不读 0xAE” |
 
 ## 5. 未做 / 未验证（重要）
 
@@ -159,8 +167,9 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 * 真实型号（02BA vs 30BA）仍未确认，固件默认 unknown，必须由人显式设定；未实现任何自动型号猜测。
 * 未做：`SAVE_CONFIG` 持久化、温度校准（MS5837 无该命令，应回 UNSUPPORTED）、多实例、DMA/中断收发。
 * 复位后 10 ms 延时是保守余量（数据手册未给具体数值），未在硬件上测过最短安全值。
-* 集成方仍需完成：`.ioc` 使能 I2C3(PA8/PC9)、`main.c` 里 `I2c_Init(&hi2c3)` + `Ms5837_Init()` +
-  主循环 `Ms5837_Process()`、`CMakeLists.txt` 增加两个源文件 —— 清单见 `docs/ms5837.md` 第 5 节。
+* 集成方仍需完成：`.ioc` 使能 I2C3(PA8/PC9) 与 CubeMX 的 `MX_I2C3_Init`/MspInit、`main.c` 里
+  `I2c_Init(&hi2c3)` + `Ms5837_Init()` + 主循环 `Ms5837_Process()`、`CMakeLists.txt` 增加
+  `Core/Src/sensor_i2c_bus.c` 与 `Core/Src/ms5837.c` —— 清单见 `docs/ms5837.md` 第 5 节。
 * 工具链限制：本机 w64devkit 未带 ASan/UBSan 运行库，无法跑 sanitizer；改用 `-O0`/`-O2` + `-Werror`
   加独立参考实现交叉验证，并以 `arm-none-eabi-gcc -Werror` 交叉编译确认无告警。
 
@@ -168,7 +177,10 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 
 * 分支：`feature/depth-ms5837-20261006`
 * 实现提交：`1130aca` “功能：新增MS5837深度计I2C3驱动与主机测试（02BA/30BA补偿、CRC4、非阻塞转换、显式零点）”
-  （8 个文件、3547 行新增：`Core/Inc/i2c.h`、`Core/Src/i2c.c`、`Core/Inc/ms5837.h`、`Core/Src/ms5837.c`、
-  `tests/ms5837_host_test.c`、`tests/run_ms5837_host_test.ps1`、`docs/ms5837.md`、`docs/ms5837-progress.md`）。
+  （8 个文件、3547 行新增；总线文件名在评审后由 `i2c.c/i2c.h` 改名为 `sensor_i2c_bus.c/.h`）。
+* 文档提交：`e53785f` “文档：记录MS5837深度计实现提交与验证证据”。
+* 评审修正提交：本文件所在提交 “修正：传感器总线改名以避开CubeMX i2c.c/h，并固化PROM 7字读取断言”，
+  只包含改名后的 `Core/Inc/sensor_i2c_bus.h`、`Core/Src/sensor_i2c_bus.c`、`Core/Src/ms5837.c`、
+  `tests/ms5837_host_test.c`、`docs/ms5837.md`、`docs/ms5837-progress.md`。
 * 只提交了本模块自己的文件（未 `git add .`，未改动/回退他人文件，未 push，未合并 main）。
 * 提交时 Git 提示 “LF will be replaced by CRLF”，来自本机 `core.autocrlf=true`，与仓库既有文件一致。

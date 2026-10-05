@@ -2,7 +2,7 @@
 
 #include <string.h>
 
-#include "i2c.h"
+#include "sensor_i2c_bus.h"
 
 /* ---------------------------------------------------------------- 命令字 */
 #define MS5837_CMD_RESET           0x1EU /* 软复位。 */
@@ -11,7 +11,12 @@
 #define MS5837_CMD_CONVERT_D1_BASE 0x40U /* D1(压力)：0x40..0x4A。 */
 #define MS5837_CMD_CONVERT_D2_BASE 0x50U /* D2(温度)：0x50..0x5A。 */
 
-#define MS5837_CMD_PROM_WORD_COUNT 7U /* 可读的 PROM 字数（第 8 个字是保留 0）。 */
+/*
+ * 官方物理 PROM 只有 7 个 16 位字，读取命令 0xA0/0xA2/0xA4/0xA6/0xA8/0xAA/0xAC。
+ * 驱动**只读这 7 个字**，绝不读 0xAE；CRC4 算法需要的第 8 个数组元素由软件置 0
+ * （见 ms5837.prom[7] = 0），设备不需要有第 8 个字也能上线。
+ */
+#define MS5837_CMD_PROM_WORD_COUNT 7U /* 实读 PROM 字数（0xA0..0xAC）。 */
 #define MS5837_ADC_BYTES           3U /* ADC 结果长度。 */
 #define MS5837_PROM_BYTES          2U /* PROM 单字长度。 */
 #define MS5837_I2C_TIMEOUT_MS      I2C_BUS_DEFAULT_TIMEOUT_MS /* 单次 I2C 事务短超时。 */

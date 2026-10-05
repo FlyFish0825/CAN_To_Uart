@@ -9,7 +9,7 @@
  * 构建（Windows + w64devkit gcc，工作区根目录执行）：
  *   gcc -std=c11 -Wall -Wextra -Werror -O0 -ICore/Inc tests/ms5837_host_test.c -o build/ms5837_host_test.exe
  *
- * 说明：本文件按仓库既有主机测试风格直接包含被测实现（i2c.c / ms5837.c），
+ * 说明：本文件按仓库既有主机测试风格直接包含被测实现（sensor_i2c_bus.c / ms5837.c），
  * 因此可以做白盒断言（例如检查驱动的状态字和统计）。
  */
 
@@ -19,7 +19,7 @@
 
 #define I2C_HOST_TEST 1
 
-#include "../Core/Inc/i2c.h"
+#include "../Core/Inc/sensor_i2c_bus.h"
 #include "../Core/Inc/ms5837.h"
 
 /* ---------------------------------------------------------------- 时间桩 */
@@ -205,7 +205,7 @@ HAL_StatusTypeDef HAL_I2C_Master_Receive(I2C_HandleTypeDef *hi2c,
   return HAL_OK;
 }
 
-#include "../Core/Src/i2c.c"
+#include "../Core/Src/sensor_i2c_bus.c"
 #include "../Core/Src/ms5837.c"
 
 /* ---------------------------------------------------------------- 测试框架 */
@@ -648,22 +648,33 @@ static void Test_CommandSequence(void)
   run_until(pred_prom_valid, 200U);
   CHECK(pred_prom_valid() != 0U);
 
-  /* PROM 读地址必须是 0xA0,0xA2,...,0xAC（7 个字）。 */
-  for (index = 0U; index < 7U; index++)
+  /*
+   * 官方物理 PROM 只有 7 个 16 位字（0xA0..0xAC）。驱动必须按顺序读这 7 个地址，
+   * 且绝不读 0xAE；CRC4 需要的第 8 个数组元素由软件置 0。
+   * 仿真设备的 index>6 会返回 HAL_ERROR，因此若驱动依赖第 8 个字就永远无法上线。
+   */
   {
-    uint8_t expected = (uint8_t)(0xA0U + (uint8_t)(index * 2U));
-    uint8_t found = 0U;
+    static const uint8_t expected_reads[7] = {0xA0U, 0xA2U, 0xA4U, 0xA6U, 0xA8U, 0xAAU, 0xACU};
+    uint8_t actual_reads[7] = {0U, 0U, 0U, 0U, 0U, 0U, 0U};
+    uint8_t seen = 0U;
     uint32_t c;
+
     for (c = 0U; c < sim.command_count; c++)
     {
-      if (sim.command_log[c] == expected)
+      CHECK(sim.command_log[c] != 0xAEU); /* 不存在第 8 个字，禁止读 0xAE。 */
+      if ((sim.command_log[c] & 0xF0U) == 0xA0U)
       {
-        found = 1U;
-        break;
+        CHECK(seen < 7U); /* 多于 7 次 PROM 读同样说明读法不对。 */
+        actual_reads[seen] = sim.command_log[c];
+        seen++;
       }
     }
-    CHECK(found != 0U);
-    prom_reads++;
+    CHECK(seen == 7U);
+    for (index = 0U; index < 7U; index++)
+    {
+      CHECK(actual_reads[index] == expected_reads[index]);
+      prom_reads++;
+    }
   }
   CHECK(prom_reads == 7U);
 
