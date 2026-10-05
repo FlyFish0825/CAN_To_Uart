@@ -137,3 +137,26 @@ mag_units、quat_wxyz、euler_rpy_rad、baro_*），无伪造字段。
 - 波特率/时序/字节间隔未实测（模块按分块时间戳工作，不依赖波特率常量）。
 - 本模块从未在 STM32 上运行；目标侧仅交叉编译检查通过。
 - 解锁引脚（`ImuSensor_SetPinsBlocked(0)`）与任何实机操作，等待用户明确指示后由统筹方执行。
+
+## 8. 实机只读接收验证（COM42，2026-10-06，经统筹授权）
+
+**结果：COM42 链路通，但采到的 261 字节全部是已烧录调试固件在 PA9 上的
+"SELFTEST-7E23" 自测横幅（13B/500ms），0 个 7E23 IMU 帧。当前接线（COM42 RX←PA9）
+无法采到 IMU 数据（IMU TX→PA10）。H750 DMA/正式后端联调仍未开始、未通过。**
+
+- 方法：PowerShell `System.IO.Ports.SerialPort`，115200 8N1、无流控、DTR/RTS 关、
+  RX-only 10 秒、零写入；结束后 `Close()` 确认 `is-open=False`。
+- 依据数据认定：横幅字符串与 500ms 周期逐字对应 `imu_uart_debug.c` 自环自测代码，
+  且已烧录构建的 `IMU_DBG_SELFTEST_ENABLE=1`（早于"不自环"规则），重烧即消除；
+  与统筹方在 COM11（CDC）看到 IMU 十六进制文本自洽——IMU 数据只出现在 PA10→固件→CDC 路径。
+- 详细报告与原始数据：`build/hardware-test/hardware-test-20261006.md`、
+  `imu_com42_10s.bin`（build/ 不入库，随工作树保留）。
+
+复现命令：
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/imu_capture_com42.ps1
+# 默认 COM42/115200/10s，仅 RX，输出 build/hardware-test/imu_com42_10s.bin
+gcc -std=c11 -Wall -Wextra -Werror -O0 -ICore/Inc tests/imu_bin_analyze.c -o build/imu_bin_analyze.exe
+./build/imu_bin_analyze.exe build/hardware-test/imu_com42_10s.bin
+```
