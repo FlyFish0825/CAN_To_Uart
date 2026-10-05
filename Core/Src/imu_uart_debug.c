@@ -16,7 +16,7 @@
 
 #include <string.h>
 
-/* USART1 DMA 环形缓冲字节数，必须为 2 的幂；921600 波特率下约缓冲 22 ms。 */
+/* USART1 DMA 环形缓冲字节数，必须为 2 的幂；115200 波特率下约缓冲 178 ms。 */
 #define IMU_DBG_DMA_RING_SIZE 2048U
 /* 待打印累积缓冲字节数；CDC 发送队列暂满时数据先在这里排队。 */
 #define IMU_DBG_ACC_SIZE 4096U
@@ -24,8 +24,10 @@
 #define IMU_DBG_BYTES_PER_LINE 16U
 /* 无新数据时打印统计状态行的最小间隔。 */
 #define IMU_DBG_IDLE_PERIOD_MS 1000U
-/* IMU 实际波特率；.ioc 中 USART1 的 921600 是旧主机链路遗留值。 */
-#define IMU_DBG_BAUDRATE 115200U
+/* PA9-PA10 短接自环自测的发送周期。 */
+#define IMU_DBG_SELFTEST_PERIOD_MS 500U
+/* 自测发送内容：短接 PA9-PA10 后，这些字节应立刻出现在 COM11 的 IMU: 行。 */
+static const char imu_dbg_selftest[] = "SELFTEST-7E23";
 
 /* USART1 RX DMA 句柄由 CubeMX 生成在 usart.c 中，非 static，可外部引用。 */
 extern DMA_HandleTypeDef hdma_usart1_rx;
@@ -45,6 +47,7 @@ static uint32_t imu_dbg_total_bytes;      /* 累计收到的原始字节数。 *
 static uint32_t imu_dbg_drop_bytes;       /* 累积缓冲溢出时丢弃的字节数。 */
 static uint32_t imu_dbg_last_data_tick;   /* 最后一次收到字节的时间。 */
 static uint32_t imu_dbg_last_status_tick; /* 最后一次打印状态行的时间。 */
+static uint32_t imu_dbg_last_selftest_tick; /* 最后一次自环自测发送的时间。 */
 static uint8_t imu_dbg_started;           /* 初始化完成标志。 */
 
 static const char imu_dbg_hex[] = "0123456789ABCDEF";
@@ -170,21 +173,11 @@ HAL_StatusTypeDef ImuUartDebug_Init(void)
 {
   /*
    * DMA 时钟和 NVIC 由 CubeMX 生成的 MX_DMA_Init() 配置，必须先于串口
-   * 初始化；USART1 的 921600 波特率与 DMA 循环模式来自 .ioc 配置。
+   * 初始化；USART1 的 115200 波特率与 DMA 循环模式均来自 .ioc 配置，
+   * usart.c 的生成值与 .ioc 一致，这里不再运行时改写波特率。
    */
   MX_DMA_Init();
   MX_USART1_UART_Init();
-
-  /*
-   * .ioc 中 USART1 默认 921600 为旧主机链路遗留值，与 IMU 不符；此处
-   * 直接用 HAL 按新波特率重新初始化，避免为此重新生成 CubeMX 代码。
-   * 正式版本确认波特率后，应在 .ioc 中修改并重新生成、删掉本段。
-   */
-  huart1.Init.BaudRate = IMU_DBG_BAUDRATE;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    return HAL_ERROR;
-  }
 
   imu_dbg_acc_len = 0U;
   imu_dbg_rd_pos = 0U;
@@ -201,7 +194,8 @@ HAL_StatusTypeDef ImuUartDebug_Init(void)
 
   /* 启动提示行：电脑端一打开 COM 口即可确认固件已在采集。 */
   {
-    static const char start_line[] = "IMU DBG: usart1 115200 dma rx start\r\n";
+    static const char start_line[] =
+        "IMU DBG: 115200 rx start, selftest PA9<->PA10\r\n";
     (void)UsbCanGateway_TxEnqueue((const uint8_t *)start_line,
                                   (uint16_t)(sizeof(start_line) - 1U));
   }
@@ -258,4 +252,16 @@ void ImuUartDebug_Process(void)
   ImuUartDebug_FlushLines();
   now = HAL_GetTick();
   ImuUartDebug_ReportIdle(now);
+
+  /*
+   * 自环自测：周期性从 PA9 发出固定字符串。用杜邦线短接 PA9 与 PA10
+   * 后，COM11 应立刻出现包含 SELFTEST-7E23 的 IMU: 数据行，从而在
+   * 不用示波器的情况下验证“引脚到 DMA 到 CDC”整条接收链路。
+   */
+  if ((now - imu_dbg_last_selftest_tick) >= IMU_DBG_SELFTEST_PERIOD_MS)
+  {
+    imu_dbg_last_selftest_tick = now;
+    (void)HAL_UART_Transmit(&huart1, (const uint8_t *)imu_dbg_selftest,
+                            (uint16_t)(sizeof(imu_dbg_selftest) - 1U), 20U);
+  }
 }

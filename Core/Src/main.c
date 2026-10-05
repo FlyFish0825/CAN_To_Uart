@@ -143,7 +143,7 @@ int main(void)
   /* 三个模块均注册成功后，主循环才开始消费协议和传输队列。 */
 
   /*
-   * 【调试分支】启动 IMU 串口读取：USART1（PA9/PA10，921600）DMA 循环
+   * 【调试分支】启动 IMU 串口读取：USART1（PA9/PA10，115200）DMA 循环
    * 接收，主循环把新收到的字节按十六进制文本行写入 USB CDC 发送队列。
    */
   if (ImuUartDebug_Init() != HAL_OK)
