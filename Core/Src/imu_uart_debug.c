@@ -24,6 +24,8 @@
 #define IMU_DBG_BYTES_PER_LINE 16U
 /* 无新数据时打印统计状态行的最小间隔。 */
 #define IMU_DBG_IDLE_PERIOD_MS 1000U
+/* IMU 实际波特率；.ioc 中 USART1 的 921600 是旧主机链路遗留值。 */
+#define IMU_DBG_BAUDRATE 115200U
 
 /* USART1 RX DMA 句柄由 CubeMX 生成在 usart.c 中，非 static，可外部引用。 */
 extern DMA_HandleTypeDef hdma_usart1_rx;
@@ -173,6 +175,17 @@ HAL_StatusTypeDef ImuUartDebug_Init(void)
   MX_DMA_Init();
   MX_USART1_UART_Init();
 
+  /*
+   * .ioc 中 USART1 默认 921600 为旧主机链路遗留值，与 IMU 不符；此处
+   * 直接用 HAL 按新波特率重新初始化，避免为此重新生成 CubeMX 代码。
+   * 正式版本确认波特率后，应在 .ioc 中修改并重新生成、删掉本段。
+   */
+  huart1.Init.BaudRate = IMU_DBG_BAUDRATE;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
   imu_dbg_acc_len = 0U;
   imu_dbg_rd_pos = 0U;
   imu_dbg_total_bytes = 0U;
@@ -188,7 +201,7 @@ HAL_StatusTypeDef ImuUartDebug_Init(void)
 
   /* 启动提示行：电脑端一打开 COM 口即可确认固件已在采集。 */
   {
-    static const char start_line[] = "IMU DBG: usart1 921600 dma rx start\r\n";
+    static const char start_line[] = "IMU DBG: usart1 115200 dma rx start\r\n";
     (void)UsbCanGateway_TxEnqueue((const uint8_t *)start_line,
                                   (uint16_t)(sizeof(start_line) - 1U));
   }
