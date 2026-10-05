@@ -720,13 +720,14 @@ static void Test_StatusBits(void)
   assert((s.status & IMU_SENSOR_STATUS_ONLINE) == 0U);
   assert((s.status & IMU_SENSOR_STATUS_RAW_VALID) == 0U);
 
-  /* 速率+模式都下发过才清除 CONFIG_UNKNOWN。 */
+  /* UNCONFIRMED 的 rate/mode 下发不清除 CONFIG_UNKNOWN：无原生读回，
+   * 配置永远无法确认（严格解释，统筹 2026-10-06 复核）。 */
   assert(ImuSensor_Request(IMU_SENSOR_REQ_SET_RATE, 100U, 6000ULL, NULL) == 0);
   assert(ImuSensor_GetSample(&s, 6000ULL) == 1);
   assert((s.status & IMU_SENSOR_STATUS_CONFIG_UNKNOWN) != 0U);
   assert(ImuSensor_Request(IMU_SENSOR_REQ_SET_MODE, 9U, 6000ULL, NULL) == 0);
   assert(ImuSensor_GetSample(&s, 6000ULL) == 1);
-  assert((s.status & IMU_SENSOR_STATUS_CONFIG_UNKNOWN) == 0U);
+  assert((s.status & IMU_SENSOR_STATUS_CONFIG_UNKNOWN) != 0U);
 }
 
 /** 气压计帧解码与压力/温度新鲜度位。 */

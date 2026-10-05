@@ -87,6 +87,8 @@ enum ImuSensorResultCode
 #define IMU_SENSOR_STATUS_PRESSURE_VALID   (1UL << 4)
 #define IMU_SENSOR_STATUS_TEMPERATURE_VALID (1UL << 5)
 #define IMU_SENSOR_STATUS_PIN_BLOCKED      (1UL << 9)
+/* bit10 CONFIG_UNKNOWN 恒置位：原生协议无读回，配置永远无法确认，
+ * UNCONFIRMED 的 rate/mode 下发不改变该位。 */
 #define IMU_SENSOR_STATUS_CONFIG_UNKNOWN   (1UL << 10)
 /* bit11 MODEL_CONFIRMED 恒为 0：原生协议无型号读回，禁止凭空确认。 */
 
