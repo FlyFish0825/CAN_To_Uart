@@ -199,7 +199,10 @@ Ms5837Result_t Ms5837_GetProm(uint16_t prom[MS5837_PROM_WORDS]);
 /**
  * @brief 用最近一次有效压力显式建立零点（对应 AA5B ZERO_DEPTH）。
  *
- * 需要 PRESSURE_VALID；否则返回 MS5837_ERR_MODEL_UNKNOWN 或 MS5837_ERR_NO_SAMPLE。
+ * 压力值走与 Ms5837_SetSurfacePressurePa 完全相同的校验（有限值、10000~200000 Pa）：
+ * 测量压力越界时返回 MS5837_ERR_PARAM 且不建立零点，避免出现
+ * “ZERO 成功但 GET_PARAMETER(0103) 认为越界”的矛盾状态。
+ * 未确认型号返回 MS5837_ERR_MODEL_UNKNOWN；还没有样本返回 MS5837_ERR_NO_SAMPLE。
  */
 Ms5837Result_t Ms5837_Zero(void);
 
@@ -210,9 +213,23 @@ Ms5837Result_t Ms5837_ClearZero(void);
 uint8_t Ms5837_IsZeroValid(void);
 
 /* ------------------------------------------------------------------ 参数 */
+/**
+ * @brief 设定型号（0 unknown / 2 = 02BA / 30 = 30BA）。
+ *
+ * 型号发生变化时：清除旧零点与滤波状态（旧 P0 可能是用错误型号算出来的），
+ * 作废已发布样本的补偿值，并丢弃正在进行的半周期按新型号重新采样；
+ * 重复设置同一个型号是幂等的，不会清零点。
+ * 当前采样率的周期预算放不下新型号时返回 MS5837_ERR_PARAM。
+ */
 Ms5837Result_t Ms5837_SetModel(uint8_t model); /* 0 / 2 / 30。 */
 uint8_t Ms5837_GetModel(void);
 
+/**
+ * @brief 设定 OSR（256~8192）。
+ *
+ * 若正好处于 D1/D2 转换中，会丢弃该半周期并按新 OSR 重新开始，绝不沿用旧等待。
+ * 周期预算放不下时返回 MS5837_ERR_PARAM。
+ */
 Ms5837Result_t Ms5837_SetOsr(uint16_t osr); /* 256~8192，且需满足当前采样率的周期预算。 */
 uint16_t Ms5837_GetOsr(void);
 
