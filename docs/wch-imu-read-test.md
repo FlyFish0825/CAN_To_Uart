@@ -1,7 +1,13 @@
-# 经 WCH-Link 读取 IMU——授权后测试步骤（ZCode 持有，待授权执行）
+# IMU 实机读取验证（已执行，结果见 build/hardware-test/imu-read-report-20261006.md）
 
-状态：**固件已就绪（本 worktree build/Debug/CAN_To_Uart.elf），等待用户授权烧录与串口访问**。
-本文档由 ZCode 维护；授权窗口内按以下步骤执行，窗口外不运行任何命令。
+**2026-10-06 结果摘要**：COM42 路线因 WCH-Link 串口物理占用 PA9/PA10 不可用
+（插着烧写器 IMU 拉不了低电平，拔掉才有数据），改为 CDC 重组法：桥接固件把
+PA10 原始字节以 `IMUWd:<hex>` 行发上 COM11，离线重组后用 imu_sensor 复检。
+**实机通过**：raw 2050B/s（25Hz×82B）、good=1503（raw/quat/euler/baro 各 375~376，
+25.07Hz）、bad_checksum=1、样本物理自洽（1g 静止、roll 61° 与加速度互洽、四元数
+归一化）。控制指令仍未实机发送（需单独授权）。
+
+以下为原始测试计划，留作复现参考。
 
 ## 0. 前提与接线（用户已确认/需确认的事实）
 
