@@ -444,10 +444,12 @@ static void Test_ParamAndRequests(void)
          IMU_SENSOR_RES_BAD_VALUE);
   assert(tx_count == 0U);
 
-  /* 0x60 受理：字面帧 + 立即 UNCONFIRMED（明确无回复，不等 0x81）。 */
+  /* 0x60 受理：字面帧 + 立即 UNCONFIRMED（明确无回复，不等 0x81）。
+   * 协议表原文：频率为单字节参数1，帧总长 07。 */
   assert(ImuSensor_Request(IMU_SENSOR_REQ_SET_RATE, 10U, 1000ULL, &seq) == 0);
   assert(seq == 1U);
-  len = Build7e23(0x60U, (const uint8_t *)"\x0A\x00\x5F", 3U, expected);
+  len = Build7e23(0x60U, (const uint8_t *)"\x0A\x5F", 2U, expected);
+  assert(len == 7U);
   AssertTxFrame(0U, expected, len);
   assert(ImuSensor_PopResult(&r) == 1);
   assert(r.op == IMU_SENSOR_REQ_SET_RATE && r.host_seq == 1U);
@@ -548,6 +550,15 @@ static void Test_DefaultTimeouts(void)
   ImuSensor_Process(2000000ULL + 30000000ULL);
   assert(ImuSensor_PopResult(&r) == 1);
   assert(r.result == IMU_SENSOR_RES_TIMEOUT);
+
+  /* 0x73 温度校准同属校准类，默认 30s。 */
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_CAL_TEMP, 2500U, 40000000ULL,
+                           &seq) == 0);
+  ImuSensor_Process(40000000ULL + 30000000ULL - 1ULL);
+  assert(ImuSensor_PopResult(&r) == 0);
+  ImuSensor_Process(40000000ULL + 30000000ULL);
+  assert(ImuSensor_PopResult(&r) == 1);
+  assert(r.result == IMU_SENSOR_RES_TIMEOUT);
 }
 
 /** 显式非 0 超时对版本与校准统一覆盖（便于 host 测试缩短等待）。 */
@@ -574,6 +585,72 @@ static void Test_ExplicitTimeoutOverride(void)
   ImuSensor_Process(205000ULL);
   assert(ImuSensor_PopResult(&r) == 1);
   assert(r.result == IMU_SENSOR_RES_TIMEOUT);
+}
+
+/** 温度校准 0x73：8 字节帧（表格长度单元格 07 为笔误，按下标行取 8），
+ *  T_100 参数1=低字节、参数2=高字节；应答 0x81 [0x73, 状态]。 */
+static void Test_TempCalibration(void)
+{
+  ImuSensor_Result r;
+  uint8_t expected[16];
+  uint8_t frame[16];
+  uint16_t len;
+  uint32_t seq = 0U;
+
+  TestReset(0, 0);
+  ImuSensor_SetPinsBlocked(0U);
+
+  /* 25.00°C → T_100=2500=0x09C4 → 参数1=0xC4、参数2=0x09。 */
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_CAL_TEMP, 2500U, 100000ULL,
+                           &seq) == 0);
+  len = Build7e23(0x73U, (const uint8_t *)"\xC4\x09\x5F", 3U, expected);
+  assert(len == 8U);
+  AssertTxFrame(0U, expected, len);
+  assert(ImuSensor_PopResult(&r) == 0); /* 待确认，无立即结果。 */
+  /* 第二条命令在飞期间被拒（BUSY 不分配序号，传 NULL 即可）。 */
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_GET_VERSION, 0U, 100000ULL,
+                           NULL) == IMU_SENSOR_RES_BUSY);
+  len = BuildCalAck(0x73U, 1U, frame);
+  assert(ImuSensor_Feed(frame, len, 101000ULL) == (int)len);
+  ImuSensor_Process(101000ULL);
+  assert(ImuSensor_PopResult(&r) == 1);
+  assert(r.op == IMU_SENSOR_REQ_CAL_TEMP && r.host_seq == seq);
+  assert(r.result == IMU_SENSOR_RES_OK);
+
+  /* 负值线格式：-5.00°C → 0xFE0C → 参数1=0x0C、参数2=0xFE（表格未写
+   * 有符号性，按 16 位线格式原样发送）。回包状态 0 → IO_ERROR。 */
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_CAL_TEMP, (uint32_t)-500,
+                           110000ULL, &seq) == 0);
+  len = Build7e23(0x73U, (const uint8_t *)"\x0C\xFE\x5F", 3U, expected);
+  AssertTxFrame(1U, expected, len);
+  len = BuildCalAck(0x73U, 0U, frame);
+  assert(ImuSensor_Feed(frame, len, 111000ULL) == (int)len);
+  ImuSensor_Process(111000ULL);
+  assert(ImuSensor_PopResult(&r) == 1);
+  assert(r.result == IMU_SENSOR_RES_IO_ERROR);
+}
+
+/** 重置用户数据 0xA0：与协议表字面量逐字节一致，无回复→UNCONFIRMED。 */
+static void Test_ResetCommand(void)
+{
+  ImuSensor_Result r;
+  uint32_t seq = 0U;
+  /* 协议表 R46 字面量（第二处校验和算法锚点）。 */
+  static const uint8_t reset_req[7] = {0x7EU, 0x23U, 0x07U, 0xA0U,
+                                       0x01U, 0x5FU, 0xA8U};
+
+  TestReset(0, 0);
+  ImuSensor_SetPinsBlocked(0U);
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_RESET, 0U, 1000ULL, &seq) == 0);
+  AssertTxFrame(0U, reset_req, sizeof(reset_req));
+  assert(ImuSensor_PopResult(&r) == 1);
+  assert(r.op == IMU_SENSOR_REQ_RESET && r.host_seq == seq);
+  assert(r.result == IMU_SENSOR_RES_UNCONFIRMED);
+  /* 无回复命令不占用待确认槽：紧随其后的版本查询立即可发。 */
+  assert(ImuSensor_Request(IMU_SENSOR_REQ_GET_VERSION, 0U, 1000ULL, &seq) == 0);
+  assert(tx_count == 2U);
+  ImuSensor_Process(2000ULL);
+  assert(ImuSensor_PopResult(&r) == 0); /* 版本仍在飞，无结果。 */
 }
 
 /** 校准有 ACK：0x81 匹配原命令；状态 0 视为设备报告失败。 */
@@ -653,8 +730,7 @@ static void Test_Unsupported(void)
 
   TestReset(0, 0);
   ImuSensor_SetPinsBlocked(0U);
-  assert(ImuSensor_Request(IMU_SENSOR_REQ_CAL_TEMP, 0U, 1000ULL, &seq) ==
-         IMU_SENSOR_RES_UNSUPPORTED);
+  /* 0x73/0xA0 已实现，SAVE/SELFTEST/REBOOT 原生无对应命令仍拒绝。 */
   assert(ImuSensor_Request(IMU_SENSOR_REQ_SAVE_CONFIG, 0U, 1000ULL, &seq) ==
          IMU_SENSOR_RES_UNSUPPORTED);
   assert(ImuSensor_Request(IMU_SENSOR_REQ_SELF_TEST, 0U, 1000ULL, &seq) ==
@@ -832,6 +908,8 @@ int main(void)
   Test_DefaultTimeouts();
   Test_ExplicitTimeoutOverride();
   Test_CalAck();
+  Test_TempCalibration();
+  Test_ResetCommand();
   Test_TxError();
   Test_Unsupported();
   Test_GroupTimestampsIndependent();

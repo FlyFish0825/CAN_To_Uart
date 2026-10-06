@@ -65,7 +65,9 @@ RESULT/status 一致，AA5B 层可直抄。建议映射：
 | 05/0A/0B SAVE/SELFTEST/REBOOT | `Request` 返回 UNSUPPORTED | 预留 |
 | 09 CALIBRATE type=1 | `Request(CAL_ACCEL_GYRO_START/CLEAR)` | 原生 0x70（原文已核实：陀螺仪+加速度；未实机） |
 | 09 CALIBRATE type=2 | `Request(CAL_MAG_START/CLEAR)` | 原生 0x71（原文已核实：磁力计；未实机） |
-| 09 CALIBRATE type=3 | UNSUPPORTED | 0x73 长度表矛盾 |
+| 09 CALIBRATE type=3 | `Request(CAL_TEMP, arg=温度×100)` | 原生 0x73，8 字节帧（表格长度单元格 07 为笔误，按下标行取 8）；应答 0x81 [0x73, 状态]；未实机 |
+| 06 RESTORE_DEFAULTS | `Request(RESET)` | 原生 0xA0 重置用户数据，字面量 `7E 23 07 A0 01 5F A8`，无回复→UNCONFIRMED；未实机 |
+| 05/0A/0B SAVE/SELFTEST/REBOOT | `Request` 返回 UNSUPPORTED | 原生协议无对应命令（0xA0 是重置用户数据，不是复位/保存/自检） |
 
  Stream80/81/85 载荷字段与 `ImuSensor_Sample` 一一对应（accel_g、gyro_rad_s、
 mag_units、quat_wxyz、euler_rpy_rad、baro_*），无伪造字段。
@@ -100,15 +102,17 @@ mag_units、quat_wxyz、euler_rpy_rad、baro_*），无伪造字段。
 | 2 | `CONFIG_UNKNOWN` 恒置位 | 无原生读回，配置永远无法确认；UNCONFIRMED 的 rate/mode 下发不清除该位（统筹 2026-10-06 指示的严格解释，含测试） |
 | 3 | `MODEL_CONFIRMED` 恒 0 | 无原生型号读回，禁止凭空确认 |
 | 4 | 帧时间戳=分块到达时刻，不做块内字节回推 | 上位机时间戳本身 ms 级（ms*1000），回推收益 <87µs/字节；如需可后续补 |
-| 5 | 默认超时（`request_timeout_us=0`）：版本查询 1s、0x70/0x71 校准 30s；显式非 0 值对全部待确认请求统一覆盖。单一在飞；在飞期间一切请求（含 0x60/0x61）BUSY | 校准实机耗时远长于版本查询，不能共用 1s；保守策略避免校准期间混入未定义时序命令 |
+| 5 | 默认超时（`request_timeout_us=0`）：版本查询 1s、0x70/0x71/0x73 校准 30s；显式非 0 值对全部待确认请求统一覆盖。单一在飞；在飞期间一切请求（含无回复命令）BUSY | 校准实机耗时远长于版本查询，不能共用 1s；保守策略避免校准期间混入未定义时序命令 |
 | 6 | rate/mode 缓存=最后成功下发的值，GET 恒 UNCONFIRMED | 原文明确无原生读回 |
-| 7 | 0xA0 复位不暴露 | AA5B REBOOT 预留 UNSUPPORTED；后端未提供复位请求 |
+| 7 | 0x73 的 T_100 **有符号性未证实**：表格只说"温度×100"，I2C 侧寄存器标 uint16；实现按 16 位线格式原样发送，负温度行为待实机确认 | 常温参考（0~50°C）下不影响使用 |
+| 8 | 0x73 帧长取 8 字节：表格"长度 07"与"下标 0..7"矛盾，按下标行（与统筹勘误一致）；若实机按 07 处理需回调 | 原文矛盾无法纸面解决，已按更自洽一侧实现并记入 NOT TESTED |
 
 变更记录：
 
 - `3a07363`：初始提交（当时 0x70/0x71 映射与 0x81 语义为假设；CONFIG_UNKNOWN 按 rate+mode 均下发清除）。
 - `4ea6084`：0x70/0x71/0x81/+5F 转为原文已核实（文档更正，实现本就一致）；`CONFIG_UNKNOWN` 改为恒置位，UNCONFIRMED 的下发不再清除该位。
-- 本次修正（校准超时分档）：`request_timeout_us=0` 时版本查询默认 1s、0x70/0x71 校准默认 30s，不再共用；显式非 0 值统一覆盖；新增默认/覆盖两个测试用例。API 与 Config 结构未变。
+- `82c590a`：校准超时分档（版本 1s / 校准 30s，`request_timeout_us=0` 时生效），显式非 0 统一覆盖。
+- 本次修正（对照通信协议.xlsx 原文逐行核实后）：**修复 SET_RATE 组包 bug**——0x60 的频率参数为单字节（帧总长 07），此前误组包为 u16 两字节（8 字节）；**实现 0x73 温度校准**（8 字节帧、0x81 应答、30s 校准超时、arg=温度×100 的 16 位线格式）；**新增 IMU_SENSOR_REQ_RESET**（原生 0xA0 重置用户数据，字面量 `7E 23 07 A0 01 5F A8`，无回复→UNCONFIRMED，对应 AA5B RESTORE_DEFAULTS 语义，是否映射由统筹定）；SAVE/SELFTEST/REBOOT 保持 UNSUPPORTED（原生无对应命令）。UART MCU→IMU 命令全集（7 条）现已全部实现。
 
 ## 6. 主机测试覆盖（对照统筹要求）
 
@@ -134,7 +138,7 @@ mag_units、quat_wxyz、euler_rpy_rad、baro_*），无伪造字段。
 ## 7. 硬件未验证清单（NOT TESTED，勿当已验证引用）
 
 - 真实 IMU 的 7E23 数据帧**未上机解码**：PA9/PA10 当前被 WCH-Link 占用，按统筹要求默认 `pins_blocked=1`，不驱动引脚、不自环、不自动校准、不烧录。
-- 全部原生命令（0x60/0x61/0x80/0x70/0x71）**未发往真机**；0x81 的 status 语义已按附件原文核实，但回包行为未实测。
+- 全部原生命令（0x60/0x61/0x80/0x70/0x71/0x73/0xA0）**未发往真机**；0x81 的 status 语义已按附件原文核实，但回包行为未实测。0x73 的 8 字节帧长解释与 T_100 有符号性未实机确认。
 - 波特率/时序/字节间隔未实测（模块按分块时间戳工作，不依赖波特率常量）。
 - 本模块从未在 STM32 上运行；目标侧仅交叉编译检查通过。
 - 解锁引脚（`ImuSensor_SetPinsBlocked(0)`）与任何实机操作，等待用户明确指示后由统筹方执行。

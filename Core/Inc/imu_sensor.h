@@ -55,10 +55,12 @@ enum ImuSensorRequestOp
   IMU_SENSOR_REQ_CAL_ACCEL_GYRO_CLEAR = 5, /* 原生 0x70 action=0。 */
   IMU_SENSOR_REQ_CAL_MAG_START = 6,       /* 原生 0x71 action=1。 */
   IMU_SENSOR_REQ_CAL_MAG_CLEAR = 7,       /* 原生 0x71 action=0。 */
-  IMU_SENSOR_REQ_CAL_TEMP = 8,            /* 0x73 未核实，恒 UNSUPPORTED。 */
-  IMU_SENSOR_REQ_SAVE_CONFIG = 9,         /* 预留，恒 UNSUPPORTED。 */
-  IMU_SENSOR_REQ_SELF_TEST = 10,          /* 预留，恒 UNSUPPORTED。 */
-  IMU_SENSOR_REQ_REBOOT = 11              /* 预留，恒 UNSUPPORTED。 */
+  IMU_SENSOR_REQ_CAL_TEMP = 8,            /* 原生 0x73，arg=温度×100（16 位
+                                             线格式原样发送，有符号性未证实）。 */
+  IMU_SENSOR_REQ_SAVE_CONFIG = 9,         /* 原生无对应命令，恒 UNSUPPORTED。 */
+  IMU_SENSOR_REQ_SELF_TEST = 10,          /* 原生无对应命令，恒 UNSUPPORTED。 */
+  IMU_SENSOR_REQ_REBOOT = 11,             /* 原生无对应命令，恒 UNSUPPORTED。 */
+  IMU_SENSOR_REQ_RESET = 12               /* 原生 0xA0 重置用户数据，无回复。 */
 };
 
 /**
@@ -227,17 +229,19 @@ int ImuSensor_GetParameter(uint16_t id, uint32_t *value_out);
 /**
  * @brief 发起一次原生命令请求（异步，结果经 PopResult 弹出）。
  * @param op            ImuSensorRequestOp。
- * @param arg           SET_RATE=Hz(10..100)；SET_MODE=6|9；其余忽略。
+ * @param arg           SET_RATE=Hz(10..100)；SET_MODE=6|9；
+ *                      CAL_TEMP=温度×100（16 位线格式原样）；其余忽略。
  * @param now_us        当前时刻，用于待确认请求的超时判定。
  * @param host_seq_out  可为 NULL；受理时写回本次请求的主机侧序号。
  * @return 0 = 受理（异步结果稍后从 PopResult 出）；
  *         否则同步拒绝码（PIN_BLOCKED/BAD_VALUE/BUSY/UNSUPPORTED）。
  *
- * 受理即可能发送 UART 帧；0x60/0x61 发出后立即产生 UNCONFIRMED 结果，
- * 不等待任何回包。0x80/0x70/0x71 为待确认请求，同一时刻仅一个；待确认
- * 请求在飞期间所有新请求（含无回复命令）保守返回 BUSY，超时产生
- * TIMEOUT 结果。Config.request_timeout_us=0 时默认超时：版本查询 1s、
- * 0x70/0x71 校准 30s；显式非 0 值对全部待确认请求统一覆盖。
+ * 受理即可能发送 UART 帧；0x60/0x61/0xA0 发出后立即产生 UNCONFIRMED
+ * 结果，不等待任何回包。0x80/0x70/0x71/0x73 为待确认请求，同一时刻仅
+ * 一个；待确认请求在飞期间所有新请求（含无回复命令）保守返回 BUSY，
+ * 超时产生 TIMEOUT 结果。Config.request_timeout_us=0 时默认超时：版本
+ * 查询 1s、校准（0x70/0x71/0x73）30s；显式非 0 值对全部待确认请求
+ * 统一覆盖。
  */
 int ImuSensor_Request(uint8_t op, uint32_t arg, uint64_t now_us,
                       uint32_t *host_seq_out);

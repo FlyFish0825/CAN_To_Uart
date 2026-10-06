@@ -6,8 +6,10 @@
  *   - 纯 C、无 HAL 依赖，可在主机测试中直接编译；
  *   - 接收侧有界：1024 字节环形缓冲 + 16 个分块头，溢出整块丢弃并计数，
  *     解析全部发生在 ImuSensor_Process()（主循环），不在中断里解析；
- *   - 无序号的原生协议同一时刻只允许一个待确认请求（0x80/0x70/0x71）；
- *     0x60/0x61/0xA0 明确无回复，发出后立即回 UNCONFIRMED，不等 0x81；
+ *   - 无序号的原生协议同一时刻只允许一个待确认请求（0x80/0x70/0x71/
+ *     0x73）；0x60/0x61/0xA0 明确无回复，发出后立即回 UNCONFIRMED，不
+ *     等 0x81；命令帧均按通信协议.xlsx 原文组包（0x60 频率为单字节参
+ *     数、0x73 长度单元格 07 为笔误按下标行取 8 字节）；
  *   - 浮点访问显式按字节拼 LE 再 memcpy 到对齐临时变量，禁止从环形缓冲
  *     直接按指针取 32 位值；浮点帧全部做 isfinite 检查，非有限整帧拒收；
  *   - 引脚默认锁定（pins_blocked=1），模块自身永远不解锁、不自环、
@@ -25,8 +27,8 @@
 #define IMU_SENSOR_RESULT_Q_SIZE 8U  /* 异步结果 FIFO 深度。 */
 #define IMU_SENSOR_FRAME_MAX 64U     /* 原生帧总长上限。 */
 #define IMU_SENSOR_FRAME_MIN 5U      /* 7E 23 LEN FUNC SUM 的理论下限。 */
-/* request_timeout_us=0 时的默认待确认超时：版本查询 1s，0x70/0x71 校准 30s
- * （校准实机耗时远长于版本查询）。显式非 0 值对全部命令统一覆盖。 */
+/* request_timeout_us=0 时的默认待确认超时：版本查询 1s，0x70/0x71/0x73
+ * 校准 30s（校准实机耗时远长于版本查询）。显式非 0 值对全部命令统一覆盖。 */
 #define IMU_SENSOR_VERSION_DEFAULT_TIMEOUT_US 1000000ULL
 #define IMU_SENSOR_CAL_DEFAULT_TIMEOUT_US 30000000ULL
 
@@ -37,8 +39,10 @@
 #define IMU_NATIVE_FUNC_EULER 0x26U       /* 17 字节：float32 rad。 */
 #define IMU_NATIVE_FUNC_BARO 0x32U        /* 21 字节：float32 高度/温度/气压/参考压。 */
 #define IMU_NATIVE_FUNC_VERSION_REQ 0x80U /* 请求 01 00 5F 前缀。 */
-#define IMU_NATIVE_FUNC_CAL_AGM 0x70U     /* 校准命令 A（映射假设，未实机核实）。 */
-#define IMU_NATIVE_FUNC_CAL_MAG 0x71U     /* 校准命令 B（映射假设，未实机核实）。 */
+#define IMU_NATIVE_FUNC_CAL_AGM 0x70U     /* 校准陀螺仪+加速度计（原文已核实）。 */
+#define IMU_NATIVE_FUNC_CAL_MAG 0x71U     /* 校准磁力计（原文已核实）。 */
+#define IMU_NATIVE_FUNC_CAL_TEMP 0x73U    /* 温度校准（长度单元格 07 为笔误，按下标行取 8 字节）。 */
+#define IMU_NATIVE_FUNC_RESET 0xA0U       /* 重置用户数据，字面量 7E 23 07 A0 01 5F A8。 */
 #define IMU_NATIVE_FUNC_CAL_ACK 0x81U     /* 校准回包：[原命令, 状态0|1]。 */
 
 /* 各已知功能字要求的帧总长（LEN 字段 = 整帧长度）。 */
@@ -857,16 +861,16 @@ int ImuSensor_Request(uint8_t op, uint32_t arg, uint64_t now_us,
   switch (op)
   {
   case IMU_SENSOR_REQ_SET_RATE:
-    /* 统筹勘误：0x60 明确无回复，发出后立即 UNCONFIRMED。 */
+    /* 统筹勘误：0x60 明确无回复，发出后立即 UNCONFIRMED。
+     * 协议表原文：长度 07，频率为单字节参数1，参数2 固定 0x5F。 */
     if ((arg < 10U) || (arg > 100U))
     {
       return IMU_SENSOR_RES_BAD_VALUE;
     }
     native = 0x60U;
-    payload[0] = (uint8_t)(arg & 0xFFU);
-    payload[1] = (uint8_t)((arg >> 8) & 0xFFU);
-    payload[2] = 0x5FU;
-    payload_len = 3U;
+    payload[0] = (uint8_t)arg;
+    payload[1] = 0x5FU;
+    payload_len = 2U;
     break;
 
   case IMU_SENSOR_REQ_SET_MODE:
@@ -922,10 +926,29 @@ int ImuSensor_Request(uint8_t op, uint32_t arg, uint64_t now_us,
     break;
 
   case IMU_SENSOR_REQ_CAL_TEMP:
-    /* 0x73 长度表自相矛盾，未核实前一律拒绝。 */
+    /* 0x73：温度×100 按两字节小端发送（参数1=低、参数2=高），参数3 固定
+     * 0x5F，应答 0x81 [0x73, 状态]。表格长度单元格写 07 但下标行到 7，
+     * 矛盾按下标行取总长 8（与 7 字节的 0x70/0x71 帧同构多一个数据字节）。 */
+    native = IMU_NATIVE_FUNC_CAL_TEMP;
+    payload[0] = (uint8_t)(arg & 0xFFU);
+    payload[1] = (uint8_t)((arg >> 8) & 0xFFU);
+    payload[2] = 0x5FU;
+    payload_len = 3U;
+    expect_reply = 1U;
+    break;
+
+  case IMU_SENSOR_REQ_RESET:
+    /* 0xA0 重置用户数据：字面量 7E 23 07 A0 01 5F A8，明确无回复。 */
+    native = IMU_NATIVE_FUNC_RESET;
+    payload[0] = 0x01U;
+    payload[1] = 0x5FU;
+    payload_len = 2U;
+    break;
+
   case IMU_SENSOR_REQ_SAVE_CONFIG:
   case IMU_SENSOR_REQ_SELF_TEST:
   case IMU_SENSOR_REQ_REBOOT:
+    /* 原生协议无对应命令（0xA0 是重置用户数据，不是复位/保存/自检）。 */
     return IMU_SENSOR_RES_UNSUPPORTED;
 
   default:
@@ -958,7 +981,8 @@ int ImuSensor_Request(uint8_t op, uint32_t arg, uint64_t now_us,
         timeout = imu_cfg.request_timeout_us;
       }
       else if ((native == IMU_NATIVE_FUNC_CAL_AGM) ||
-               (native == IMU_NATIVE_FUNC_CAL_MAG))
+               (native == IMU_NATIVE_FUNC_CAL_MAG) ||
+               (native == IMU_NATIVE_FUNC_CAL_TEMP))
       {
         timeout = IMU_SENSOR_CAL_DEFAULT_TIMEOUT_US;
       }
