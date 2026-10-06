@@ -317,6 +317,26 @@ static void ms5837_record_invalid_conversion(uint32_t now)
 }
 
 /*
+ * 让“已发布样本”的补偿结果立即失效。
+ * 用于型号变化/恢复默认这类会让旧补偿值不再成立的操作：
+ * 清掉 PRESSURE/TEMPERATURE/DEPTH 有效位并把测量字段置回 NaN，
+ * 绝不允许“已知型号算出的旧压力”在型号变回 unknown 后仍带着有效位被读走。
+ */
+static void ms5837_invalidate_compensated(void)
+{
+  ms5837.status &= ~(MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID |
+                     MS5837_STATUS_DEPTH_VALID);
+  ms5837.sample.pressure_raw = 0;
+  ms5837.sample.temperature_centi_c = 0;
+  ms5837.sample.pressure_pa = ms5837_nan();
+  ms5837.sample.temperature_c = ms5837_nan();
+  ms5837.sample.depth_raw_m = ms5837_nan();
+  ms5837.sample.depth_filtered_m = ms5837_nan();
+  ms5837.filter_valid = 0U;
+  ms5837.sample.status = ms5837.status;
+}
+
+/*
  * PROM 内容可信度检查：CRC 通过也可能碰上全 0 / 全 0xFFFF 的假 PROM
  * （典型的 I2C 卡死或空器件特征）。真实模块的 C1~C6 是工厂标定值，
  * 不可能 6 个字全 0 或全 0xFFFF。
@@ -1003,7 +1023,14 @@ Ms5837Result_t Ms5837_RestoreDefaults(void)
   ms5837.stats.output_rate_hz = MS5837_OUTPUT_RATE_HZ_DEFAULT;
   ms5837.status |= MS5837_STATUS_CONFIG_UNKNOWN;
   ms5837.status &= ~MS5837_STATUS_MODEL_CONFIRMED;
+  /* 型号回到 unknown：旧的补偿值（压力/温度）也随之失效，不能带有效位被读走。 */
+  ms5837_invalidate_compensated();
   (void)Ms5837_ClearZero();
+  /*
+   * 默认值里的 OSR/型号也会改变转换时间：与 SetOsr/SetModel 一样，
+   * 必须丢弃正在进行的半周期（延迟丢弃），否则 D1/D2 会跨配置配对。
+   */
+  ms5837_abort_half_cycle();
   return MS5837_OK;
 }
 
@@ -1039,13 +1066,7 @@ Ms5837Result_t Ms5837_SetModel(uint8_t model)
   }
 
   /* 旧样本是按旧型号算的，立即失效，等下一帧重新补偿。 */
-  ms5837.status &= ~(MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID |
-                     MS5837_STATUS_DEPTH_VALID);
-  ms5837.sample.pressure_pa = ms5837_nan();
-  ms5837.sample.temperature_c = ms5837_nan();
-  ms5837.sample.depth_raw_m = ms5837_nan();
-  ms5837.sample.depth_filtered_m = ms5837_nan();
-  ms5837.filter_valid = 0U;
+  ms5837_invalidate_compensated();
 
   /*
    * 型号变了：旧的 P0 很可能是用错误型号算出来的，因此连同零点一起清除；

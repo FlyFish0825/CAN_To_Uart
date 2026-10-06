@@ -11,7 +11,9 @@
 | `Core/Src/sensor_i2c_bus.c` | 基于 `HAL_I2C_Master_Transmit/Receive` 的同步短事务实现；不定义 `MX_I2C3_Init` |
 | `Core/Inc/ms5837.h` | MS5837 驱动接口、参数表、状态位、样本/统计结构 |
 | `Core/Src/ms5837.c` | 非阻塞状态机、CRC4、02BA/30BA 一阶+二阶补偿、零点、滤波、参数 |
-| `tests/ms5837_host_test.c` | 主机单元测试（含 I2C 从设备仿真与转换时间模型） |
+| `tests/ms5837_host_test.c` | 主机单元测试（含 I2C 从设备仿真、芯片 busy 模型、D1/D2 配对不变量、随机不变量） |
+| `tests/ms5837_reference_vectors.h` | 独立 Python 参考实现生成的 100 条跨实现校验向量（自动生成，勿手改） |
+| `tests/gen_ms5837_reference_vectors.py` | 上面那张表的生成脚本（固定种子、可复现；注释里记录了它自己踩过的坑） |
 | `tests/run_ms5837_host_test.ps1` | 一键编译+运行脚本 |
 | `docs/ms5837.md` | 接口说明、数据手册核对记录、**集成方需要做的修改清单** |
 | `docs/ms5837-progress.md` | 本文件（证据与限制） |
@@ -127,12 +129,25 @@ PS> .\build\ms5837_host_test.exe
         D1-change-x4     busy重发=0 busy读=0 提前读=0 新D1=0x40
         D1-wrap-8192to256 busy重发=0 busy读=0 提前读=0 新D1=0x40
 [  OK  ] BusyDeviceNoEarlyRestart
+[ RUN  ] RestoreDefaultsDuringConversion
+[  OK  ] RestoreDefaultsDuringConversion
 [ RUN  ] OfficialExample02baTerms
 [  OK  ] OfficialExample02baTerms
 [ RUN  ] TemperatureBranchBoundary
 [  OK  ] TemperatureBranchBoundary
 [ RUN  ] UnitsAndNegativeDepth
 [  OK  ] UnitsAndNegativeDepth
+[ RUN  ] RandomizedInvariants
+        fuzz seed=0: 3000 步 / 8 个样本
+        fuzz seed=1: 3000 步 / 6 个样本
+        fuzz seed=2: 3000 步 / 4 个样本
+        fuzz seed=3: 3000 步 / 5 个样本
+        fuzz seed=4: 3000 步 / 8 个样本
+        fuzz 合计: 5 seeds × 3000 步 / 31 个样本 / 最终 model=0 osr=1024 rate=38Hz
+[  OK  ] RandomizedInvariants
+[ RUN  ] ReferenceVectors
+        参考向量 100 条全部一致（30BA/02BA、物理量与极端输入、分支边界）
+[  OK  ] ReferenceVectors
 [ RUN  ] SampleMetadataAndFreshness
 [  OK  ] SampleMetadataAndFreshness
 [ RUN  ] I2cBusLayer
@@ -141,7 +156,7 @@ ms5837_host_test: PASS
 (exit 0)
 ```
 
-共 28 组测试，全部 PASS；`-O2` 构建同样 `PASS`（`gcc -std=c11 -Wall -Wextra -Werror -O2 ...`）。
+共 30 组测试，全部 PASS；`-O2` 构建同样 `PASS`（`gcc -std=c11 -Wall -Wextra -Werror -O2 ...`）。
 修复前的失败证据（同一条命令、同一套用例）：`BusyDeviceNoEarlyRestart: sim.new_conversion_while_busy == 0U` ×6
 （D1/D2 8192→256、30BA↔02BA、连续 4 次改配置、tick 回绕），修复后 8 场景全 0 违规。
 一键脚本：`powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_ms5837_host_test.ps1`（结果同上）。
@@ -200,6 +215,9 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 | `TemperatureBranchBoundary` | TEMP=1999 与 TEMP=2000 分界两侧（1999 走低温修正、2000 的二阶修正必须全为 0，且等于一阶结果）；02BA 非低温分支不得有任何修正（手册第 8 页无高温项）；冷→热→冷连续三帧都等于独立复算，证明没有残留上一帧的 Ti/OFFi/SENSi |
 | `UnitsAndNegativeDepth` | 30BA `pressure_pa = raw×10`（0.1 mbar/LSB）、02BA `pressure_pa = raw`（0.01 mbar/LSB = 1 Pa）且 `raw/100 = 1100.02 mbar`；24 位 ADC 按 MSB first 组装（仿真 0x123456 原样出现在样本里）；负水深不被夹到 0 且与 `(P−P0)/(rho·g)` 一致 |
 | `Crc4`（扩充） | 计算 CRC **不得破坏**调用方保存的原始 PROM：字 0 高 4 位原 CRC 与第 8 个软件辅助字在调用后必须逐字节不变 |
+| `RestoreDefaultsDuringConversion` | **自查发现的缺陷回归**：`RESTORE_DEFAULTS` 会改 OSR/型号，必须与 `SetOsr`/`SetModel` 一样延迟丢弃半周期（`DISCARD_WAIT`、不重发转换、D1/D2 配对不错位）；且型号回到 unknown 后不得再保留 `PRESSURE_VALID`/`TEMPERATURE_VALID` 与旧压力值（必须 NaN） |
+| `RandomizedInvariants` | 确定性 LCG、5 个种子 × 3000 步，随机组合：推进主循环、改 OSR/型号/采样率、`RESTORE_DEFAULTS`、改零点/滤波、通用 `SetParam`/`GetParam`、重新 `Init`、随机离线/卡死、tick 停滞或大步跳（含超期不追赶）。每步检查全局不变量：busy 期间不得重发/读、D1/D2 必须同 OSR、型号 unknown 不得报压力有效、零点无效不得报深度有效、`ZERO` 与 `GET_PARAMETER(0103)` 范围口径必须一致、**标志有效则数值不得为 NaN**、序号单调递增 |
+| `ReferenceVectors` | 跨实现校验：`tests/gen_ms5837_reference_vectors.py`（独立 Python，无共享代码）生成 100 条向量（30BA/02BA、物理量与极端输入、TEMP=1999/2000/2001/−1499/−1500/−1501 分支边界），逐条比对 `Ms5837_Compensate()` 的整数输出 |
 
 主机测试里的从设备仿真带**独立复制的数据手册最大转换时间表**：驱动若提前读 ADC 会被记为违规
 （`early_reads`），当前为 0。
@@ -218,7 +236,10 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 | 7) 型号切换必须清除旧水面零点与滤波（旧 P0 可能是错误型号算出来的） | `SetModel()` 在型号真正变化时调用 `ClearZero()` 并作废已发布样本补偿值；同型号重复设置保持幂等不清零点 | 新增 `ModelChangeClearsZero`：30BA→02BA、02BA→unknown 均断言 `ZERO_VALID` 清、`GET_PARAMETER(0103)` 由 OK 变 `NO_ZERO`、深度变 NaN；30BA→30BA 零点保留 |
 | 8) `Ms5837_Zero()` 未做范围校验，可能产生 `GET_PARAMETER` 认为越界的 P0 | `Zero()` 直接复用 `SetSurfacePressurePa()`（有限值 + 10000~200000 Pa）；越界返回 `ERR_PARAM` 且不建立零点，已有有效零点不被破坏 | 新增 `ZeroValidatesRange`：越界（<10000 / >200000 Pa）被拒且 `0103` 仍为 `NO_ZERO`；量程内成功后 `0103` 读回的 P0 与样本压力一致 |
 | 9) OSR/型号在 D1/D2 转换途中变更会沿用旧 deadline（可能提前读） | 新增 `ms5837_abort_half_cycle()`：`SetOsr()`/`SetModel()` 在 `CONVERT_D1/D2` 时丢弃半周期、清半截 D1/D2，回 IDLE 用新配置重新走完整周期 | 新增 `ConfigChangeDuringConversion`：256→8192 途中改配置后必须先出现新的 D1 `0x4A`（不能先出现被中断的 D2）、最小等待 ≥ 19+1 ms、提前读 0 次；型号切换同理 |
-| 10) **（本轮）** 手册第 11 页：转换期间芯片一直 busy，重发转换/提前读 ADC 都会得到错误结果——“丢弃软件半周期”不能等于“立刻重发” | `ms5837_abort_half_cycle()` 改为**延迟丢弃**：只清半截 D1/D2 并进入新状态 `DISCARD_WAIT`，**保留原 deadline**（按旧配置算、不会更短）；到点后（芯片已空闲）才用新配置重新发 D1。`Ms5837_Process()` 增加 `DISCARD_WAIT` 分支 | 新增 `BusyDeviceNoEarlyRestart`（8 场景）先复现失败：修复前 6/8 报“busy 期间重发”，修复后 8/8 全 0 违规 |
+| 10) **（上一轮）** 手册第 11 页：转换期间芯片一直 busy，重发转换/提前读 ADC 都会得到错误结果——“丢弃软件半周期”不能等于“立刻重发” | `ms5837_abort_half_cycle()` 改为**延迟丢弃**：只清半截 D1/D2 并进入新状态 `DISCARD_WAIT`，**保留原 deadline**（按旧配置算、不会更短）；到点后（芯片已空闲）才用新配置重新发 D1。`Ms5837_Process()` 增加 `DISCARD_WAIT` 分支 | 新增 `BusyDeviceNoEarlyRestart`（8 场景）先复现失败：修复前 6/8 报“busy 期间重发”，修复后 8/8 全 0 违规 |
+| 11) **（本轮自查）** `Ms5837_RestoreDefaults()` 也改 OSR/型号，却**没有**丢弃半周期 → D1/D2 会跨配置配对 | 在 `RestoreDefaults()` 末尾调用 `ms5837_abort_half_cycle()`（与 `SetOsr`/`SetModel` 同一条延迟丢弃路径） | 新增 `RestoreDefaultsDuringConversion` + 仿真新增“D1/D2 必须同 OSR”配对不变量：修复前 `state == DISCARD_WAIT` 失败，修复后通过 |
+| 12) **（本轮自查）** `RestoreDefaults()` 把型号退回 unknown 后，仍保留 `PRESSURE_VALID`/`TEMPERATURE_VALID` 与旧压力值 → “有效假数据” | 抽出 `ms5837_invalidate_compensated()`（清 3 个有效位 + 测量字段置 NaN + 清滤波），`SetModel` 与 `RestoreDefaults` 共用 | 由 `RandomizedInvariants` 的随机序列在 step=1288 命中（action=RESTORE_DEFAULTS，无 busy/配对违规），再用针对性断言定位并修复；修复后 5 seeds × 3000 步 0 违规 |
+| 13) **（本轮自查）** 参考向量生成器第一版把 30BA 的**高温分支**套用到了 02BA 上 | 生成器改为“只有 30BA 有高温分支”（02BA 手册第 8 页无高温项） | `ReferenceVectors` 逐条比对时先报出 `向量 50 不一致: 期望 temp=2987 实得 2989`，确认是生成器错、驱动对；修正后 100/100 一致 |
 
 ## 5. 未做 / 未验证（重要）
 

@@ -273,6 +273,8 @@ Ms5837Result_t Ms5837_GetParam(uint16_t param_id,
  * 恢复 OUTPUT_RATE_HZ=25、DEPTH_OSR=4096、WATER_DENSITY=1029、FILTER_K=0、
  * DEPTH_MODEL=unknown，并清除零点；不改变 PROM、CRC 结论和总线连接。
  * 型号回到 unknown 后需要重新显式设定型号才会输出补偿后的压力/温度/深度。
+ * 由于默认值也会改变型号与转换时间，本调用同样会作废已发布样本的补偿值并
+ * 丢弃正在进行的半周期（与 Ms5837_SetModel 一致）。
  */
 Ms5837Result_t Ms5837_RestoreDefaults(void);
 

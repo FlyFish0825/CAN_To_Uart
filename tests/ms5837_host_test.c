@@ -22,6 +22,9 @@
 #include "../Core/Inc/sensor_i2c_bus.h"
 #include "../Core/Inc/ms5837.h"
 
+/* 由独立 Python 实现生成的参考向量表（含生成说明）。 */
+#include "ms5837_reference_vectors.h"
+
 /* ---------------------------------------------------------------- 时间桩 */
 static uint32_t test_tick; /* 主机侧可控毫秒时钟。 */
 
@@ -52,6 +55,9 @@ typedef struct
   uint32_t busy_until; /* 芯片“忙”到什么时候（手册第11页：转换完成前一直 busy）。 */
   uint32_t new_conversion_while_busy; /* 转换未完成又收到新 D1/D2 的次数（必须为 0）。 */
   uint32_t read_while_busy; /* 转换未完成就读 ADC 的次数（手册：结果会是 0）。 */
+  uint8_t last_d1_osr; /* 最近一次 D1 命令的 OSR 下标；0xFF 表示还没有。 */
+  uint8_t d1_valid; /* 是否有一个“待配对”的 D1。 */
+  uint32_t mismatched_pair; /* D1 与随后 D2 的 OSR 不一致的次数（半周期泄漏，必须为 0）。 */
   uint32_t min_conv_wait_ms; /* 观测到的最小“命令→读 ADC”间隔。 */
   uint8_t min_conv_wait_valid; /* 是否已记录过转换等待。 */
   uint32_t tx_time_ms; /* 每次 HAL I2C 事务占用总线的毫秒数（模拟真实事务耗时）。 */
@@ -158,6 +164,8 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
     sim.conversion_command_ms = test_tick;
     sim.conversion_ready_ms = test_tick + sim_conversion_ms(sim.model, index);
     sim.busy_until = sim.conversion_ready_ms;
+    sim.last_d1_osr = index;
+    sim.d1_valid = 1U;
     return HAL_OK;
   }
   if ((command & 0xF0U) == 0x50U) /* D2 转换 */
@@ -167,10 +175,19 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
     {
       return HAL_ERROR;
     }
+    /*
+     * 配对不变量：补偿用的 D1/D2 必须来自同一 OSR 设置。
+     * 若中途改过 OSR（半周期没被丢弃），这里的下标就会不一致。
+     */
+    if ((sim.d1_valid != 0U) && (sim.last_d1_osr != index))
+    {
+      sim.mismatched_pair++;
+    }
     sim.conversion = 2U;
     sim.conversion_command_ms = test_tick;
     sim.conversion_ready_ms = test_tick + sim_conversion_ms(sim.model, index);
     sim.busy_until = sim.conversion_ready_ms;
+    sim.d1_valid = 0U;
     return HAL_OK;
   }
   if ((command & 0xF0U) == 0xA0U) /* PROM 读 */
@@ -2257,6 +2274,401 @@ static void Test_UnitsAndNegativeDepth(void)
   TEST_END();
 }
 
+/* ---------------------------------------------------------------- 17h2. RESTORE_DEFAULTS 也要丢弃半周期 */
+static void Test_RestoreDefaultsDuringConversion(void)
+{
+  Ms5837Sample_t sample;
+
+  TEST_BEGIN("RestoreDefaultsDuringConversion");
+
+  sim_reset();
+  sim.model = MS5837_MODEL_30BA;
+  sim.d1_value = 5000000U;
+  sim.d2_value = 6981794U;
+  test_tick = 0U;
+  I2c_Init(&fake_handle);
+  Ms5837_RestoreDefaults();
+  CHECK(Ms5837_SetOutputRateHz(10U) == MS5837_OK);
+  CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
+  CHECK(Ms5837_SetOsr(MS5837_OSR_8192) == MS5837_OK);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  CHECK(run_until(pred_prom_valid, 400U) != 0U);
+
+  /* 走到 D1 转换中（推进 tick 之前跳出，保证芯片仍忙）。 */
+  while ((ms5837.state != MS5837_STATE_CONVERT_D1) && (test_tick < 500U))
+  {
+    Ms5837_Process();
+    if (ms5837.state != MS5837_STATE_CONVERT_D1)
+    {
+      test_tick++;
+    }
+  }
+  CHECK(ms5837.state == MS5837_STATE_CONVERT_D1);
+  CHECK((int32_t)(test_tick - sim.busy_until) < 0);
+
+  /* RestoreDefaults 同样会改 OSR/型号，必须走同一条“延迟丢弃”路径。 */
+  CHECK(Ms5837_RestoreDefaults() == MS5837_OK);
+  CHECK(ms5837.state == MS5837_STATE_DISCARD_WAIT);
+  CHECK(sim.new_conversion_while_busy == 0U);
+
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 4000U) != 0U);
+  CHECK(sim.new_conversion_while_busy == 0U);
+  CHECK(sim.read_while_busy == 0U);
+  CHECK(sim.early_reads == 0U);
+  /* D1/D2 必须配对（同一 OSR），不能把改配置前后的两半拼起来补偿。 */
+  CHECK(sim.mismatched_pair == 0U);
+  /* 默认型号是 unknown：样本只能给原始值，不得声称压力有效。 */
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(MS5837_IS_NAN(sample.pressure_pa));
+  CHECK((sample.status & MS5837_STATUS_PRESSURE_VALID) == 0U);
+  CHECK(Ms5837_GetOsr() == MS5837_OSR_DEFAULT);
+
+  /* 同一条自查：RESTORE_DEFAULTS 后不得再保留“已知型号算出的有效压力/温度”标志与数值。 */
+  sim_reset();
+  sim.model = MS5837_MODEL_30BA;
+  sim.d1_value = TEST_D1_SURFACE;
+  sim.d2_value = TEST_D2_25C;
+  test_tick = 0U;
+  I2c_Init(&fake_handle);
+  Ms5837_RestoreDefaults();
+  CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  CHECK(run_until(pred_prom_valid, 400U) != 0U);
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_PRESSURE_VALID) != 0U);
+  CHECK(!MS5837_IS_NAN(sample.pressure_pa));
+
+  CHECK(Ms5837_RestoreDefaults() == MS5837_OK);
+  CHECK(Ms5837_GetModel() == MS5837_MODEL_UNKNOWN);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_PRESSURE_VALID) == 0U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_TEMPERATURE_VALID) == 0U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_DEPTH_VALID) == 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(MS5837_IS_NAN(sample.pressure_pa));
+  CHECK(MS5837_IS_NAN(sample.temperature_c));
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17l. 随机化不变量（自查用） */
+/*
+ * 用确定性 LCG 随机组合：推进主循环、改 OSR/型号/采样率、RESTORE_DEFAULTS、改零点/滤波、
+ * 随机离线/卡死。每一步都检查全局不变量，用来抓手写用例没覆盖到的组合缺陷。
+ */
+static uint32_t fuzz_state = 0x12345678U;
+
+static uint32_t fuzz_next(void)
+{
+  fuzz_state = (fuzz_state * 1103515245U) + 12345U;
+  return (fuzz_state >> 8) & 0x00FFFFFFU;
+}
+
+static uint8_t fuzz_check_invariants(void)
+{
+  Ms5837Sample_t sample;
+  uint32_t status = Ms5837_GetStatus();
+  float pa = 0.0f;
+  uint8_t type = 0U;
+  uint8_t length = 0U;
+  uint8_t value[4];
+
+  /* 手册第 11 页：芯片忙期间不得重发转换、不得读 ADC。 */
+  if (sim.new_conversion_while_busy != 0U)
+  {
+    return 0U;
+  }
+  if (sim.read_while_busy != 0U)
+  {
+    return 0U;
+  }
+  if (sim.early_reads != 0U)
+  {
+    return 0U;
+  }
+  /* D1/D2 必须来自同一 OSR（半周期不得跨配置配对）。 */
+  if (sim.mismatched_pair != 0U)
+  {
+    return 0U;
+  }
+  /* 型号未确认时不得声称压力/温度/深度有效。 */
+  if ((Ms5837_GetModel() == MS5837_MODEL_UNKNOWN) &&
+      ((status & (MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID)) != 0U))
+  {
+    return 0U;
+  }
+  /* 零点无效时不得声称深度有效，也不得给出深度数值。 */
+  if ((Ms5837_IsZeroValid() == 0U) && ((status & MS5837_STATUS_DEPTH_VALID) != 0U))
+  {
+    return 0U;
+  }
+  if (Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_OK)
+  {
+    float stored;
+    memcpy(&stored, value, sizeof(stored));
+    if (Ms5837_IsZeroValid() == 0U)
+    {
+      return 0U;
+    }
+    if ((stored < MS5837_SURFACE_PRESSURE_MIN) || (stored > MS5837_SURFACE_PRESSURE_MAX))
+    {
+      return 0U; /* ZERO 与 GET_PARAMETER 的范围口径必须一致 */
+    }
+  }
+  else if (Ms5837_IsZeroValid() != 0U)
+  {
+    /* 有零点却读不回参数：同样不允许。 */
+    return 0U;
+  }
+  if (Ms5837_GetSurfacePressurePa(&pa) == MS5837_OK)
+  {
+    if ((pa < MS5837_SURFACE_PRESSURE_MIN) || (pa > MS5837_SURFACE_PRESSURE_MAX))
+    {
+      return 0U;
+    }
+  }
+
+  if (Ms5837_GetSample(&sample) == MS5837_OK)
+  {
+    /* 绝不允许“标志有效但数值是 NaN”。 */
+    if (((status & MS5837_STATUS_PRESSURE_VALID) != 0U) && MS5837_IS_NAN(sample.pressure_pa))
+    {
+      return 0U;
+    }
+    if (((status & MS5837_STATUS_TEMPERATURE_VALID) != 0U) && MS5837_IS_NAN(sample.temperature_c))
+    {
+      return 0U;
+    }
+    if ((status & MS5837_STATUS_DEPTH_VALID) != 0U)
+    {
+      if (MS5837_IS_NAN(sample.depth_raw_m) || MS5837_IS_NAN(sample.depth_filtered_m))
+      {
+        return 0U;
+      }
+    }
+    else if (!MS5837_IS_NAN(sample.depth_raw_m) && (Ms5837_IsZeroValid() == 0U))
+    {
+      return 0U;
+    }
+  }
+  return 1U;
+}
+
+static void Test_RandomizedInvariants(void)
+{
+  uint32_t step;
+  uint32_t samples = 0U;
+  uint32_t seq_seen = 0U;
+  uint32_t seed_index;
+  static const uint32_t seeds[5] = {0x12345678U, 0x0BADF00DU, 0x5EED1234U, 0xA5A5A5A5U, 0x0000FFFFU};
+  Ms5837Sample_t sample;
+
+  TEST_BEGIN("RandomizedInvariants");
+
+  for (seed_index = 0U; seed_index < 5U; seed_index++)
+  {
+    uint32_t seed_samples = 0U;
+
+    fuzz_state = seeds[seed_index];
+    sim_reset();
+    sim.model = MS5837_MODEL_30BA;
+    sim.d1_value = 5000000U;
+    sim.d2_value = 6981794U;
+    test_tick = 0U;
+    I2c_Init(&fake_handle);
+    Ms5837_RestoreDefaults();
+    CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
+    CHECK(Ms5837_Init() == MS5837_OK);
+    CHECK(run_until(pred_prom_valid, 400U) != 0U);
+    Ms5837_ClearNewSampleFlag();
+    seq_seen = 0U;
+
+    for (step = 0U; step < 3000U; step++)
+    {
+      uint32_t action = fuzz_next() % 16U;
+
+      if (action < 8U)
+      {
+        Ms5837_Process();
+      }
+      else if (action == 8U)
+      {
+        static const uint16_t osrs[6] = {256U, 512U, 1024U, 2048U, 4096U, 8192U};
+        (void)Ms5837_SetOsr(osrs[fuzz_next() % 6U]);
+      }
+      else if (action == 9U)
+      {
+        static const uint8_t models[3] = {MS5837_MODEL_UNKNOWN, MS5837_MODEL_02BA,
+                                          MS5837_MODEL_30BA};
+        (void)Ms5837_SetModel(models[fuzz_next() % 3U]);
+      }
+      else if (action == 10U)
+      {
+        (void)Ms5837_SetOutputRateHz((uint16_t)(1U + (fuzz_next() % 100U)));
+      }
+      else if (action == 11U)
+      {
+        (void)Ms5837_RestoreDefaults();
+      }
+      else if (action == 12U)
+      {
+        switch (fuzz_next() % 4U)
+        {
+          case 0U:
+            (void)Ms5837_SetFilterK((float)(fuzz_next() % 100U) / 100.0f);
+            break;
+          case 1U:
+            (void)Ms5837_SetWaterDensity(900.0f + (float)(fuzz_next() % 400U));
+            break;
+          case 2U:
+            (void)Ms5837_Zero();
+            break;
+          default:
+            (void)Ms5837_ClearZero();
+            break;
+        }
+      }
+      else if (action == 13U)
+      {
+        /* 通用参数入口（AA5B 路由走这条），含非法值。 */
+        uint8_t raw[4];
+        uint8_t type;
+        uint8_t length;
+        uint16_t id;
+        uint32_t r = fuzz_next();
+        switch (r % 4U)
+        {
+          case 0U:
+            id = MS5837_PARAM_DEPTH_OSR;
+            type = MS5837_PARAM_TYPE_U16;
+            raw[0] = (uint8_t)r;
+            raw[1] = (uint8_t)(r >> 8);
+            (void)Ms5837_SetParam(id, type, raw, 2U);
+            break;
+          case 1U:
+            id = MS5837_PARAM_DEPTH_MODEL;
+            type = MS5837_PARAM_TYPE_U8;
+            raw[0] = (uint8_t)(r % 5U);
+            (void)Ms5837_SetParam(id, type, raw, 1U);
+            break;
+          case 2U:
+            id = MS5837_PARAM_SURFACE_PRESSURE;
+            type = MS5837_PARAM_TYPE_F32;
+            {
+              float v = (float)(r % 300000U);
+              memcpy(raw, &v, sizeof(v));
+            }
+            (void)Ms5837_SetParam(id, type, raw, 4U);
+            break;
+          default:
+            (void)Ms5837_GetParam(MS5837_PARAM_WATER_DENSITY, &type, &length, raw);
+            (void)Ms5837_GetProm(0);
+            break;
+        }
+      }
+      else if (action == 14U)
+      {
+        /* 重新初始化：会放弃当前转换（手册第10页允许随时 Reset）。 */
+        (void)Ms5837_Init();
+      }
+      else
+      {
+        /* 制造总线异常：离线/卡死会短暂持续，随后大概率恢复。 */
+        sim.online = ((fuzz_next() % 4U) != 0U) ? 1U : 0U;
+        sim.stall = ((fuzz_next() % 32U) == 0U) ? 1U : 0U;
+      }
+
+      if (fuzz_check_invariants() == 0U)
+      {
+        printf("        fuzz 违规 seed=%u step=%u action=%u (busy重发=%u busy读=%u 提前读=%u 配对错=%u)\n",
+               seed_index, step, action, sim.new_conversion_while_busy, sim.read_while_busy,
+               sim.early_reads, sim.mismatched_pair);
+        CHECK(0);
+      }
+      if (Ms5837_HasNewSample() != 0U)
+      {
+        Ms5837_ClearNewSampleFlag();
+        CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+        CHECK(sample.sequence > seq_seen); /* 序号必须单调递增 */
+        seq_seen = sample.sequence;
+        samples++;
+        seed_samples++;
+      }
+
+      /* 有时不推进 tick（命中同 tick 路径），有时大步跳（超期后不得追赶连发）。 */
+      switch (fuzz_next() % 8U)
+      {
+        case 0U:
+          break;
+        case 1U:
+          test_tick += 1U + (fuzz_next() % 500U);
+          break;
+        default:
+          test_tick += fuzz_next() % 4U;
+          break;
+      }
+    }
+
+    printf("        fuzz seed=%u: 3000 步 / %u 个样本\n", seed_index, seed_samples);
+  }
+
+  sim.online = 1U;
+  sim.stall = 0U;
+  printf("        fuzz 合计: 5 seeds × 3000 步 / %u 个样本 / 最终 model=%u osr=%u rate=%uHz\n",
+         samples, Ms5837_GetModel(), Ms5837_GetOsr(), Ms5837_GetOutputRateHz());
+  CHECK(samples >= 20U); /* 确保随机序列真的跑出了采样 */
+  CHECK(fuzz_check_invariants() != 0U);
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17m. 跨实现参考向量 */
+/*
+ * 与固件无共享代码的独立 Python 实现在随机/极端输入上算出期望值，
+ * 这里逐条比对 Ms5837_Compensate()，用于抓常数、取整语义与分支错误。
+ */
+static void Test_ReferenceVectors(void)
+{
+  uint32_t index;
+  uint32_t checked = 0U;
+
+  TEST_BEGIN("ReferenceVectors");
+
+  for (index = 0U; index < MS5837_REFERENCE_VECTOR_COUNT; index++)
+  {
+    const Ms5837ReferenceVector_t *vector = &ms5837_reference_vectors[index];
+    uint16_t prom[MS5837_PROM_WORDS];
+    int64_t raw = 0;
+    int32_t temp = 0;
+    uint8_t k;
+
+    for (k = 0U; k < MS5837_PROM_WORDS; k++)
+    {
+      prom[k] = 0U;
+    }
+    for (k = 1U; k <= 6U; k++)
+    {
+      prom[k] = vector->coefficient[k];
+    }
+
+    CHECK(Ms5837_Compensate(vector->model, prom, vector->d1, vector->d2, &raw, &temp) == 1U);
+    if ((raw != vector->expected_raw) || (temp != vector->expected_temp_centi_c))
+    {
+      printf("        向量 %u 不一致: model=%u C1..C6=%u/%u/%u/%u/%u/%u d1=%u d2=%u"
+             " 期望 raw=%lld temp=%d 实得 raw=%lld temp=%d\n",
+             index, vector->model, vector->coefficient[1], vector->coefficient[2],
+             vector->coefficient[3], vector->coefficient[4], vector->coefficient[5],
+             vector->coefficient[6], vector->d1, vector->d2,
+             (long long)vector->expected_raw, vector->expected_temp_centi_c,
+             (long long)raw, temp);
+      CHECK(0);
+    }
+    checked++;
+  }
+  printf("        参考向量 %u 条全部一致（30BA/02BA、物理量与极端输入、分支边界）\n", checked);
+  TEST_END();
+}
+
 /* ---------------------------------------------------------------- 18. I2C 层 */
 static void Test_I2cBusLayer(void)
 {
@@ -2354,9 +2766,12 @@ int main(void)
   Test_ZeroValidatesRange();
   Test_ConfigChangeDuringConversion();
   Test_BusyDeviceNoEarlyRestart();
+  Test_RestoreDefaultsDuringConversion();
   Test_OfficialExample02baTerms();
   Test_TemperatureBranchBoundary();
   Test_UnitsAndNegativeDepth();
+  Test_RandomizedInvariants();
+  Test_ReferenceVectors();
   Test_SampleMetadataAndFreshness();
   Test_I2cBusLayer();
 
