@@ -30,6 +30,8 @@
 #include "firmware_flow.h"
 #include "system_heartbeat.h"
 #include "usb_can_gateway.h"
+#include "sensor_board.h"
+#include "sensor_service.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -126,6 +128,10 @@ int main(void)
   {
     Error_Handler();
   }
+  /* Separate sensor backend from the CAN gateway. IMU UART remains disabled
+   * by default while PA9/PA10 are physically occupied by WCH-Link. */
+  SensorService_Init(SensorBoard_UsbSend, SensorBoard_ImuTransmit);
+  (void)SensorBoard_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -151,6 +157,8 @@ int main(void)
      * 第二步运行 USB 传输层：搬运 RX 环形缓冲中的字节、启动一个 USB TX
      * 包。USB 完成回调只释放队列槽位，整个发送过程保持非阻塞。
      */
+    SensorBoard_Process();
+    SensorService_Process(HAL_GetTick());
     UsbCanGateway_Process();
   /* USER CODE END 3 */
 }

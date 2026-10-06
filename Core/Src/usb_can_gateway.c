@@ -1,6 +1,7 @@
 #include "usb_can_gateway.h"
 
 #include "firmware_flow.h"
+#include "sensor_protocol.h"
 #include "usbd_cdc_if.h"
 
 typedef struct
@@ -37,7 +38,8 @@ typedef enum
   USB_PROTOCOL_WAIT_START = 0U,
   USB_PROTOCOL_WAIT_FAMILY,
   USB_PROTOCOL_AA55,
-  USB_PROTOCOL_AA59
+  USB_PROTOCOL_AA59,
+  USB_PROTOCOL_AA5B
 } UsbProtocolRouteState_t;
 
 static UsbProtocolRouteState_t usb_protocol_route_state =
@@ -46,6 +48,7 @@ static uint16_t usb_protocol_route_count = 0U;
 static uint16_t usb_protocol_route_expected = 0U;
 static uint8_t usb_protocol_route_header[16];
 static uint32_t usb_protocol_route_last_tick = 0U;
+static volatile uint32_t usb_connection_epoch = 0U;
 
 static uint16_t UsbCanGateway_RxFree(void)
 {
@@ -84,6 +87,10 @@ static void UsbCanGateway_RouteToParser(uint8_t byte)
   {
     FirmwareFlow_RxFeed(&byte, 1U);
   }
+  else if (usb_protocol_route_state == USB_PROTOCOL_AA5B)
+  {
+    SensorProtocol_RxFeed(&byte, 1U, HAL_GetTick());
+  }
   else
   {
     CanGateway_RxFeed(&byte, 1U);
@@ -121,10 +128,10 @@ static void UsbCanGateway_RouteByte(uint8_t byte)
       break;
 
     case USB_PROTOCOL_WAIT_FAMILY:
-      if ((byte == 0x55U) || (byte == 0x59U))
+      if ((byte == 0x55U) || (byte == 0x59U) || (byte == 0x5BU))
       {
-        usb_protocol_route_state = (byte == 0x59U) ?
-                                   USB_PROTOCOL_AA59 : USB_PROTOCOL_AA55;
+        usb_protocol_route_state = (byte == 0x59U) ? USB_PROTOCOL_AA59 :
+                                   ((byte == 0x5BU) ? USB_PROTOCOL_AA5B : USB_PROTOCOL_AA55);
         usb_protocol_route_count = 2U;
         usb_protocol_route_expected = 0U;
         usb_protocol_route_header[0] = 0xAAU;
@@ -166,6 +173,7 @@ static void UsbCanGateway_RouteByte(uint8_t byte)
       break;
 
     case USB_PROTOCOL_AA59:
+    case USB_PROTOCOL_AA5B:
       UsbCanGateway_RouteToParser(byte);
       if (usb_protocol_route_count < sizeof(usb_protocol_route_header))
       {
@@ -179,7 +187,8 @@ static void UsbCanGateway_RouteByte(uint8_t byte)
             ((uint16_t)usb_protocol_route_header[11] << 8U);
         usb_protocol_route_expected = payload_length + 20U;
         if ((usb_protocol_route_header[2] != 1U) ||
-            (payload_length > FW_FLOW_MAX_PAYLOAD))
+            (payload_length > ((usb_protocol_route_state == USB_PROTOCOL_AA5B) ?
+                               SENSOR_MAX_PAYLOAD : FW_FLOW_MAX_PAYLOAD)))
         {
           UsbCanGateway_RouteReset();
         }
@@ -502,6 +511,7 @@ void UsbCanGateway_TxComplete(void)
 
 void UsbCanGateway_OnConfigured(void)
 {
+  usb_connection_epoch++;
   /* 主机重新枚举后，上一条 USB IN 传输不会再收到完成回调。 */
   usb_can_tx_busy = 0U;
   usb_can_tx_start_tick = 0U;
@@ -512,6 +522,7 @@ void UsbCanGateway_OnConfigured(void)
 
 void UsbCanGateway_OnDeconfigured(void)
 {
+  usb_connection_epoch++;
   /*
    * 断开/复位时 CDC 不一定为当前包回调完成事件。只释放本层 busy，
    * 当前队列尾不前移，重新枚举后仍会重试同一个包。
@@ -557,6 +568,11 @@ void UsbCanGateway_GetBufferUsage(uint8_t *rx_percent,
     *tx_percent = UsbCanGateway_UsagePercent(tx_used,
                                               USB_CAN_TX_QUEUE_SIZE - 1U);
   }
+}
+
+uint32_t UsbCanGateway_GetConnectionEpoch(void)
+{
+  return usb_connection_epoch;
 }
 
 void UsbCanGateway_Process(void)

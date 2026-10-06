@@ -74,6 +74,9 @@ void UsbCanGateway_RxMarkPaused(void);
  */
 void UsbCanGateway_Process(void);
 
+/* Updated by USB callbacks, consumed in main-loop sensor link handling. */
+uint32_t UsbCanGateway_GetConnectionEpoch(void);
+
 /**
  * @brief 获取 USB CDC 的通用传输适配器。
  * @return 只读操作表指针，交给 CanGateway_Init() 注册。
