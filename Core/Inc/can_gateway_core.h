@@ -1,10 +1,3 @@
-/**
- * @file can_gateway_core.h
- * @brief CAN 网关核心与外部字节传输层之间的稳定接口。
- *
- * 该头文件属于手写应用层接口；它把 AA55 协议、CAN 软件队列和具体
- * USB/串口驱动隔离开，便于在不改变业务逻辑的情况下替换传输介质。
- */
 #ifndef __CAN_GATEWAY_CORE_H__
 #define __CAN_GATEWAY_CORE_H__
 

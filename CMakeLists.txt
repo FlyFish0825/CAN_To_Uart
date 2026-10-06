@@ -48,12 +48,24 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/firmware_flow.c
     Core/Src/system_heartbeat.c
     Core/Src/usb_can_gateway.c
+    Core/Src/sensor_protocol.c
+    Core/Src/sensor_service.c
+    Core/Src/sensor_board.c
+    Core/Src/imu_sensor.c
+    Core/Src/ms5837.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
 )
+
+# Passive RX is safe for observation; TX/configuration remains separately guarded.
+option(SENSOR_IMU_UART_ENABLED "Enable passive IMU USART1 receive on PA10" ON)
+option(SENSOR_IMU_UART_TX_ENABLED "Enable IMU PA9 TX only after wiring is confirmed free" OFF)
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+    SENSOR_IMU_UART_ENABLED=$<BOOL:${SENSOR_IMU_UART_ENABLED}>
+    SENSOR_IMU_UART_TX_ENABLED=$<BOOL:${SENSOR_IMU_UART_TX_ENABLED}>)
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE

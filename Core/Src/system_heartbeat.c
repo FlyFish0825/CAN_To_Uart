@@ -1,10 +1,3 @@
-/**
- * @file system_heartbeat.c
- * @brief 周期性组装并发送 AA58 System PING 心跳。
- *
- * 心跳只报告链路和软件队列状态，不代表 CAN 节点业务数据或 CAN 总线
- * 已经收到应答；发送成功的定义是外部传输层接受并复制了完整协议包。
- */
 #include "system_heartbeat.h"
 
 /*
@@ -26,8 +19,8 @@
 #define SYSTEM_FRAME_END              0xAAU /* 帧尾固定字节。 */
 
 static SystemHeartbeatTransportOps_t heartbeat_transport = {0}; /* 注册的传输回调副本。 */
-static uint32_t heartbeat_last_tick = 0U; /* 上次到达发送周期的 tick。 */
-static uint32_t heartbeat_sequence = 0U; /* 下一个心跳包的序号，发送成功后递增。 */
+static uint32_t heartbeat_last_tick = 0U; /* 上次成功提交心跳的 tick。 */
+static uint32_t heartbeat_sequence = 0U; /* 下一个心跳包的序号。 */
 
 /**
  * @brief 按规范计算 CRC16-CCITT。
@@ -90,11 +83,11 @@ static void SystemHeartbeat_WriteU32Le(uint8_t *dst, uint32_t value)
  */
 static void SystemHeartbeat_Send(void)
 {
-  uint8_t packet[SYSTEM_HEARTBEAT_PACKET_SIZE] = {0}; /* 待发送的 AA58 完整帧。 */
-  SystemHeartbeatMetrics_t metrics = {0}; /* 本次采样到的队列占用率。 */
-  uint16_t crc; /* FAMILY 至 payload 的 CRC16-CCITT。 */
-  uint32_t timestamp_us; /* 协议要求的微秒时间戳。 */
-  SystemHeartbeatIoResult_t result; /* 外部传输层对本次入队的结果。 */
+  uint8_t packet[SYSTEM_HEARTBEAT_PACKET_SIZE] = {0};
+  SystemHeartbeatMetrics_t metrics = {0};
+  uint16_t crc;
+  uint32_t timestamp_us;
+  SystemHeartbeatIoResult_t result;
 
   packet[0] = SYSTEM_FRAME_START;
   packet[1] = SYSTEM_FRAME_FAMILY;
@@ -155,7 +148,7 @@ HAL_StatusTypeDef SystemHeartbeat_Init(
 
 void SystemHeartbeat_Process(void)
 {
-  uint32_t now = HAL_GetTick(); /* 当前系统 tick，用于无符号回绕安全的周期比较。 */
+  uint32_t now = HAL_GetTick();
 
   if ((uint32_t)(now - heartbeat_last_tick) < SYSTEM_HEARTBEAT_PERIOD_MS)
   {

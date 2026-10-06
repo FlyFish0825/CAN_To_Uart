@@ -1,10 +1,3 @@
-/**
- * @file usb_can_gateway.h
- * @brief USB CDC 字节队列、协议路由和发送完成通知接口。
- *
- * USB 回调只搬运字节；协议解析、CAN 队列操作和发送调度均在主循环中
- * 进行，以限制中断执行时间并保留 AA55/AA59 两种协议的边界。
- */
 #ifndef __USB_CAN_GATEWAY_H__
 #define __USB_CAN_GATEWAY_H__
 
@@ -80,6 +73,9 @@ void UsbCanGateway_RxMarkPaused(void);
  * 因此本函数不会等待 USB IN 传输结束。
  */
 void UsbCanGateway_Process(void);
+
+/* Updated by USB callbacks, consumed in main-loop sensor link handling. */
+uint32_t UsbCanGateway_GetConnectionEpoch(void);
 
 /**
  * @brief 获取 USB CDC 的通用传输适配器。

@@ -1,10 +1,3 @@
-/**
- * @file firmware_flow.h
- * @brief AA59 固件块可靠转发协议的常量和轮询接口。
- *
- * 输入是可分片的 AA59 字节流，合法逻辑块先进入固定队列，再由主循环
- * 拆成经典 CAN/CAN FD 帧；FLOW_ACK 通过注册的外部传输接口返回。
- */
 #ifndef __FIRMWARE_FLOW_H__
 #define __FIRMWARE_FLOW_H__
 

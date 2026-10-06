@@ -1,10 +1,3 @@
-/**
- * @file system_heartbeat.h
- * @brief AA58 系统心跳协议的传输适配接口。
- *
- * 心跳是独立于 AA55 CAN 数据的公共链路状态包；模块只负责定时组包，
- * 不直接依赖 USB、CAN 或其他具体外设。
- */
 #ifndef __SYSTEM_HEARTBEAT_H__
 #define __SYSTEM_HEARTBEAT_H__
 

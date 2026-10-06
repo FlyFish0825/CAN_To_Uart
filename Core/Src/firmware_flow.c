@@ -1,11 +1,3 @@
-/**
- * @file firmware_flow.c
- * @brief AA59 固件块解析、信用流控、CAN 分帧和 FLOW_ACK 调度。
- *
- * 接收端先验证完整包的版本、长度、CRC 和帧尾，再按 block_index/offset
- * 顺序入固定队列。主循环只在 CAN 核心可接收时推进 frame_cursor；所有
- * 分片进入 FDCAN 硬件 FIFO 后才返还 credit，避免把软件入队误报为完成。
- */
 #include "firmware_flow.h"
 
 #include <string.h>
@@ -20,7 +12,6 @@ typedef enum
 
 typedef struct
 {
-  /** 该逻辑块转发到的 CAN 标识符。 */
   uint32_t can_id; /* 块对应的 CAN 标识符。 */
   uint32_t block_index; /* 块在固件传输中的逻辑序号。 */
   uint32_t offset; /* 块数据在固件镜像中的字节偏移。 */
@@ -48,27 +39,27 @@ static uint16_t fw_queue_tail = 0U; /* 当前消费块位置。 */
 static uint16_t fw_queue_count = 0U; /* 队列中尚未完成的块数。 */
 
 static FirmwareFlowParserState_t fw_parser_state = FW_PARSER_WAIT_START;
-static uint8_t fw_rx_packet[FW_FLOW_RX_PACKET_SIZE]; /* 当前 AA59 半帧缓存。 */
-static uint16_t fw_rx_index = 0U; /* 当前缓存下一个写入偏移。 */
-static uint16_t fw_rx_expected_size = 0U; /* 固定头和 payload 确定后的完整包长度。 */
-static uint32_t fw_parser_last_tick = 0U; /* 最近一次收到 AA59 字节的时间。 */
+static uint8_t fw_rx_packet[FW_FLOW_RX_PACKET_SIZE];
+static uint16_t fw_rx_index = 0U;
+static uint16_t fw_rx_expected_size = 0U;
+static uint32_t fw_parser_last_tick = 0U;
 
 static CanGatewayTransportOps_t fw_transport = {0}; /* 固件流控使用的 CAN 发送接口。 */
-static uint8_t fw_session_active = 0U; /* 是否存在可接收 DATA_BLOCK 的会话。 */
-static uint8_t fw_last_block_received = 0U; /* 是否已经收到覆盖镜像末尾的块。 */
-static uint8_t fw_target = FW_FLOW_TARGET_SYSTEM; /* 当前会话目标系统编号。 */
-static uint32_t fw_size = 0U; /* 当前固件镜像总字节数。 */
-static uint32_t fw_next_block_index = 0U; /* 下一个期望的逻辑块序号。 */
-static uint32_t fw_next_offset = 0U; /* 下一个期望的镜像偏移。 */
-static uint16_t fw_credit_available = 0U; /* 允许发送方继续提交的块数。 */
+static uint8_t fw_session_active = 0U;
+static uint8_t fw_last_block_received = 0U;
+static uint8_t fw_target = FW_FLOW_TARGET_SYSTEM;
+static uint32_t fw_size = 0U;
+static uint32_t fw_next_block_index = 0U;
+static uint32_t fw_next_offset = 0U;
+static uint16_t fw_credit_available = 0U;
 
-static uint8_t fw_ack_pending = 0U; /* 是否有待发送 FLOW_ACK。 */
-static uint8_t fw_ack_force = 0U; /* 是否忽略累计/时间阈值立即发送 ACK。 */
-static uint8_t fw_ack_status = FW_FLOW_STATUS_OK; /* 当前 ACK 的状态码。 */
-static uint16_t fw_ack_credit_return = 0U; /* 尚未在 ACK 中返还的 credit 数。 */
-static uint32_t fw_ack_sequence = 0U; /* 下一个 FLOW_ACK 的序号。 */
-static uint32_t fw_last_ack_tick = 0U; /* 最近一次成功提交 ACK 的时间。 */
-static uint32_t fw_last_completed_block = 0xFFFFFFFFUL; /* 最近完成块序号，无完成时为无效值。 */
+static uint8_t fw_ack_pending = 0U;
+static uint8_t fw_ack_force = 0U;
+static uint8_t fw_ack_status = FW_FLOW_STATUS_OK;
+static uint16_t fw_ack_credit_return = 0U;
+static uint32_t fw_ack_sequence = 0U;
+static uint32_t fw_last_ack_tick = 0U;
+static uint32_t fw_last_completed_block = 0xFFFFFFFFUL;
 /* 每个已接收块使用唯一 token，避免新会话与旧的在途回调发生编号冲突。 */
 static uint32_t fw_next_completion_token = 1U;
 
@@ -83,7 +74,6 @@ static volatile uint32_t fw_queue_full_count = 0U;
 static volatile uint32_t fw_invalid_block_count = 0U;
 static volatile uint32_t fw_forward_fail_count = 0U;
 
-/** 使用 CRC-16-CCITT 校验 AA59 FAMILY 至 payload 末尾的数据。 */
 static uint16_t FirmwareFlow_Crc16(const uint8_t *data, uint16_t length)
 {
   uint16_t crc = 0xFFFFU;
@@ -108,7 +98,6 @@ static uint16_t FirmwareFlow_Crc16(const uint8_t *data, uint16_t length)
   return crc;
 }
 
-/** 从协议缓冲区读取小端序 32 位整数。 */
 static uint32_t FirmwareFlow_ReadU32Le(const uint8_t *data)
 {
   return ((uint32_t)data[0]) |
@@ -117,14 +106,12 @@ static uint32_t FirmwareFlow_ReadU32Le(const uint8_t *data)
          ((uint32_t)data[3] << 24U);
 }
 
-/** 向协议缓冲区写入小端序 16 位整数。 */
 static void FirmwareFlow_WriteU16Le(uint8_t *data, uint16_t value)
 {
   data[0] = (uint8_t)(value & 0xFFU);
   data[1] = (uint8_t)(value >> 8U);
 }
 
-/** 向协议缓冲区写入小端序 32 位整数。 */
 static void FirmwareFlow_WriteU32Le(uint8_t *data, uint32_t value)
 {
   data[0] = (uint8_t)(value & 0xFFU);
@@ -133,7 +120,6 @@ static void FirmwareFlow_WriteU32Le(uint8_t *data, uint32_t value)
   data[3] = (uint8_t)((value >> 24U) & 0xFFU);
 }
 
-/** 合并待发送 ACK 状态；错误和强制 ACK 优先保留。 */
 static void FirmwareFlow_RequestAck(uint8_t status, uint8_t force)
 {
   /* 错误状态优先，不能被后续正常完成事件覆盖。 */
@@ -148,7 +134,6 @@ static void FirmwareFlow_RequestAck(uint8_t status, uint8_t force)
   }
 }
 
-/** 清空会话进度和块队列，但不改变外部传输回调。 */
 static void FirmwareFlow_ResetSession(void)
 {
   fw_session_active = 0U;
@@ -162,7 +147,6 @@ static void FirmwareFlow_ResetSession(void)
   fw_queue_count = 0U;
 }
 
-/** 将逻辑数据长度向上取整到 CAN FD 合法 DLC 长度。 */
 static uint8_t FirmwareFlow_DlcLength(uint8_t length)
 {
   if (length <= 8U) return length;
@@ -175,7 +159,6 @@ static uint8_t FirmwareFlow_DlcLength(uint8_t length)
   return 64U;
 }
 
-/** 计算一个逻辑块需要的经典 CAN 分片数或 CAN FD 单帧数。 */
 static uint8_t FirmwareFlow_GetFrameCount(const FirmwareFlowBlock_t *block)
 {
   if ((block->can_flags & FW_FLOW_CAN_FLAG_FD) != 0U)
@@ -185,7 +168,6 @@ static uint8_t FirmwareFlow_GetFrameCount(const FirmwareFlowBlock_t *block)
   return (uint8_t)((block->valid_len + 7U) / 8U);
 }
 
-/** 根据当前分片游标生成一个待提交的 CAN/CAN FD 帧。 */
 static CanGatewayIoResult_t FirmwareFlow_BuildFrame(
     const FirmwareFlowBlock_t *block,
     CanGatewayCanFrame_t *frame)
@@ -232,7 +214,6 @@ static CanGatewayIoResult_t FirmwareFlow_BuildFrame(
   return CAN_GATEWAY_IO_OK;
 }
 
-/** 从队首移除当前逻辑块，并按成功/失败返还 credit 或生成错误 ACK。 */
 static void FirmwareFlow_CompleteCurrentBlock(uint8_t success)
 {
   FirmwareFlowBlock_t *block;
@@ -298,7 +279,6 @@ static void FirmwareFlow_OnCanTxCompletion(void *context,
   }
 }
 
-/** 在有限预算内推进队首块的 CAN 分帧发送。 */
 static void FirmwareFlow_ProcessTx(void)
 {
   uint8_t budget = 8U;
@@ -370,7 +350,6 @@ static void FirmwareFlow_ProcessTx(void)
   }
 }
 
-/** 按 AA59 FLOW_ACK 布局组装当前累计确认状态。 */
 static void FirmwareFlow_BuildAck(uint8_t *packet)
 {
   uint16_t crc;
@@ -400,7 +379,6 @@ static void FirmwareFlow_BuildAck(uint8_t *packet)
   packet[33] = 0xAAU;
 }
 
-/** 按累计数量、低水位和最小间隔规则尝试发送 FLOW_ACK。 */
 static void FirmwareFlow_ProcessAck(void)
 {
   uint32_t now;
@@ -440,7 +418,6 @@ static void FirmwareFlow_ProcessAck(void)
   fw_last_ack_tick = now;
 }
 
-/** 校验 BEGIN 并建立新的固件传输会话和初始 credit。 */
 static void FirmwareFlow_HandleBegin(const uint8_t *payload,
                                      uint16_t payload_length,
                                      uint8_t target)
@@ -473,7 +450,6 @@ static void FirmwareFlow_HandleBegin(const uint8_t *payload,
   FirmwareFlow_RequestAck(FW_FLOW_STATUS_OK, 1U);
 }
 
-/** 校验 DATA_BLOCK 的顺序/边界并复制到可靠转发队列。 */
 static void FirmwareFlow_HandleData(const uint8_t *payload,
                                     uint16_t payload_length,
                                     uint8_t target)
@@ -559,7 +535,6 @@ static void FirmwareFlow_HandleData(const uint8_t *payload,
   }
 }
 
-/** 仅在最后一块已完成转发后关闭会话。 */
 static void FirmwareFlow_HandleEnd(uint8_t target)
 {
   fw_target = target;
@@ -575,7 +550,6 @@ static void FirmwareFlow_HandleEnd(uint8_t target)
   FirmwareFlow_RequestAck(FW_FLOW_STATUS_OK, 1U);
 }
 
-/** 校验完整 AA59 包并按命令分派到 BEGIN/DATA/END 处理器。 */
 static void FirmwareFlow_CommitPacket(void)
 {
   uint16_t payload_length;
@@ -623,7 +597,6 @@ static void FirmwareFlow_CommitPacket(void)
   }
 }
 
-/** 丢弃当前半帧并把 AA59 解析器恢复到等待帧头状态。 */
 static void FirmwareFlow_ResetParser(void)
 {
   fw_parser_state = FW_PARSER_WAIT_START;
@@ -632,7 +605,6 @@ static void FirmwareFlow_ResetParser(void)
   fw_parser_last_tick = HAL_GetTick();
 }
 
-/** 向 AA59 状态机输入一个字节，完成后触发整帧提交。 */
 static void FirmwareFlow_PushByte(uint8_t byte)
 {
   switch (fw_parser_state)
