@@ -5,9 +5,9 @@
  * 数据路径：
  *   USART1 RX（DMA1_Stream0，循环模式，.dma_buffer 段）→ imu_dbg_dma_ring
  *     → 主循环按 NDTR 游标取出新字节
- *     → (1) 原始字节阻塞回显到 PA9（→WCH-Link RX→PC COM42，供离线解析
- *         原生帧流；115200 线速约 87us/字节，批量小、阻塞可忽略）
- *     → (2) 喂给正式后端 ImuSensor_Feed/Process 做片内解析
+ *     → (1b) 原始字节十六进制行（"IMUWd:<hex>"）原样发上 USB CDC（COM11）：
+ *         上位机按行重组即得完整原生帧流，可离线复检协议
+ *     → (2) 同时喂给正式后端 ImuSensor_Feed/Process 做片内解析
  *     → (3) 每秒两行统计经 UsbCanGateway_TxEnqueue 上 CDC（COM11）：
  *         "IMUW raw=<n> good=<n> err=<n> drop=<n>" 与
  *         "IMUW r=<raw_seq> q=<quat_seq> e=<euler_seq> b=<baro_seq>"
@@ -32,6 +32,19 @@
 #define IMU_DBG_DMA_RING_SIZE 2048U
 /* 统计行打印间隔。 */
 #define IMU_DBG_STATS_PERIOD_MS 1000U
+/*
+ * PA9 回显开关：WCH-Link 插着时其串口占用 PA9/PA10（IMU 拉不了低电平），
+ * 拔掉后 WCH 串口消失，回显没有接收方；且 IMU 可能接到 PA9，故保持 0。
+ */
+#define IMU_DBG_ECHO_ENABLE 0U
+/*
+ * CDC 原始数据开关：把 PA10 收到的字节按十六进制行原样发上 CDC
+ * （"IMUWd:<hex>"，每行最多 24 字节），供上位机/离线工具重组完整
+ * 原生帧流做协议验证。统计行照常 1Hz。
+ */
+#define IMU_DBG_CDC_DUMP_ENABLE 1U
+/* 每行最多转储的字节数：24*2 hex + 前缀 + 换行 < 78B CDC 单包。 */
+#define IMU_DBG_DUMP_LINE_BYTES 24U
 
 /* USART1 RX DMA 句柄由 CubeMX 生成在 usart.c 中，非 static，可外部引用。 */
 extern DMA_HandleTypeDef hdma_usart1_rx;
@@ -48,6 +61,42 @@ static uint32_t imu_dbg_total_bytes;      /* 累计收到的原始字节数。 *
 static uint32_t imu_dbg_last_stats_tick;  /* 最后一次打印统计行的时间。 */
 static uint8_t  imu_dbg_started;          /* 初始化完成标志。 */
 static uint8_t  imu_dbg_ver_reported;     /* 版本行是否已打印。 */
+
+static const char imu_dbg_hex[] = "0123456789ABCDEF";
+
+static void ImuUartDebug_SendLine(const char *text, uint16_t len);
+
+/** 把一段原始字节按十六进制行发上 CDC（IMUWd: 前缀，无损重组用）。 */
+static void ImuUartDebug_HexDump(const uint8_t *data, uint16_t len)
+{
+  char line[USB_CAN_PACKET_SIZE];
+  uint16_t sent = 0U;
+
+  while (sent < len)
+  {
+    uint16_t n = (uint16_t)(len - sent);
+    uint16_t pos;
+    uint16_t i;
+
+    if (n > IMU_DBG_DUMP_LINE_BYTES)
+    {
+      n = IMU_DBG_DUMP_LINE_BYTES;
+    }
+    memcpy(line, "IMUWd:", 6U);
+    pos = 6U;
+    for (i = 0U; i < n; i++)
+    {
+      uint8_t b = data[sent + i];
+
+      line[pos++] = imu_dbg_hex[(b >> 4) & 0x0FU];
+      line[pos++] = imu_dbg_hex[b & 0x0FU];
+    }
+    line[pos++] = '\r';
+    line[pos++] = '\n';
+    ImuUartDebug_SendLine(line, pos);
+    sent = (uint16_t)(sent + n);
+  }
+}
 
 /** 无符号 32 位转十进制，返回写入字符数（值上限 10 位）。 */
 static uint16_t ImuUartDebug_U32ToDec(uint32_t value, char *out)
@@ -208,6 +257,7 @@ void ImuUartDebug_Process(void)
 
     now_us = (uint64_t)HAL_GetTick() * 1000ULL;
 
+#if IMU_DBG_ECHO_ENABLE
     /* (1) 原始字节回显到 PA9：WCH-Link RX→COM42 可捕获完整原生帧流。
      *     阻塞发送按 115200 线速估算超时（约 87us/字节，留倍余量）。 */
     (void)HAL_UART_Transmit(&huart1, &imu_dbg_dma_ring[imu_dbg_rd_pos],
@@ -218,6 +268,16 @@ void ImuUartDebug_Process(void)
                               (uint16_t)(count - first),
                               (uint32_t)(((count - first) / 4U) + 10U));
     }
+#endif
+
+#if IMU_DBG_CDC_DUMP_ENABLE
+    /* (1b) 原始字节十六进制行上 CDC（WCH-Link 拔除后唯一的数据出口）。 */
+    ImuUartDebug_HexDump(&imu_dbg_dma_ring[imu_dbg_rd_pos], first);
+    if (count > first)
+    {
+      ImuUartDebug_HexDump(&imu_dbg_dma_ring[0], (uint16_t)(count - first));
+    }
+#endif
 
     /* (2) 同一批字节喂给正式后端解析（时间戳为 HAL 毫秒 ×1000）。 */
     (void)ImuSensor_Feed(&imu_dbg_dma_ring[imu_dbg_rd_pos], first, now_us);
