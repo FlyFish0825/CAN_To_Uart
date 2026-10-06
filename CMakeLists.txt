@@ -62,7 +62,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Passive RX is safe for observation; TX/configuration remains separately guarded.
 option(SENSOR_IMU_UART_ENABLED "Enable passive IMU USART1 receive on PA10" ON)
-option(SENSOR_IMU_UART_TX_ENABLED "Enable IMU PA9 TX only after wiring is confirmed free" OFF)
+option(SENSOR_IMU_UART_TX_ENABLED "Enable IMU PA9 TX only after wiring is confirmed free" ON)  # 2026-10-06 接线确认空闲（WCH 拔除），经用户授权开启
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     SENSOR_IMU_UART_ENABLED=$<BOOL:${SENSOR_IMU_UART_ENABLED}>
     SENSOR_IMU_UART_TX_ENABLED=$<BOOL:${SENSOR_IMU_UART_TX_ENABLED}>)
