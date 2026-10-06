@@ -54,6 +54,18 @@ static uint16_t usb_protocol_route_expected = 0U; /* 根据长度字段计算的
 static uint8_t usb_protocol_route_header[16]; /* AA59 固定头部暂存区。 */
 static uint32_t usb_protocol_route_last_tick = 0U; /* 路由器最近收到字节的时间。 */
 
+/**
+ * @brief 主机下行字节旁路钩子（弱定义，默认空实现）。
+ *
+ * ProcessRx 每从 RX 环形缓冲取出一个字节都会调用一次；需要旁路观察
+ * 主机字节流的模块（如调试分支的 "!SYNC" 时间同步命令）用强符号重写。
+ * 正式协议的时间同步改走 AA5x 帧族后应移除该钩子。
+ */
+__weak void UsbCanGateway_ByteTap(uint8_t byte)
+{
+  (void)byte;
+}
+
 /** 返回 RX 环形缓冲可写的空闲字节数，保留一个空槽区分满/空。 */
 static uint16_t UsbCanGateway_RxFree(void)
 {
@@ -402,6 +414,7 @@ static void UsbCanGateway_ProcessRx(void)
     byte = usb_can_rx_ring[tail];
     usb_can_rx_tail = (uint16_t)((tail + 1U) & USB_CAN_RX_RING_MASK);
     UsbCanGateway_RouteByte(byte);
+    UsbCanGateway_ByteTap(byte);
     processed++;
   }
 

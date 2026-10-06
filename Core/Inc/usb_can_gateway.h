@@ -52,6 +52,16 @@ _Static_assert((USB_CAN_TX_QUEUE_SIZE & (USB_CAN_TX_QUEUE_SIZE - 1U)) == 0U,
 void UsbCanGateway_RxPush(const uint8_t *data, uint16_t len);
 
 /**
+ * @brief 主机下行字节旁路钩子（默认空实现，允许模块用强符号重写）。
+ * @param byte 本次从 USB CDC RX 环形缓冲取出的一个字节。
+ *
+ * UsbCanGateway_Process() 每取到一个主机字节都会调用一次。调试分支用
+ * 它解析 "!SYNC <epoch_ms>" 时间同步命令；正式协议的时间同步应改走
+ * AA5x 帧族，届时移除该钩子。
+ */
+void UsbCanGateway_ByteTap(uint8_t byte);
+
+/**
  * @brief 判断 RX 环形缓冲是否能完整容纳下一包输入。
  *
  * USB 回调收到当前数据包后调用此函数。它只判断 RX 环形缓存是否能容纳
