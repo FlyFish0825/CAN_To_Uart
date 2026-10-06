@@ -46,6 +46,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/can_gateway_core.c
     Core/Src/firmware_flow.c
+    Core/Src/imu_sensor.c
     Core/Src/imu_uart_debug.c
     Core/Src/system_heartbeat.c
     Core/Src/usb_can_gateway.c

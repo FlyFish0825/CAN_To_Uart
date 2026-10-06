@@ -1,10 +1,18 @@
 /**
  * @file imu_uart_debug.h
- * @brief 【imu-uart1-debug 测试分支】IMU 串口读取调试接口。
+ * @brief 【imu-uart1-debug 调试分支】IMU→WCH-Link 串口桥（读数验证用）。
  *
- * 该模块只存在于调试分支：把 USART1（PA9/PA10，115200）收到的原始字节
- * 以十六进制文本行写入 USB CDC 发送队列，供电脑端串口工具直接观察 IMU
- * 输出。模块不解析 IMU 协议，也不参与正式网关数据路径。
+ * 用途：在授权的硬件测试窗口里，经 WCH-Link 的串口桥（COM42）读取 IMU。
+ * 数据路径：
+ *   IMU TX → PA10（USART1 RX，DMA 循环接收）
+ *     → 原始字节逐段回显到 PA9（USART1 TX）→ WCH-Link RX → PC COM42
+ *     → 同时喂给正式后端 imu_sensor 做片内解析
+ *     → 每秒一行健康统计经 USB CDC（COM11）输出
+ *
+ * 约束：只收不发——不对 IMU 发送任何原生命令（imu_sensor 保持
+ * pins_blocked=1、tx=NULL），无自环自测，无自动校准；PA9 上的唯一输出
+ * 是 PA10 收到字节的回显。历史版本（7E23 直打 + RTC/!SYNC 双时钟）已
+ * 留档于 da651db，本文件是其在硬件验证阶段的替代实现。
  */
 #ifndef __IMU_UART_DEBUG_H__
 #define __IMU_UART_DEBUG_H__
@@ -16,7 +24,7 @@ extern "C" {
 #include "main.h"
 
 /**
- * @brief 初始化 USART1 并启动 DMA 环形接收。
+ * @brief 初始化 USART1（PA9/PA10，115200）并启动 DMA 循环接收与桥接。
  * @return HAL_OK 启动成功；HAL_ERROR DMA 接收启动失败。
  *
  * 内部会调用 CubeMX 生成的 MX_DMA_Init() 和 MX_USART1_UART_Init()，
@@ -25,11 +33,8 @@ extern "C" {
 HAL_StatusTypeDef ImuUartDebug_Init(void);
 
 /**
- * @brief 主循环轮询：取出 DMA 新收到的字节并按行打印到 CDC 发送队列。
- *
- * 函数非阻塞。CDC 发送队列满时已收到的数据保留在模块缓冲内，下一轮继
- * 续尝试；模块缓冲也无法容纳时丢弃新数据并计数，空闲状态行会汇报丢弃
- * 数量，便于发现上位机长时间不取数据造成的堆积。
+ * @brief 主循环轮询：DMA 游标取新字节 → PA9 回显 → imu_sensor 解析 →
+ *        1Hz CDC 统计行。函数非阻塞（回显按 115200 线速短暂阻塞）。
  */
 void ImuUartDebug_Process(void);
 
