@@ -103,10 +103,12 @@ BUSY/UNSUPPORTED）或受理（异步结果经 `ImuSensor_PopResult` 弹出）�
 2. **CMake**：`Core/Src/imu_sensor.c` 加入构建（同 ms5837 的处理方式）。
 3. **AA5B TARGET=1 接线**：参考集成分支 `sensor_service.c`——GET/SET_PARAMETER 路由、
    GET_INFO、CALIBRATE 映射、流 0x80/0x81/0x83 均已有实现。
-4. **已知缺口（必须修）**：① 集成分支的 imu_sensor 停在 82c590a，需更新到本版
-   （0x60 单字节修正——真机实测旧 8 字节帧被设备静默忽略；0x73/0xA0 新增）；
-   ② `sensor_service.c` CALIBRATE type=3 未把 payload 里的 reference_temperature_centiC
-   传入 `ImuSensor_Request` 的 arg（当前传 0 会发 0°C）。
+4. **已知缺口（必须修）**：① 集成工作树的 imu_sensor 停在 82c590a，需同步到本分支
+   版本（0x60 单字节修正——真机实测旧 8 字节帧被设备静默忽略；0x73/0xA0 新增；
+   2026-10-06 修正版已真机闭环：SET 50 → 流 50Hz）。
+   ② **产品决策：不使用 IMU 硬件校准**（上位机软件校准）——集成层应对 AA5B
+   CALIBRATE 直接回 UNSUPPORTED，无需修复 centiC 传参；若将来启用再修复
+   （当前 type=3 会以 arg=0 发送 0°C，属缺陷）。
 5. **接收模式建议**：USART1 IDLE 中断 + 主循环搬运（参考 25138b9），替代轮询。
 
 ## 6. 已知限制与假设

@@ -4,17 +4,18 @@
 > **依赖声明**：通用帧格式（AA 5B 帧头/CRC16-CCITT-FALSE/帧尾）、FLAGS 定义、RESULT 码表、
 > 0x83 状态流结构与背压规则，见《ms5837-aa5b-host-protocol.md》§2/§3/§10，本文件不重复。
 > 上位机按 `TARGET` 字段区分两台传感器：`TARGET=1` IMU（本文件），`TARGET=2` 深度计。
-> 来源：**除标注 ⚠️ 外，全部字段 2026-10-06 真机实测**（CDC COM11，9 条命令 + 24s 流，
-> 测试固件 = 集成分支接线 + imu_sensor@8367a93；证据见 docs/imu-sensor.md §7 与
-> build/hardware-test/aa5b-imu-test-report-20261006.md）。
+> 来源：**除标注 ⚠️ 外，全部字段 2026-10-06 真机实测**（CDC COM11，GET_INFO/GET_STATUS/
+> 参数读写/边界/启停流共 13 条命令 + 多轮 24s 流；测试固件 = 集成分支接线 +
+> imu_sensor@8367a93；证据见 docs/imu-sensor.md §7 与 aa5b-imu-test-report-20261006.md）。
 > IMU 相关代码：`Core/Inc/imu_sensor.h`、`Core/Src/imu_sensor.c`；AA5B 编解码：
 > `Core/Src/sensor_protocol.c`；业务层：`Core/Src/sensor_service.c`。
 
 ## 1. 推送策略（已定稿）
 
 连接即**自动推流**（与深度计一致），无需 START_STREAM；`STOP_STREAM(0x08)` /
-`START_STREAM(0x07)` 可随时暂停/恢复（仅控制转发，不影响传感器采样）。带宽不足时
-再议按需单查模式（参考 ms5837.md §8 的 0x0D 提案，IMU 侧对称设计暂缓）。
+`START_STREAM(0x07)` 可随时暂停/恢复，**仅控制 CDC 转发、不影响传感器采样，且按
+TARGET 独立**（实测：STOP t1 时深度流不受影响，反之亦然）。带宽不足时再议按需
+单查模式（参考 ms5837.md §8 的 0x0D 提案，IMU 侧对称设计暂缓）。
 
 ## 2. IMU 命令集（TARGET=1）
 
@@ -24,7 +25,7 @@
 | `0x02` | `GET_STATUS` | `0x42` | ✓ 实测 | `RESULT=0`，负载 21B（§6） |
 | `0x03` | `GET_PARAMETER` | `0x43` | ✓ 实测 | 仅 0001/0003，其余 ID `RESULT=1` |
 | `0x04` | `SET_PARAMETER` | `0x44` | ✓ 实测 | 同上 |
-| `0x07/0x08` | `START/STOP_STREAM` | `0x47/0x48` | ✓ | `RESULT=0` |
+| `0x07/0x08` | `START/STOP_STREAM` | `0x47/0x48` | ✓ 实测 | `RESULT=0`，**按 TARGET 独立**（STOP t1 不影响 t2 流） |
 | `0x09` | `CALIBRATE` | `0x49` | ⚠️ 未真机发送 | 载荷见 §7（会改设备校准状态） |
 | `0x05/0x0A/0x0B` | SAVE/SELF_TEST/REBOOT | `0x45/0x4A/0x4B` | ✓ 实测 | **`RESULT=1` UNSUPPORTED**，GUI 不出按钮 |
 | `0x06` | `RESTORE_DEFAULTS` | `0x46` | ⚠️ 统筹待定 | 提议映射原生 0xA0（重置用户数据），当前固件回 `RESULT=1` |
@@ -45,7 +46,11 @@
    **生效确认方法：SET 后统计 0x80 遥测的实际帧率约 2 秒**（实测脚本即此做法）。
 3. 非法参数（如 0001=5、0003=7）= `RESULT=2 BAD_VALUE`，同步回复。
 
-## 4. CALIBRATE 载荷（4 字节恒长，⚠️ 真机未发送）
+## 4. CALIBRATE 载荷（**产品决策：不使用，GUI 不实现**）
+
+> **2026-10-06 决策：本设备不使用 IMU 硬件校准，校准在上位机软件层面完成——
+> GUI 不要实现 CALIBRATE 命令。** 以下载荷定义仅作协议完备性保留：命令在固件中
+> 存在且会真实改变设备校准状态（`action=0` 清除属有损操作），误发会降低数据质量。
 
 | 偏移 | 字段 | 说明 |
 | --- | --- | --- |
@@ -67,12 +72,13 @@ GUI 触发前应向操作者确认（当前实现缺口：centiC 传参，见 do
 | 2 | 1 | `model` | **恒 0**：原生协议无型号读回，禁止凭四元数/磁力计数据猜 6/9 轴 |
 | 3 | 4 | `capabilities` | `0x000001E7`：bit0 raw、bit1 quaternion、bit2 euler、bit5 rate-config、bit6 algorithm-config、bit7 accel/gyro-cal、bit8 mag-cal |
 | 7 | 16 | `name` | `"7E23 IMU"` 后补 `\0` |
-| 23 | 8 | `firmware` | 版本串 `"1.0.0"`；**首次 GET_INFO 会自动触发原生版本查询，回复约 1 s 后才发出**，之后走缓存 |
+| 23 | 8 | `firmware` | 版本串 `"1.0.0"`；**首次 GET_INFO 会自动触发原生版本查询并在收到版本后立即回复（实测请求后数十毫秒）**，之后走缓存即时回复 |
 
 ## 6. GET_STATUS 负载与状态位（IMU 侧取值）
 
 20 字节统计体（RESULT + status + sample_seq + age_ms + good_frames + errors）同深度计。
-实测 `status=0x0000043F`、`sample_seq=62641`、`age_ms=3`、`errors=0`。
+实测 `status=0x0000043F`（含 bit10，因实测时速率/模式尚未设置过；SET 后清零）、
+`sample_seq=62641`、`age_ms=3`、`errors=0`。
 
 **IMU 状态位定义（与深度计共用编号，取值不同）：**
 
@@ -98,7 +104,8 @@ GUI 触发前应向操作者确认（当前实现缺口：centiC 传参，见 do
 
 **0x81 合并语义（实测 51 Hz）**：四元数（原生 0x16）与欧拉角（原生 0x26）各 25 Hz
 独立到达，**任一有新样本即发一帧**——GUI 按 `status` 的 `QUAT_VALID/EULER_VALID`
-位分别取字段，不要假设 0x80 与 0x81 一一对应。
+位分别取字段，不要假设 0x80 与 0x81 一一对应。帧率关系（GUI 带宽预估用）：
+**0x80 ≈ 输出率；0x81 ≈ 2×输出率**（实测 25Hz 模式→51Hz，50Hz 模式→~100Hz）。
 
 **单位（缩放经真机验证）**：accel = g；gyro = rad/s；euler = rad；**mag 的物理单位
 未证实（800/32767 线性值），GUI 禁止标注 uT**。
@@ -112,4 +119,4 @@ GUI 触发前应向操作者确认（当前实现缺口：centiC 传参，见 do
 2. 无持久化：复位后速率/模式/版本缓存全丢，每次连接重做 GET_INFO。
 3. **改速率后必须验证实际帧率**（§3 第 2 条），UNCONFIRMED 不是成功。
 4. PIN_BLOCKED(9) 表示 IMU 串口被占用（如调试器插着），不是通信故障。
-5. `CALIBRATE` 会真实改变设备校准状态：GUI 触发前向操作者确认，且校准期间禁用其他传感器命令（BUSY）。
+5. **CALIBRATE 不实现**（产品决策：校准在上位机软件层面完成）。该命令在固件中存在且会真实改变设备校准状态（有损操作），不要误发。
