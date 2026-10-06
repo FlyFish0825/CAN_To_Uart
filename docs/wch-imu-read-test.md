@@ -15,12 +15,14 @@
 
 ```
 cd F:/file/BaiduSyncdisk/Project/CAN_To_Uart/worktrees/imu-uart1-debug
-"C:/Program Files/openOCD/bin/openocd" -f tests/wch_flash_openocd.cfg \
+"C:/Program Files/openOCD/bin/openocd.exe" \
+    -s "C:/Program Files/openOCD/openocd/scripts" \
+    -f tests/wch_flash_openocd.cfg \
     -c "program build/Debug/CAN_To_Uart.elf verify reset exit"
 ```
 
-预期输出含 `** Programming Finished **` 与 `** Verified **`。失败则原样记录错误，
-不重试不抢设备。
+预期输出含 `** Programming Finished **` 与 `** Verified OK **`。失败则原样记录错误，
+不重试不抢设备。（2026-10-06 已按此命令成功烧录一次：Verified OK。）
 
 ## 2. COM42 只读采集（15 秒，RX-only）
 
