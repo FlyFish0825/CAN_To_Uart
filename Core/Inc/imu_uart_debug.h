@@ -33,10 +33,20 @@ extern "C" {
 HAL_StatusTypeDef ImuUartDebug_Init(void);
 
 /**
- * @brief 主循环轮询：DMA 游标取新字节 → PA9 回显 → imu_sensor 解析 →
- *        1Hz CDC 统计行。函数非阻塞（回显按 115200 线速短暂阻塞）。
+ * @brief 主循环轮询：按空闲事件搬运新字节 → CDC 十六进制行与 imu_sensor
+ *        解析（带接收时间戳）→ 1Hz CDC 统计行。非阻塞。
  */
 void ImuUartDebug_Process(void);
+
+/**
+ * @brief USART1 中断挂钩：由 stm32h7xx_it.c 的 USART1_IRQHandler 在
+ *        HAL_UART_IRQHandler 之前调用。
+ *
+ * 检测到空闲（IDLE）中断时：清标志、快照当时的 DMA 写游标与 HAL 毫秒
+ * 时间戳、置接收标志。真正把字节搬去 CDC/解析器的是主循环的
+ * ImuUartDebug_Process()——中断里只做这三个变量的写入。
+ */
+void ImuUartDebug_Uart1IrqHook(void);
 
 #ifdef __cplusplus
 }

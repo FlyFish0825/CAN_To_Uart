@@ -61,6 +61,17 @@ static uint32_t imu_dbg_total_bytes;      /* 累计收到的原始字节数。 *
 static uint32_t imu_dbg_last_stats_tick;  /* 最后一次打印统计行的时间。 */
 static uint8_t  imu_dbg_started;          /* 初始化完成标志。 */
 static uint8_t  imu_dbg_ver_reported;     /* 版本行是否已打印。 */
+static uint32_t imu_dbg_rx_restarts;      /* RX DMA 错误重启次数。 */
+
+/*
+ * USART1 IDLE 中断与主循环之间的交接（中断里只写，主循环读后清）：
+ * 空闲中断在帧突发结束瞬间触发，此时快照 DMA 写游标与毫秒时间戳，
+ * 主循环据此把 [读游标, 快照游标) 的字节搬去 CDC 与解析器，时间戳
+ * 即"这批字节接收完成"的时刻（用户要求：接收时打时间戳）。
+ */
+static volatile uint8_t  imu_dbg_idle_flag; /* 1 = 有待搬运的空闲事件。 */
+static volatile uint16_t imu_dbg_idle_pos;  /* 中断时刻的 DMA 写游标。 */
+static volatile uint32_t imu_dbg_idle_tick; /* 中断时刻（HAL_GetTick 毫秒）。 */
 
 static const char imu_dbg_hex[] = "0123456789ABCDEF";
 
@@ -123,6 +134,25 @@ static void ImuUartDebug_SendLine(const char *text, uint16_t len)
   (void)UsbCanGateway_TxEnqueue((const uint8_t *)text, len);
 }
 
+void ImuUartDebug_Uart1IrqHook(void)
+{
+  if (imu_dbg_started == 0U)
+  {
+    return;
+  }
+  /* 只认 IDLE：帧突发结束（线空闲一帧时间）即为一批接收完成。其余
+   * 中断源不清不碰，交回其后的 HAL_UART_IRQHandler 处理。 */
+  if (((huart1.Instance->ISR & USART_ISR_IDLE) != 0U) &&
+      ((huart1.Instance->CR1 & USART_CR1_IDLEIE) != 0U))
+  {
+    huart1.Instance->ICR = USART_ICR_IDLECF; /* 写 1 清除空闲标志。 */
+    imu_dbg_idle_pos = (uint16_t)(IMU_DBG_DMA_RING_SIZE -
+                                  __HAL_DMA_GET_COUNTER(&hdma_usart1_rx));
+    imu_dbg_idle_tick = HAL_GetTick();
+    imu_dbg_idle_flag = 1U;
+  }
+}
+
 /** 每秒输出健康统计（两行）与首次版本号。 */
 static void ImuUartDebug_ReportStats(uint32_t now)
 {
@@ -152,6 +182,9 @@ static void ImuUartDebug_ReportStats(uint32_t now)
   memcpy(&line[pos], " drop=", 6U);
   pos = (uint16_t)(pos + 6U);
   pos += ImuUartDebug_U32ToDec(s.rx_dropped_bytes, &line[pos]);
+  memcpy(&line[pos], " rst=", 5U);
+  pos = (uint16_t)(pos + 5U);
+  pos += ImuUartDebug_U32ToDec(imu_dbg_rx_restarts, &line[pos]);
   line[pos++] = '\r';
   line[pos++] = '\n';
   ImuUartDebug_SendLine(line, pos);
@@ -206,11 +239,17 @@ HAL_StatusTypeDef ImuUartDebug_Init(void)
   imu_dbg_total_bytes = 0U;
   imu_dbg_last_stats_tick = HAL_GetTick();
   imu_dbg_ver_reported = 0U;
+  imu_dbg_rx_restarts = 0U;
+  imu_dbg_idle_flag = 0U;
+  imu_dbg_idle_pos = 0U;
+  imu_dbg_idle_tick = 0U;
 
   if (HAL_UART_Receive_DMA(&huart1, imu_dbg_dma_ring, IMU_DBG_DMA_RING_SIZE) != HAL_OK)
   {
     return HAL_ERROR;
   }
+  /* 接收搬运由空闲中断驱动：帧突发结束即触发，主循环完成实际搬运。 */
+  __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
   imu_dbg_started = 1U;
 
   ImuUartDebug_SendLine(start_line, (uint16_t)(sizeof(start_line) - 1U));
@@ -220,42 +259,87 @@ HAL_StatusTypeDef ImuUartDebug_Init(void)
 void ImuUartDebug_Process(void)
 {
   uint16_t write_pos;
+  uint16_t target_pos;
   uint32_t now;
+  uint32_t stamp;
+  uint16_t count;
+  uint16_t first;
+  uint64_t now_us;
 
   if (imu_dbg_started == 0U)
   {
     return;
   }
+  now = HAL_GetTick();
 
   /*
-   * NDTR 是 DMA 剩余传输计数，读游标 = 缓冲大小 - 剩余量；游标不一致
-   * 即有新字节。读取期间 DMA 仍在写入，这里只消费游标之间的旧数据。
+   * 错误恢复：HAL 检出 ORE 等错误时会停掉 RX DMA，这里重启接收并重新
+   * 武装 IDLE 中断；重启点之前的字节已不可信，直接放弃并计入重启数。
    */
-  write_pos = (uint16_t)(IMU_DBG_DMA_RING_SIZE -
-                         __HAL_DMA_GET_COUNTER(&hdma_usart1_rx));
-  if (write_pos != imu_dbg_rd_pos)
+  if (huart1.ErrorCode != HAL_UART_ERROR_NONE)
   {
-    uint16_t count;
-    uint16_t first;
-    uint64_t now_us;
-
-    if (write_pos > imu_dbg_rd_pos)
+    huart1.ErrorCode = HAL_UART_ERROR_NONE;
+    (void)HAL_UART_AbortReceive(&huart1);
+    if (HAL_UART_Receive_DMA(&huart1, imu_dbg_dma_ring,
+                             IMU_DBG_DMA_RING_SIZE) != HAL_OK)
     {
-      count = (uint16_t)(write_pos - imu_dbg_rd_pos);
+      return; /* 重启失败，下一拍再试。 */
     }
-    else
-    {
-      /* DMA 写入位置已绕回缓冲区起点。 */
-      count = (uint16_t)((IMU_DBG_DMA_RING_SIZE - imu_dbg_rd_pos) + write_pos);
-    }
+    imu_dbg_rd_pos = 0U;
+    imu_dbg_idle_flag = 0U;
+    imu_dbg_rx_restarts++;
+    __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+  }
 
+  /*
+   * 接收搬运由 USART1 空闲中断驱动：IDLE 在帧突发结束瞬间触发，中断里
+   * 快照 DMA 写游标与毫秒时间戳并置标志；主循环在此把 [读游标, 快照
+   * 游标) 之间的字节搬去 CDC 与解析器，时间戳即中断时刻（这批字节的
+   * 接收完成时刻）。
+   */
+  if (imu_dbg_idle_flag != 0U)
+  {
+    imu_dbg_idle_flag = 0U;
+    target_pos = imu_dbg_idle_pos;
+    stamp = imu_dbg_idle_tick;
+  }
+  else
+  {
+    /*
+     * 安全网：长时间无空闲事件且积压超过半环（主循环停顿、IDLE 丢失）
+     * 时强制排空，时间戳退化为当前时刻；正常 25Hz 突发到不了这一步。
+     */
+    write_pos = (uint16_t)(IMU_DBG_DMA_RING_SIZE -
+                           __HAL_DMA_GET_COUNTER(&hdma_usart1_rx));
+    if ((uint16_t)(write_pos - imu_dbg_rd_pos) <
+        (uint16_t)(IMU_DBG_DMA_RING_SIZE / 2U))
+    {
+      ImuSensor_Process((uint64_t)now * 1000ULL);
+      ImuUartDebug_ReportStats(now);
+      return;
+    }
+    target_pos = write_pos;
+    stamp = now;
+  }
+
+  if (target_pos >= imu_dbg_rd_pos)
+  {
+    count = (uint16_t)(target_pos - imu_dbg_rd_pos);
+  }
+  else
+  {
+    /* DMA 写入位置已绕回缓冲区起点。 */
+    count = (uint16_t)((IMU_DBG_DMA_RING_SIZE - imu_dbg_rd_pos) + target_pos);
+  }
+
+  if (count != 0U)
+  {
     first = (uint16_t)(IMU_DBG_DMA_RING_SIZE - imu_dbg_rd_pos);
     if (first > count)
     {
       first = count;
     }
-
-    now_us = (uint64_t)HAL_GetTick() * 1000ULL;
+    now_us = (uint64_t)stamp * 1000ULL;
 
 #if IMU_DBG_ECHO_ENABLE
     /* (1) 原始字节回显到 PA9：WCH-Link RX→COM42 可捕获完整原生帧流。
@@ -271,7 +355,21 @@ void ImuUartDebug_Process(void)
 #endif
 
 #if IMU_DBG_CDC_DUMP_ENABLE
-    /* (1b) 原始字节十六进制行上 CDC（WCH-Link 拔除后唯一的数据出口）。 */
+    /* (1b) 数据产生时间戳行 + 原始字节十六进制行上 CDC（WCH-Link 拔除
+     *      后唯一的数据出口）。IMUWt 行可离线对齐每批字节的到达时刻。 */
+    {
+      char line[USB_CAN_PACKET_SIZE];
+      uint16_t pos = 0U;
+
+      memcpy(line, "IMUWt:", 6U);
+      pos = 6U;
+      pos += ImuUartDebug_U32ToDec(stamp, &line[pos]);
+      line[pos++] = ':';
+      pos += ImuUartDebug_U32ToDec(count, &line[pos]);
+      line[pos++] = '\r';
+      line[pos++] = '\n';
+      ImuUartDebug_SendLine(line, pos);
+    }
     ImuUartDebug_HexDump(&imu_dbg_dma_ring[imu_dbg_rd_pos], first);
     if (count > first)
     {
@@ -279,7 +377,7 @@ void ImuUartDebug_Process(void)
     }
 #endif
 
-    /* (2) 同一批字节喂给正式后端解析（时间戳为 HAL 毫秒 ×1000）。 */
+    /* (2) 同一批字节喂给正式后端解析：时间戳 = IDLE 中断时刻。 */
     (void)ImuSensor_Feed(&imu_dbg_dma_ring[imu_dbg_rd_pos], first, now_us);
     if (count > first)
     {
@@ -287,7 +385,7 @@ void ImuUartDebug_Process(void)
                            now_us);
     }
 
-    imu_dbg_rd_pos = write_pos;
+    imu_dbg_rd_pos = target_pos;
     imu_dbg_total_bytes = (uint32_t)(imu_dbg_total_bytes + count);
   }
 
