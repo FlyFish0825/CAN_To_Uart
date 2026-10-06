@@ -10,6 +10,7 @@
 | 构建与维护 | [编译、烧录与维护](#6-编译烧录与维护)、[测试与验证](#10-测试验证入口与审查清单) | CMake 构建、烧录边界、主机测试和板上验证范围 |
 | 源码索引 | [工程边界与文件分工](#8-工程边界与文件分工)、[手写模块与配置文件索引](#9-手写模块与配置文件索引) | CubeMX 生成区、手写模块、配置文件和职责划分 |
 | 硬件参考 | [硬件资料目录](docs/hardware/) | 原理图和 STM32H750 数据手册，按资料归档，不作为自动化构建输入 |
+| 传感器系统 | [IMU 上位机协议](docs/imu-aa5b-host-protocol.md)、[IMU 驱动与集成](docs/imu-sensor.md)、[深度计上位机协议](docs/ms5837-aa5b-host-protocol.md)、[深度计驱动与集成](docs/ms5837.md) | AA5B TARGET=1/2 双传感器协议（真机实测）、驱动接口与集成记录 |
 
 项目根目录保留工程入口文件；补充资料统一放在 `docs/` 二级目录下。第三方库自带的 LICENSE、示例说明和测试说明继续随其所属库目录保存。
 
@@ -161,10 +162,22 @@ status(1) | reserved(3)
 | FDCAN1 TX | PD1 | MCU 到 CAN 收发器 TXD |
 | FDCAN1 RX | PD0 | CAN 收发器 RXD 到 MCU |
 | CANH / CANL | 收发器总线侧 | 接 CAN 总线，不能接 TTL 串口 |
+| USART1 (IMU) | PA9=TX / PA10=RX | 亚博 10 轴 IMU，115200 8N1；⚠️ WCH-Link 调试器插着时会占用 PA9/PA10，IMU 测试与运行前必须拔掉 |
+| I2C3 (深度计) | PA8=SCL / PC9=SDA | MS5837 压力传感器，7 位地址 0x76 |
 
 本固件使用 USB CDC 虚拟串口作为电脑接口，不需要外接 USB 转串口模块，也不需要配置传统串口波特率。请根据实际板卡原理图确认 USB 接口连接和供电。
 
 FDCAN 内核时钟配置为 80 MHz；默认仲裁段 1 Mbit/s、FD 数据段 8 Mbit/s。工作模式为 Normal，自动重发关闭。经典 CAN 帧不使用 FD 数据段速率。支持 FD 报文的软件配置不等于板卡收发器及布线已通过对应高速验证。
+
+### 2.1 传感器子系统（AA5B：IMU 与深度计）
+
+固件内置双传感器后端，经同一 USB CDC 以 AA5B v1 帧族与上位机通信：`TARGET=1` IMU、`TARGET=2` 深度计，与 AA55/AA58/AA59 帧族按帧头家族字节路由、同一发送队列串行输出。
+
+- 连接后**自动推流**：IMU 0x80（原始九轴，单位 g / rad/s）/ 0x81（四元数+欧拉角，rad）/ 深度计 0x82（压力/温度/深度）/ 双 TARGET 状态 0x83 各 1 Hz。`STOP/START_STREAM` 可按 TARGET 独立暂停/恢复（仅控制转发，不影响采样）。
+- 命令：GET_INFO / GET_STATUS / 参数读写（IMU 输出率与算法模式、深度计 OSR/水密度/零点/滤波/型号）/ CALIBRATE / ZERO_DEPTH；回复命令码 = 请求 + 0x40，全部字段真机实测。
+- 校准策略：IMU **不使用设备侧硬件校准**（上位机软件校准，CALIBRATE 不实现）；深度计支持 ZERO_DEPTH 水面归零。
+- 发送队列水位 ≥25/255 时传感器帧被背压丢弃（保护 CAN 业务），上位机以 `sample_seq` 判断连续性。
+- 详见《imu-aa5b-host-protocol.md》《ms5837-aa5b-host-protocol.md》两份真机实测协议文档。
 
 ## 3. 普通 CAN 帧的串口协议
 

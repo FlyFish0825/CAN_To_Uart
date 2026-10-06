@@ -97,19 +97,17 @@ BUSY/UNSUPPORTED）或受理（异步结果经 `ImuSensor_PopResult` 弹出）�
 数据帧（IMU→MCU，自动上报）：0x04 原始 23B / 0x16 四元数 21B / 0x26 欧拉 17B /
 0x32 气压 21B（仅十轴）/ 0x01 版本（应答）/ 0x81 状态（应答）。
 
-## 5. 集成方需要做的修改（本分支不做）
+## 5. 集成记录（✅ 已完成，commit 77f76e9）
 
-1. **波特率**：usart.c + .ioc 改 115200（见 §1，硬性）。
-2. **CMake**：`Core/Src/imu_sensor.c` 加入构建（同 ms5837 的处理方式）。
-3. **AA5B TARGET=1 接线**：参考集成分支 `sensor_service.c`——GET/SET_PARAMETER 路由、
-   GET_INFO、CALIBRATE 映射、流 0x80/0x81/0x83 均已有实现。
-4. **已知缺口（必须修）**：① 集成工作树的 imu_sensor 停在 82c590a，需同步到本分支
-   版本（0x60 单字节修正——真机实测旧 8 字节帧被设备静默忽略；0x73/0xA0 新增；
-   2026-10-06 修正版已真机闭环：SET 50 → 流 50Hz）。
-   ② **产品决策：不使用 IMU 硬件校准**（上位机软件校准）——集成层应对 AA5B
-   CALIBRATE 直接回 UNSUPPORTED，无需修复 centiC 传参；若将来启用再修复
-   （当前 type=3 会以 arg=0 发送 0°C，属缺陷）。
-5. **接收模式建议**：USART1 IDLE 中断 + 主循环搬运（参考 25138b9），替代轮询。
+以下清单已于 2026-10-06 在机器人中控分支执行完毕，本节转为集成记录：
+
+1. ~~波特率~~ ✅ `usart.c` + `.ioc` 已改 115200（WCH-Link 占用 PA9/PA10 的注意事项见 §1）。
+2. ~~CMake~~ ✅ `Core/Src/imu_sensor.c`、`Core/Src/ms5837.c` 及服务层三文件已加入构建。
+3. ~~AA5B TARGET=1 接线~~ ✅ 集成分支的 `sensor_service.c` 等已合入（commit 77f76e9）。
+4. ~~已知缺口~~ ✅ imu_sensor 已是 8367a93 版（0x60 单字节，真机闭环 SET 50→50Hz）；
+   **CALIBRATE 按产品决策不实现**——集成层应回 UNSUPPORTED，GUI 走软件校准。
+5. 接收模式：当前为 DMA 轮询（含 40ms 超限重启保护）；可选升级为 USART1 IDLE 中断
+   模式（参考 imu-uart1-debug 分支 `25138b9`，已实机验证 25.9 事件/s、0 错帧）。
 
 ## 6. 已知限制与假设
 
