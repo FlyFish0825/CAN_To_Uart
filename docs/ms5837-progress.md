@@ -7,14 +7,14 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `Core/Inc/sensor_i2c_bus.h` | 传感器 I2C 事务层接口（短超时、7 位地址、结果码、主机测试替身开关 `I2C_HOST_TEST`）。**刻意不叫 i2c.h**，避免与 CubeMX 生成的 `Core/Inc/i2c.h` 冲突 |
-| `Core/Src/sensor_i2c_bus.c` | 基于 `HAL_I2C_Master_Transmit/Receive` 的同步短事务实现；不定义 `MX_I2C3_Init` |
+| ~~`Core/Inc/sensor_i2c_bus.h`~~ | **已并入 `Core/Inc/ms5837.h`（2026-10-06 折叠，见文末）** |
+| ~~`Core/Src/sensor_i2c_bus.c`~~ | **已并入 `Core/Src/ms5837.c`** |
 | `Core/Inc/ms5837.h` | MS5837 驱动接口、参数表、状态位、样本/统计结构 |
 | `Core/Src/ms5837.c` | 非阻塞状态机、CRC4、02BA/30BA 一阶+二阶补偿、零点、滤波、参数 |
-| `tests/ms5837_host_test.c` | 主机单元测试（含 I2C 从设备仿真、芯片 busy 模型、D1/D2 配对不变量、随机不变量） |
-| `tests/ms5837_reference_vectors.h` | 独立 Python 参考实现生成的 100 条跨实现校验向量（自动生成，勿手改） |
-| `tests/gen_ms5837_reference_vectors.py` | 上面那张表的生成脚本（固定种子、可复现；注释里记录了它自己踩过的坑） |
-| `tests/run_ms5837_host_test.ps1` | 一键编译+运行脚本 |
+| `tests/ms5837_host_test.c` | **（已按用户要求删除，见文末）**
+| `tests/ms5837_reference_vectors.h` | **（已按用户要求删除，见文末）**
+| `tests/gen_ms5837_reference_vectors.py` | **（已按用户要求删除，见文末）**
+| `tests/run_ms5837_host_test.ps1` | **（已按用户要求删除，见文末）**
 | `docs/ms5837.md` | 接口说明、数据手册核对记录、**集成方需要做的修改清单** |
 | `docs/ms5837-progress.md` | 本文件（证据与限制） |
 
@@ -282,6 +282,24 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 **驱动侧无需改动**：`Ms5837Sample_t.timestamp_ms` 本身就是“数据产生时刻”（D2 结果读完那一刻，
 `ms5837.c:686`）；驱动继续 25 Hz 采样，保证查询取到的是最新样本（≤40 ms 旧）。
 8.3 节同时说明这是破坏性协议变更，GUI 必须同步从解析 0x82(32B) 改为解析 0x4D(21B)。
+
+## 5.2 折叠为两文件（2026-10-06，用户要求）
+
+用户要求：深度计只保留 **`Core/Inc/ms5837.h` + `Core/Src/ms5837.c` 两个文件**，测试文件全部删除，准备并入主分支。
+
+* I2C 事务层（原 `sensor_i2c_bus.c/h`）整体并入这两个文件：对外只留
+  `I2c_Init/I2c_IsReady/I2c_SetDevice/I2c_GetDevice` + `I2c_EvIrqHandler/I2c_ErIrqHandler`；
+  `I2c_Submit/GetPhase/GetResult/Process` 改为文件内 static；同步包装 `I2c_Write/Read/WriteRead`
+  与只被测试使用的 `I2c_IsBusy` 删除；`I2C_HOST_TEST` 替身机制随测试一起移除。
+* **等价性做法（无逻辑漂移的证明）**：把 `git HEAD`（折叠前）的 4 个文件导出到临时目录，
+  用同一个折叠脚本生成结果，与工作树里的折叠结果**逐字节比较 → 完全一致**
+  （`ms5837.c` 62153 B、`ms5837.h` 18509 B 两侧相同）；因此折叠只改了文件组织，没有改任何逻辑。
+* 折叠后 ARM 交叉编译 `arm-none-eabi-gcc -mcpu=cortex-m7 -Werror` → exit 0（text 5916 / data 193 / bss 24），
+  目标文件里仍有 `I2C3_EV_IRQHandler`、`I2C3_ER_IRQHandler`、4 个 HAL 回调、`I2c_Init`、`Ms5837_Init`。
+* 主机测试（31 个用例）与参考向量表、生成脚本、跑测脚本**已删除**；如需要可用
+  `git show 2e51f45:tests/ms5837_host_test.c` 等从历史取回（该提交保留了折叠前的完整测试）。
+* 并入主分支只需：新增 2 个文件；删掉 `Core/Src/sensor_board.c:3` 与 `tests/sensor_service_host_test.c:3`
+  的 `#include "sensor_i2c_bus.h"`；删掉根 `CMakeLists.txt:56` 的 `Core/Src/sensor_i2c_bus.c`。
 
 ## 6. 提交
 

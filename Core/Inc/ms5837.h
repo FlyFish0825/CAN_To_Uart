@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include "stm32h7xx_hal.h" /* I2C 句柄类型与 HAL 回调声明所需 */
 
 /*
  * TE MS5837 防水压力/深度传感器驱动（I2C3, PA8=SCL, PC9=SDA, 7 位地址 0x76）。
@@ -310,6 +311,66 @@ uint8_t Ms5837_Compensate(uint8_t model,
                           uint32_t d2,
                           int64_t *pressure_raw,
                           int32_t *temperature_centi_c);
+
+
+/* ---------------------------------------------------------------- I2C 事务层接口
+ *
+ * 原 sensor_i2c_bus.h 已并入本文件。集成方只需要：
+ *   1) 自己完成 I2C3 的 CubeMX/HAL 初始化（本模块不定义 MX_I2C3_Init）；
+ *   2) 调用一次 I2c_Init(&hi2c3) 把句柄交给本模块（内部按实例使能 EV/ER 中断）；
+ *   3) 主循环调用 Ms5837_Process()（内部已包含事务超时推进，无需另外调用轮询函数）。
+ *
+ * I2C3_EV_IRQHandler / I2C3_ER_IRQHandler 由本文件提供；若集成方用 CubeMX 生成 i2c.c
+ * 并自带这两个函数，请把 I2C_BUS_DEFINE_IRQ_HANDLERS 置 0，并在生成的函数里调用
+ * I2c_EvIrqHandler() / I2c_ErIrqHandler()，否则会重复定义。
+ */
+#define I2C_BUS_DEFAULT_TIMEOUT_MS 5U /* 未显式指定时单次事务的默认超时。 */
+#define I2C_BUS_MAX_TIMEOUT_MS     50U /* 单次事务允许的最大超时上限。 */
+#define I2C_BUS_MAX_TRANSFER       16U /* 一次事务允许的最大字节数。 */
+#define I2C_BUS_MS5837_ADDRESS7    0x76U /* MS5837 的 7 位地址（HAL 写地址 0xEC）。 */
+
+#ifndef I2C_BUS_DEFINE_IRQ_HANDLERS
+#define I2C_BUS_DEFINE_IRQ_HANDLERS 1 /* 是否由本文件提供 I2Cx_EV/ER_IRQHandler。 */
+#endif
+#ifndef I2C_BUS_IRQ_PRIORITY
+#define I2C_BUS_IRQ_PRIORITY 5U /* 低于 FDCAN(2)/DMA(3)/USART1(4)，可按系统策略调整。 */
+#endif
+#ifndef I2C_BUS_ENABLE_NVIC
+#define I2C_BUS_ENABLE_NVIC 1 /* 是否由 I2c_Init() 使能对应 I2C 的 EV/ER 中断。 */
+#endif
+
+/* 事务结果。PARAM/NOT_READY 表示调用方式错误，其余来自 HAL 状态。 */
+typedef enum
+{
+  I2C_BUS_OK = 0, /* 事务完成。 */
+  I2C_BUS_NOT_READY, /* 尚未绑定 I2C 句柄。 */
+  I2C_BUS_PARAM, /* 地址、长度或缓冲区非法。 */
+  I2C_BUS_BUSY, /* 总线被占用。 */
+  I2C_BUS_TIMEOUT, /* 事务在超时时间内未完成。 */
+  I2C_BUS_ERROR /* NACK、仲裁丢失等总线错误。 */
+} I2cBusResult_t;
+
+/** @brief 绑定 HAL I2C 句柄（传 NULL 卸载），并按实例使能 EV/ER 中断。 */
+void I2c_Init(I2C_HandleTypeDef *handle);
+
+/** @brief 是否已绑定句柄。 */
+uint8_t I2c_IsReady(void);
+
+/** @brief 设置当前 7 位从地址，合法范围 0x08~0x77。 */
+I2cBusResult_t I2c_SetDevice(uint8_t address7);
+
+/** @brief 读取当前 7 位从地址。 */
+uint8_t I2c_GetDevice(void);
+
+/** @brief 中断服务转发入口（供集成方自己的中断服务函数调用）。 */
+void I2c_EvIrqHandler(void);
+void I2c_ErIrqHandler(void);
+
+/* 本模块实现的 HAL 完成/错误回调（HAL 里是 __weak，这里提供实现）。 */
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c);
+void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c);
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c);
+void HAL_I2C_AbortCpltCallback(I2C_HandleTypeDef *hi2c);
 
 #ifdef __cplusplus
 }
