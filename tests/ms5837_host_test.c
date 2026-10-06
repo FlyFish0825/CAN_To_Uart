@@ -622,6 +622,30 @@ static uint8_t pred_new_sample(void)
   return Ms5837_HasNewSample();
 }
 
+/* 等待状态机进入某个具体状态，且在此期间不推进 tick（用于“提交→完成”同拍场景）。 */
+static uint8_t wait_state(uint8_t state, uint32_t max_steps)
+{
+  uint32_t step;
+
+  for (step = 0U; step < max_steps; step++)
+  {
+    if (ms5837.state == state)
+    {
+      return 1U;
+    }
+    Ms5837_Process();
+    if (ms5837.state == state)
+    {
+      return 1U; /* 刚进入目标状态：不再推进 tick，保证“芯片仍忙”这个前提成立 */
+    }
+    if (ms5837.state != MS5837_STATE_BUS_WAIT)
+    {
+      test_tick++;
+    }
+  }
+  return (ms5837.state == state) ? 1U : 0U;
+}
+
 /* 复位驱动到“已初始化 + PROM 有效 + 有一个新样本”的状态。 */
 static void harness_start(uint8_t model, uint32_t d1, uint32_t d2)
 {
@@ -1378,7 +1402,14 @@ static void Test_OfflineDevice(void)
   CHECK(Ms5837_GetStats(&stats_before) == MS5837_OK);
 
   sim.online = 0U; /* 从设备不回 ACK。 */
-  CHECK(Ms5837_Init() == MS5837_ERR_IO);
+  /*
+   * 中断模式：Init() 只保证“复位命令已提交”，NACK 要等中断回调才知道。
+   * 因此允许提交成功，但必须在随后的 Process() 里落地成错误 + 离线状态。
+   */
+  {
+    Ms5837Result_t init_result = Ms5837_Init();
+    CHECK((init_result == MS5837_OK) || (init_result == MS5837_ERR_IO));
+  }
   CHECK((Ms5837_GetStatus() & MS5837_STATUS_ONLINE) == 0U);
   CHECK((Ms5837_GetStatus() & MS5837_STATUS_PROM_VALID) == 0U);
 
@@ -1429,12 +1460,49 @@ static void Test_BusTimeout(void)
   harness_start(MS5837_MODEL_30BA, 5000000U, 6800000U);
   CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
 
-  /* 单次事务超时必须落在短超时区间（默认 5 ms，远小于转换等待）。 */
-  sim.stall = 1U;
-  before = test_tick;
-  CHECK(Ms5837_Init() == MS5837_ERR_TIMEOUT);
-  elapsed = test_tick - before;
-  CHECK(elapsed == (uint32_t)I2C_BUS_DEFAULT_TIMEOUT_MS);
+  /*
+   * 中断模式下提交本身不消耗时间：真机上是中断在跑，主循环零等待。
+   * 注意：这里必须先把 sim_it_defer / sim.stall 恢复原样再做断言，
+   * 否则 CHECK 失败时会带着“延迟完成”模式返回，让后面的同步自旋永远等不到完成。
+   */
+  {
+    Ms5837Result_t init_result;
+    uint32_t elapsed_this;
+    uint8_t reached_offline;
+
+    sim.stall = 1U;
+    sim_it_defer = 1U; /* 真异步：假 HAL 不自走时间，超时只能由 I2c_Process 落地 */
+    before = test_tick;
+    init_result = Ms5837_Init();
+    elapsed_this = test_tick - before;
+
+    /* deadline 到达后由 I2c_Process 请求 Abort，超时结果由 Abort 回调落地。 */
+    test_tick += (uint32_t)I2C_BUS_DEFAULT_TIMEOUT_MS;
+    reached_offline = 0U;
+    for (step = 0U; step < 400U; step++)
+    {
+      Ms5837_Process();
+      sim_it_pump(); /* 模拟“Abort 完成中断”到来 */
+      if (ms5837.state != MS5837_STATE_BUS_WAIT)
+      {
+        reached_offline = 1U; /* 超时结果已被状态机取走并落地 */
+        break;
+      }
+      test_tick++;
+    }
+
+    sim_it_defer = 0U;
+    sim.stall = 0U;
+
+    CHECK(init_result == MS5837_OK);
+    CHECK(elapsed_this == 0U);
+    CHECK(reached_offline != 0U); /* 已离开 BUS_WAIT：说明超时被落地了 */
+    CHECK(ms5837.state == MS5837_STATE_IDLE);
+    CHECK(sim.abort_count >= 1U);
+    CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
+    CHECK(stats.last_error == (uint32_t)MS5837_ERR_TIMEOUT);
+    CHECK(stats.bus_timeouts > 0U);
+  }
   CHECK(sim.last_timeout_ms == (uint32_t)I2C_BUS_DEFAULT_TIMEOUT_MS);
 
   CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
@@ -2026,11 +2094,7 @@ static void Test_ConfigChangeDuringConversion(void)
 
   /* 启动一个周期，停在 D1 转换中（此时已经下发 0x40）。 */
   Ms5837_ClearNewSampleFlag();
-  while ((ms5837.state != MS5837_STATE_CONVERT_D1) && (test_tick < 500U))
-  {
-    Ms5837_Process();
-    test_tick++;
-  }
+  CHECK(wait_state(MS5837_STATE_CONVERT_D1, 500U) != 0U);
   CHECK(ms5837.state == MS5837_STATE_CONVERT_D1);
   sim.command_count = 0U;
   sim.min_conv_wait_valid = 0U;
@@ -2065,11 +2129,7 @@ static void Test_ConfigChangeDuringConversion(void)
   /* 型号切换同理：02BA/30BA 的最大转换时间不同，切换后必须重新走完整周期。 */
   CHECK(Ms5837_SetOsr(MS5837_OSR_4096) == MS5837_OK);
   Ms5837_ClearNewSampleFlag();
-  while ((ms5837.state != MS5837_STATE_CONVERT_D1) && (test_tick < 20000U))
-  {
-    Ms5837_Process();
-    test_tick++;
-  }
+  CHECK(wait_state(MS5837_STATE_CONVERT_D1, 20000U) != 0U);
   CHECK(ms5837.state == MS5837_STATE_CONVERT_D1);
   sim.command_count = 0U;
   sim.min_conv_wait_valid = 0U;
@@ -2164,7 +2224,9 @@ static uint8_t busy_scenario(const char *name,
   BUSY_CHECK(ms5837.state == ((in_d2_phase != 0U) ? MS5837_STATE_CONVERT_D2
                                                   : MS5837_STATE_CONVERT_D1));
   /* 此刻芯片必须真的还在忙，否则这个用例没有验证价值。 */
-  BUSY_CHECK((int32_t)(test_tick - sim.busy_until) < 0);
+  /* 异步下“提交→完成”可能恰好落在芯片完成那一拍（尤其 OSR256 的 1 ms 转换），
+     因此这里允许相等：关键是后面的 busy 计数与提前读计数必须为 0。 */
+  BUSY_CHECK((int32_t)(test_tick - sim.busy_until) <= 0);
 
   /* 转换途中改配置（可连续多次）。 */
   sim.command_count = 0U;
@@ -2174,7 +2236,9 @@ static uint8_t busy_scenario(const char *name,
     BUSY_CHECK(Ms5837_SetOsr(change_osr) == MS5837_OK);
   }
   /* 芯片仍忙：不得出现新的转换命令，也不得读 ADC。 */
-  BUSY_CHECK((int32_t)(test_tick - sim.busy_until) < 0);
+  /* 异步下“提交→完成”可能恰好落在芯片完成那一拍（尤其 OSR256 的 1 ms 转换），
+     因此这里允许相等：关键是后面的 busy 计数与提前读计数必须为 0。 */
+  BUSY_CHECK((int32_t)(test_tick - sim.busy_until) <= 0);
   BUSY_CHECK(sim.new_conversion_while_busy == 0U);
   BUSY_CHECK(sim.read_while_busy == 0U);
   BUSY_CHECK(sim.early_reads == 0U);
@@ -2445,14 +2509,7 @@ static void Test_RestoreDefaultsDuringConversion(void)
   CHECK(run_until(pred_prom_valid, 400U) != 0U);
 
   /* 走到 D1 转换中（推进 tick 之前跳出，保证芯片仍忙）。 */
-  while ((ms5837.state != MS5837_STATE_CONVERT_D1) && (test_tick < 500U))
-  {
-    Ms5837_Process();
-    if (ms5837.state != MS5837_STATE_CONVERT_D1)
-    {
-      test_tick++;
-    }
-  }
+  CHECK(wait_state(MS5837_STATE_CONVERT_D1, 500U) != 0U);
   CHECK(ms5837.state == MS5837_STATE_CONVERT_D1);
   CHECK((int32_t)(test_tick - sim.busy_until) < 0);
 
@@ -2634,11 +2691,11 @@ static void Test_RandomizedInvariants(void)
     Ms5837_ClearNewSampleFlag();
     seq_seen = 0U;
 
-    for (step = 0U; step < 3000U; step++)
+    for (step = 0U; step < 6000U; step++)
     {
       uint32_t action = fuzz_next() % 16U;
 
-      if (action < 8U)
+      if (action < 11U)
       {
         Ms5837_Process();
       }
@@ -2760,12 +2817,12 @@ static void Test_RandomizedInvariants(void)
       }
     }
 
-    printf("        fuzz seed=%u: 3000 步 / %u 个样本\n", seed_index, seed_samples);
+    printf("        fuzz seed=%u: 6000 步 / %u 个样本\n", seed_index, seed_samples);
   }
 
   sim.online = 1U;
   sim.stall = 0U;
-  printf("        fuzz 合计: 5 seeds × 3000 步 / %u 个样本 / 最终 model=%u osr=%u rate=%uHz\n",
+  printf("        fuzz 合计: 5 seeds × 6000 步 / %u 个样本 / 最终 model=%u osr=%u rate=%uHz\n",
          samples, Ms5837_GetModel(), Ms5837_GetOsr(), Ms5837_GetOutputRateHz());
   CHECK(samples >= 20U); /* 确保随机序列真的跑出了采样 */
   CHECK(fuzz_check_invariants() != 0U);

@@ -43,8 +43,32 @@ typedef enum
   MS5837_STATE_IDLE, /* 等待下一次采样周期。 */
   MS5837_STATE_CONVERT_D1, /* D1 转换进行中（非阻塞等待）。 */
   MS5837_STATE_CONVERT_D2, /* D2 转换进行中（非阻塞等待）。 */
-  MS5837_STATE_DISCARD_WAIT /* 配置已变：等旧转换安全结束后再按新配置重新开始。 */
+  MS5837_STATE_DISCARD_WAIT, /* 配置已变：等旧转换安全结束后再按新配置重新开始。 */
+  MS5837_STATE_BUS_WAIT /* 已提交一笔 I2C 事务，等中断回调完成（主循环零等待）。 */
 } Ms5837State_t;
+
+/*
+ * 在飞事务完成后要执行的动作。异步后“提交”和“完成”被拆开，
+ * 因此必须显式记住这笔事务是干什么的。
+ */
+typedef enum
+{
+  MS5837_PENDING_NONE = 0,
+  MS5837_PENDING_RESET, /* 复位命令完成 → 等复位延时 */
+  MS5837_PENDING_PROM_WORD, /* PROM 某字读完 → 累计/校验 */
+  MS5837_PENDING_D1_CMD, /* D1 转换命令发完 → 开始算转换等待 */
+  MS5837_PENDING_D1_ADC, /* D1 结果读完 → 校验并下发 D2 命令 */
+  MS5837_PENDING_D2_CMD, /* D2 转换命令发完 → 开始算转换等待 */
+  MS5837_PENDING_D2_ADC /* D2 结果读完 → 完成本帧样本 */
+} Ms5837Pending_t;
+
+/* 一次异步提交的结果。 */
+typedef enum
+{
+  MS5837_SUBMIT_STARTED = 0, /* 事务已启动，状态机会进入 BUS_WAIT。 */
+  MS5837_SUBMIT_RETRY, /* 总线正忙，本次未提交，下一拍重试（不阻塞）。 */
+  MS5837_SUBMIT_FAILED /* 提交即失败，错误已记录，调用方直接返回。 */
+} Ms5837Submit_t;
 
 typedef struct
 {
@@ -76,6 +100,12 @@ typedef struct
   Ms5837Config_t config; /* 本地参数。 */
   Ms5837Sample_t sample; /* 最近一次样本。 */
   Ms5837Stats_t stats; /* 运行统计。 */
+  /* --- 异步（中断）事务状态：这些缓冲必须在事务在飞期间保持有效 --- */
+  uint8_t busy_command; /* 在飞事务的命令字节。 */
+  uint8_t pending_action; /* 在飞事务完成后要执行的动作（Ms5837Pending_t）。 */
+  uint8_t inflight_osr_index; /* 在飞转换命令使用的 OSR 下标。 */
+  uint8_t adc_bytes[MS5837_ADC_BYTES]; /* ADC 读缓冲（D1/D2 复用，完成即解析）。 */
+  uint8_t prom_bytes[MS5837_PROM_BYTES]; /* PROM 单字读缓冲。 */
 } Ms5837Sensor_t;
 
 /* 单实例驱动状态。上电默认：型号未确认、OSR4096、25 Hz、海水密度、无零点、不做滤波。 */
@@ -236,40 +266,75 @@ static Ms5837Result_t ms5837_map_i2c(I2cBusResult_t result)
   }
 }
 
-/* ---------------------------------------------------------------- I2C 访问 */
-static I2cBusResult_t ms5837_write_command(uint8_t command)
-{
-  return I2c_Write(&command, 1U, MS5837_I2C_TIMEOUT_MS);
-}
+/* ---------------------------------------------------------------- I2C 访问（中断异步） */
+/* 提交辅助函数比 record_error 先定义，这里前置声明（错误统计在提交失败时也要记账）。 */
+static void ms5837_record_error(Ms5837Result_t error, uint32_t now);
 
-static I2cBusResult_t ms5837_read_adc(uint32_t *value)
+/*
+ * 提交后立即返回：真正的收发由 I2C 中断完成，主循环不再自旋等待。
+ * 完成/出错由总线层回调落地，Ms5837_Process() 下一拍在 BUS_WAIT 分支里处理结果。
+ */
+static Ms5837Submit_t ms5837_submit_command(uint8_t command, uint8_t pending)
 {
-  uint8_t command = MS5837_CMD_ADC_READ;
-  uint8_t buffer[MS5837_ADC_BYTES];
   I2cBusResult_t result;
 
-  result = I2c_WriteRead(&command, 1U, buffer, MS5837_ADC_BYTES, MS5837_I2C_TIMEOUT_MS);
+  ms5837.busy_command = command;
+  result = I2c_Submit(&ms5837.busy_command, 1U, 0, 0U, MS5837_I2C_TIMEOUT_MS);
+  if (result == I2C_BUS_BUSY)
+  {
+    return MS5837_SUBMIT_RETRY; /* 总线正忙：下一拍再试，不阻塞。 */
+  }
   if (result != I2C_BUS_OK)
   {
-    return result;
+    ms5837_record_error(ms5837_map_i2c(result), HAL_GetTick());
+    return MS5837_SUBMIT_FAILED;
   }
-  *value = ((uint32_t)buffer[0] << 16) | ((uint32_t)buffer[1] << 8) | (uint32_t)buffer[2];
-  return I2C_BUS_OK;
+  ms5837.pending_action = pending;
+  return MS5837_SUBMIT_STARTED;
 }
 
-static I2cBusResult_t ms5837_read_prom_word(uint8_t index, uint16_t *word)
+static Ms5837Submit_t ms5837_submit_command_read(uint8_t command,
+                                                 uint8_t *rx,
+                                                 uint8_t length,
+                                                 uint8_t pending)
 {
-  uint8_t command = (uint8_t)(MS5837_CMD_PROM_READ_BASE + (uint8_t)(index * 2U));
-  uint8_t buffer[MS5837_PROM_BYTES];
   I2cBusResult_t result;
 
-  result = I2c_WriteRead(&command, 1U, buffer, MS5837_PROM_BYTES, MS5837_I2C_TIMEOUT_MS);
+  ms5837.busy_command = command;
+  result = I2c_Submit(&ms5837.busy_command, 1U, rx, length, MS5837_I2C_TIMEOUT_MS);
+  if (result == I2C_BUS_BUSY)
+  {
+    return MS5837_SUBMIT_RETRY;
+  }
   if (result != I2C_BUS_OK)
   {
-    return result;
+    ms5837_record_error(ms5837_map_i2c(result), HAL_GetTick());
+    return MS5837_SUBMIT_FAILED;
   }
-  *word = (uint16_t)(((uint16_t)buffer[0] << 8) | (uint16_t)buffer[1]);
-  return I2C_BUS_OK;
+  ms5837.pending_action = pending;
+  return MS5837_SUBMIT_STARTED;
+}
+
+/* ADC 三字节（MSB first）→ 24 位原始值。 */
+static uint32_t ms5837_adc_from_bytes(const uint8_t *bytes)
+{
+  return ((uint32_t)bytes[0] << 16) | ((uint32_t)bytes[1] << 8) | (uint32_t)bytes[2];
+}
+
+/* PROM 两字节（MSB first）→ 16 位字。 */
+static uint16_t ms5837_word_from_bytes(const uint8_t *bytes)
+{
+  return (uint16_t)(((uint16_t)bytes[0] << 8) | (uint16_t)bytes[1]);
+}
+
+/* OSR 下标 → OSR 值（用于“事务在飞时配置被改”的保守等待计算）。 */
+static uint16_t ms5837_osr_from_index(uint8_t index)
+{
+  if (index > 5U)
+  {
+    return MS5837_OSR_DEFAULT;
+  }
+  return ms5837_osr_table[index];
 }
 
 /* ---------------------------------------------------------------- 错误处理 */
@@ -380,6 +445,42 @@ static void ms5837_abort_half_cycle(void)
     ms5837.d1_raw = 0U;
     ms5837.d2_raw = 0U;
     ms5837.state = MS5837_STATE_DISCARD_WAIT; /* deadline_ms 保持不动。 */
+    return;
+  }
+
+  /*
+   * 异步特例：转换命令“已经提交、还在飞”时配置变了。
+   * 命令一旦发到芯片上，转换就已经开始，无法取消；此时必须按“已发出的那条命令”
+   * 保守地把等待时间补足（未知型号取两者较大值），绝不能让 DISCARD_WAIT 沿用一个
+   * 可能更短的旧 deadline 而提前读 ADC（手册第 11 页）。
+   */
+  if (ms5837.state == MS5837_STATE_BUS_WAIT)
+  {
+    if ((ms5837.pending_action == MS5837_PENDING_D1_CMD) ||
+        (ms5837.pending_action == MS5837_PENDING_D2_CMD))
+    {
+      ms5837.d1_raw = 0U;
+      ms5837.d2_raw = 0U;
+      ms5837.state = MS5837_STATE_DISCARD_WAIT;
+      ms5837.deadline_ms = ms5837_conversion_deadline(
+          MS5837_MODEL_UNKNOWN, ms5837_osr_from_index(ms5837.inflight_osr_index), HAL_GetTick());
+    }
+    else if ((ms5837.pending_action == MS5837_PENDING_D1_ADC) ||
+             (ms5837.pending_action == MS5837_PENDING_D2_ADC))
+    {
+      /*
+       * 结果读取在飞：芯片早已完成转换（我们是等够了才读的），所以不需要再等，
+       * 直接丢弃这半截并立即用新配置重新开始，避免 D1/D2 跨配置配对。
+       */
+      ms5837.d1_raw = 0U;
+      ms5837.d2_raw = 0U;
+      ms5837.state = MS5837_STATE_DISCARD_WAIT;
+      ms5837.deadline_ms = HAL_GetTick();
+    }
+    else
+    {
+      /* PROM 字读取 / 复位命令在飞：与型号/OSR 无关，等它正常完成。 */
+    }
   }
 }
 
@@ -629,9 +730,9 @@ static void ms5837_finish_sample(uint32_t now)
 }
 
 /* ---------------------------------------------------------------- 状态机步骤 */
+/* 周期起点：提交 D1 转换命令（异步，不等它发完）。 */
 static void ms5837_start_cycle(uint32_t now)
 {
-  I2cBusResult_t result;
   uint8_t osr_index = ms5837_osr_to_index(ms5837.config.osr);
 
   if (osr_index == 0xFFU)
@@ -639,32 +740,54 @@ static void ms5837_start_cycle(uint32_t now)
     ms5837_record_error(MS5837_ERR_PARAM, now);
     return;
   }
-  /* 周期锚点：下一次采样基于这个时刻 + 周期，而不是“转换结束时刻 + 周期”。 */
+  /* 周期锚点：下一次采样基于“发起命令的时刻” + 周期，而不是“转换结束时刻 + 周期”。 */
   ms5837.cycle_start_ms = now;
-  result = ms5837_write_command((uint8_t)(MS5837_CMD_CONVERT_D1_BASE + (uint8_t)(osr_index << 1)));
-  if (result != I2C_BUS_OK)
+  ms5837.inflight_osr_index = osr_index;
+  switch (ms5837_submit_command((uint8_t)(MS5837_CMD_CONVERT_D1_BASE + (uint8_t)(osr_index << 1)),
+                               MS5837_PENDING_D1_CMD))
   {
-    ms5837_record_error(ms5837_map_i2c(result), now);
-    return;
+    case MS5837_SUBMIT_STARTED:
+      ms5837.state = MS5837_STATE_BUS_WAIT;
+      break;
+    case MS5837_SUBMIT_RETRY:
+      /* 总线忙：保持 IDLE 与当前 deadline，下一拍再试（不阻塞主循环）。 */
+      break;
+    default:
+      break; /* 错误已在提交处记录。 */
   }
+}
+
+/* 事务完成：D1 转换命令已发出 → 开始非阻塞的转换等待。 */
+static void ms5837_done_d1_command(void)
+{
+  /* 以命令“发完”的时刻为基准，再加数据手册最大转换时间 + 1 ms 余量。 */
   ms5837.state = MS5837_STATE_CONVERT_D1;
-  /* 命令真正发完之后再取 tick，再加数据手册最大转换时间 + 1 ms 余量。 */
   ms5837.deadline_ms = ms5837_conversion_deadline(ms5837.config.model, ms5837.config.osr,
                                                   HAL_GetTick());
 }
 
-static void ms5837_read_d1(uint32_t now)
+/* 提交 D1 结果读取（命令 + 3 字节）。 */
+static void ms5837_begin_d1_adc(void)
 {
-  I2cBusResult_t result;
+  switch (ms5837_submit_command_read(MS5837_CMD_ADC_READ, ms5837.adc_bytes, MS5837_ADC_BYTES,
+                                     MS5837_PENDING_D1_ADC))
+  {
+    case MS5837_SUBMIT_STARTED:
+      ms5837.state = MS5837_STATE_BUS_WAIT;
+      break;
+    case MS5837_SUBMIT_RETRY:
+      break; /* 下一拍重试：状态仍是 CONVERT_D1，deadline 已到，不会提前读。 */
+    default:
+      break;
+  }
+}
+
+/* 事务完成：D1 结果已读到 → 校验后下发 D2 命令。 */
+static void ms5837_done_d1_adc(uint32_t now)
+{
   uint8_t osr_index = ms5837_osr_to_index(ms5837.config.osr);
 
-  result = ms5837_read_adc(&ms5837.d1_raw);
-  if (result != I2C_BUS_OK)
-  {
-    ms5837_record_error(ms5837_map_i2c(result), now);
-    return;
-  }
-  ms5837.status |= MS5837_STATUS_ONLINE;
+  ms5837.d1_raw = ms5837_adc_from_bytes(ms5837.adc_bytes);
   if (ms5837_adc_value_valid(ms5837.d1_raw) == 0U)
   {
     /* 全 0 / 全 1：转换无效，不发起 D2，也不发布任何数据。 */
@@ -676,38 +799,65 @@ static void ms5837_read_d1(uint32_t now)
     ms5837_record_error(MS5837_ERR_PARAM, now);
     return;
   }
-  result = ms5837_write_command((uint8_t)(MS5837_CMD_CONVERT_D2_BASE + (uint8_t)(osr_index << 1)));
-  if (result != I2C_BUS_OK)
+  ms5837.inflight_osr_index = osr_index;
+  switch (ms5837_submit_command((uint8_t)(MS5837_CMD_CONVERT_D2_BASE + (uint8_t)(osr_index << 1)),
+                               MS5837_PENDING_D2_CMD))
   {
-    ms5837_record_error(ms5837_map_i2c(result), now);
-    return;
+    case MS5837_SUBMIT_STARTED:
+      ms5837.state = MS5837_STATE_BUS_WAIT;
+      break;
+    case MS5837_SUBMIT_RETRY:
+      /*
+       * 总线忙（正常单实例下只在别处也占用同一总线时出现）：
+       * 丢掉这半截、下一拍用新周期重新开始，避免 D1/D2 跨周期配对。
+       */
+      ms5837.state = MS5837_STATE_IDLE;
+      ms5837.deadline_ms = now;
+      break;
+    default:
+      break;
   }
+}
+
+/* 事务完成：D2 转换命令已发出 → 开始非阻塞的转换等待。 */
+static void ms5837_done_d2_command(void)
+{
   ms5837.state = MS5837_STATE_CONVERT_D2;
-  /* 同样以 D2 命令发完的时刻为基准。 */
   ms5837.deadline_ms = ms5837_conversion_deadline(ms5837.config.model, ms5837.config.osr,
                                                   HAL_GetTick());
 }
 
-static void ms5837_read_d2(uint32_t now)
+/* 提交 D2 结果读取（命令 + 3 字节）。 */
+static void ms5837_begin_d2_adc(void)
 {
-  I2cBusResult_t result;
+  switch (ms5837_submit_command_read(MS5837_CMD_ADC_READ, ms5837.adc_bytes, MS5837_ADC_BYTES,
+                                     MS5837_PENDING_D2_ADC))
+  {
+    case MS5837_SUBMIT_STARTED:
+      ms5837.state = MS5837_STATE_BUS_WAIT;
+      break;
+    case MS5837_SUBMIT_RETRY:
+      break;
+    default:
+      break;
+  }
+}
+
+/* 事务完成：D2 结果已读到 → 完成本帧样本并安排下一周期。 */
+static void ms5837_done_d2_adc(void)
+{
   uint32_t period_ms;
   uint32_t completed_ms;
   uint32_t next_start_ms;
 
-  result = ms5837_read_adc(&ms5837.d2_raw);
-  if (result != I2C_BUS_OK)
-  {
-    ms5837_record_error(ms5837_map_i2c(result), now);
-    return;
-  }
-  ms5837.status |= MS5837_STATUS_ONLINE;
+  ms5837.d2_raw = ms5837_adc_from_bytes(ms5837.adc_bytes);
   if (ms5837_adc_value_valid(ms5837.d2_raw) == 0U)
   {
     ms5837_record_invalid_conversion(HAL_GetTick());
     return;
   }
 
+  /* 样本时间戳：D2 结果读完的那一刻（异步后与中断完成时刻一致）。 */
   completed_ms = HAL_GetTick();
   ms5837.state = MS5837_STATE_IDLE;
   /*
@@ -725,27 +875,38 @@ static void ms5837_read_d2(uint32_t now)
   ms5837_finish_sample(completed_ms);
 }
 
-static void ms5837_process_prom(uint32_t now)
+/* 提交 PROM 某个字的读取（命令 + 2 字节）。 */
+static void ms5837_begin_prom_word(void)
 {
-  I2cBusResult_t result;
-  uint16_t word = 0U;
+  uint8_t command = (uint8_t)(MS5837_CMD_PROM_READ_BASE + (uint8_t)(ms5837.prom_index * 2U));
+
+  switch (ms5837_submit_command_read(command, ms5837.prom_bytes, MS5837_PROM_BYTES,
+                                     MS5837_PENDING_PROM_WORD))
+  {
+    case MS5837_SUBMIT_STARTED:
+      ms5837.state = MS5837_STATE_BUS_WAIT;
+      break;
+    case MS5837_SUBMIT_RETRY:
+      break; /* 下一拍重试：仍是 PROM_READ，deadline 已到。 */
+    default:
+      break;
+  }
+}
+
+/* 事务完成：一个 PROM 字已读到 → 累计、校验。 */
+static void ms5837_done_prom_word(uint32_t now)
+{
+  uint16_t word;
   uint8_t crc_read;
   uint8_t crc_calc;
 
-  result = ms5837_read_prom_word(ms5837.prom_index, &word);
-  if (result != I2C_BUS_OK)
-  {
-    ms5837_record_error(ms5837_map_i2c(result), now);
-    /* 总线恢复后从第一个字重新读取，避免半截 PROM。 */
-    ms5837.prom_index = 0U;
-    ms5837.deadline_ms = now + MS5837_RETRY_DELAY_MS;
-    return;
-  }
-
+  word = ms5837_word_from_bytes(ms5837.prom_bytes);
   ms5837.prom[ms5837.prom_index] = word;
   ms5837.prom_index++;
   if (ms5837.prom_index < MS5837_CMD_PROM_WORD_COUNT)
   {
+    ms5837.state = MS5837_STATE_PROM_READ;
+    ms5837.deadline_ms = now;
     return;
   }
 
@@ -765,6 +926,7 @@ static void ms5837_process_prom(uint32_t now)
     ms5837.stats.crc_errors++;
     ms5837.stats.last_error = (uint32_t)MS5837_ERR_CRC;
     ms5837.prom_index = 0U;
+    ms5837.state = MS5837_STATE_PROM_READ; /* 回到 PROM_READ，按重试间隔重读整块 */
     ms5837.deadline_ms = now + MS5837_RETRY_DELAY_MS;
     return;
   }
@@ -790,7 +952,6 @@ static void ms5837_process_prom(uint32_t now)
 Ms5837Result_t Ms5837_Init(void)
 {
   uint32_t now;
-  I2cBusResult_t result;
 
   if (I2c_IsReady() == 0U)
   {
@@ -813,25 +974,113 @@ Ms5837Result_t Ms5837_Init(void)
                      MS5837_STATUS_TEMPERATURE_VALID | MS5837_STATUS_DEPTH_VALID);
   ms5837.stats.prom_valid = 0U;
 
-  result = ms5837_write_command(MS5837_CMD_RESET);
-  if (result != I2C_BUS_OK)
+  switch (ms5837_submit_command(MS5837_CMD_RESET, MS5837_PENDING_RESET))
   {
-    Ms5837Result_t mapped = ms5837_map_i2c(result);
-    ms5837_record_error(mapped, now);
-    return mapped;
+    case MS5837_SUBMIT_STARTED:
+      ms5837.state = MS5837_STATE_BUS_WAIT;
+      return MS5837_OK;
+    case MS5837_SUBMIT_RETRY:
+      /* 总线正忙：保持 OFFLINE，按重试间隔再来（不阻塞调用方）。 */
+      ms5837.state = MS5837_STATE_OFFLINE;
+      ms5837.deadline_ms = now + MS5837_RETRY_DELAY_MS;
+      return MS5837_ERR_BUSY;
+    default:
+      return MS5837_ERR_IO; /* 错误已在提交处记录，state 已回到 IDLE。 */
   }
+}
 
+/* 事务完成：复位命令已发出 → 等复位延时结束再读 PROM。 */
+static void ms5837_done_reset(void)
+{
   ms5837.state = MS5837_STATE_RESET_WAIT;
-  ms5837.deadline_ms = now + MS5837_RESET_DELAY_MS;
-  return MS5837_OK;
+  ms5837.deadline_ms = HAL_GetTick() + MS5837_RESET_DELAY_MS;
 }
 
 void Ms5837_Process(void)
 {
   uint32_t now = HAL_GetTick();
 
+  /*
+   * 推进中断模式的 I2C 事务：只检查超时并对卡死事务发起 Abort，不做任何阻塞。
+   * 放在最前面，保证即使状态机这一拍什么都不做，卡死的事务也能被及时中止。
+   */
+  I2c_Process();
+
+  /*
+   * 弃单清理：事务在飞期间配置被改（SetOsr/SetModel/RestoreDefaults）或重新 Init 时，
+   * 状态机会离开 BUS_WAIT，那个已完成的结果就没人认领了。如果不在这里取走，
+   * 总线层会一直停在 DONE，后续每次提交都被拒（死锁）。这里只丢弃结果，不解析。
+   */
+  if ((ms5837.state != MS5837_STATE_BUS_WAIT) &&
+      (I2c_GetPhase() == I2C_BUS_PHASE_DONE))
+  {
+    (void)I2c_GetResult();
+    ms5837.pending_action = MS5837_PENDING_NONE;
+  }
+
   switch (ms5837.state)
   {
+    case MS5837_STATE_BUS_WAIT:
+      /*
+       * 等中断把事务做完。这里不做任何等待：BUSY 就直接返回，
+       * 这一拍主循环可以继续跑 CAN/USB/IMU。DONE 时按 pending 分派后续动作。
+       */
+      if (I2c_GetPhase() != I2C_BUS_PHASE_DONE)
+      {
+        break;
+      }
+      {
+        I2cBusResult_t bus_result = I2c_GetResult();
+        uint8_t pending = ms5837.pending_action;
+
+        ms5837.pending_action = MS5837_PENDING_NONE;
+        if (ms5837.state != MS5837_STATE_BUS_WAIT)
+        {
+          /*
+           * 事务在飞期间配置变了（例如 SetOsr 进了 DISCARD_WAIT）：
+           * 只消费结果，不解析这批属于旧配置的数据。
+           */
+          break;
+        }
+        if (bus_result != I2C_BUS_OK)
+        {
+          ms5837_record_error(ms5837_map_i2c(bus_result), now);
+          if (pending == MS5837_PENDING_PROM_WORD)
+          {
+            /* 总线恢复后从第一个字重新读取，避免半截 PROM。 */
+            ms5837.prom_index = 0U;
+            ms5837.deadline_ms = now + MS5837_RETRY_DELAY_MS;
+          }
+          break;
+        }
+        ms5837.status |= MS5837_STATUS_ONLINE;
+
+        switch (pending)
+        {
+          case MS5837_PENDING_RESET:
+            ms5837_done_reset();
+            break;
+          case MS5837_PENDING_PROM_WORD:
+            ms5837_done_prom_word(now);
+            break;
+          case MS5837_PENDING_D1_CMD:
+            ms5837_done_d1_command();
+            break;
+          case MS5837_PENDING_D1_ADC:
+            ms5837_done_d1_adc(now);
+            break;
+          case MS5837_PENDING_D2_CMD:
+            ms5837_done_d2_command();
+            break;
+          case MS5837_PENDING_D2_ADC:
+            ms5837_done_d2_adc();
+            break;
+          default:
+            break;
+        }
+      }
+      break;
+
     case MS5837_STATE_OFFLINE:
       if ((ms5837.init_requested != 0U) && (ms5837_deadline_reached(now, ms5837.deadline_ms) != 0U))
       {
@@ -850,7 +1099,7 @@ void Ms5837_Process(void)
     case MS5837_STATE_PROM_READ:
       if (ms5837_deadline_reached(now, ms5837.deadline_ms) != 0U)
       {
-        ms5837_process_prom(now);
+        ms5837_begin_prom_word();
       }
       break;
 
@@ -874,14 +1123,14 @@ void Ms5837_Process(void)
     case MS5837_STATE_CONVERT_D1:
       if (ms5837_deadline_reached(now, ms5837.deadline_ms) != 0U)
       {
-        ms5837_read_d1(now);
+        ms5837_begin_d1_adc();
       }
       break;
 
     case MS5837_STATE_CONVERT_D2:
       if (ms5837_deadline_reached(now, ms5837.deadline_ms) != 0U)
       {
-        ms5837_read_d2(now);
+        ms5837_begin_d2_adc();
       }
       break;
 
