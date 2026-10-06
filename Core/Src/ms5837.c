@@ -42,7 +42,8 @@ typedef enum
   MS5837_STATE_PROM_READ, /* 逐字读取 PROM。 */
   MS5837_STATE_IDLE, /* 等待下一次采样周期。 */
   MS5837_STATE_CONVERT_D1, /* D1 转换进行中（非阻塞等待）。 */
-  MS5837_STATE_CONVERT_D2 /* D2 转换进行中（非阻塞等待）。 */
+  MS5837_STATE_CONVERT_D2, /* D2 转换进行中（非阻塞等待）。 */
+  MS5837_STATE_DISCARD_WAIT /* 配置已变：等旧转换安全结束后再按新配置重新开始。 */
 } Ms5837State_t;
 
 typedef struct
@@ -343,9 +344,14 @@ static uint8_t ms5837_prom_sane(const uint16_t prom[MS5837_PROM_WORDS])
 /*
  * OSR / 型号变更时丢弃正在进行的半周期。
  *
- * 已发出的转换命令对应的等待时长是按“旧配置”算的；若新配置需要更长的等待，
- * 继续沿用旧 deadline 就会提前读到未完成的转换。这里直接丢掉半周期，
- * 回到 IDLE 并按新配置重新走一遍完整的 D1+D2，绝不中途缩短等待。
+ * 手册第 11 页明确：转换期间芯片一直 busy，
+ *   - “Conversion sequence sent during the already started conversion process will yield incorrect result”，
+ *   - “If the ADC read command is sent during conversion the result will be 0 ... the final result will be wrong”，
+ * 而且新命令并不会取消正在进行的转换。
+ *
+ * 所以这里只丢弃“软件侧”的半周期：保留原 deadline（它是按旧配置算出的、不会更短的等待），
+ * 把状态切到 DISCARD_WAIT；等芯片真正空闲后，再用新配置重新走一遍完整的 D1+D2。
+ * 绝不在这里直接重发 D1/D2，也绝不缩短旧转换的等待。
  */
 static void ms5837_abort_half_cycle(void)
 {
@@ -353,8 +359,7 @@ static void ms5837_abort_half_cycle(void)
   {
     ms5837.d1_raw = 0U;
     ms5837.d2_raw = 0U;
-    ms5837.state = MS5837_STATE_IDLE;
-    ms5837.deadline_ms = HAL_GetTick(); /* 立即用新配置重新开始完整周期。 */
+    ms5837.state = MS5837_STATE_DISCARD_WAIT; /* deadline_ms 保持不动。 */
   }
 }
 
@@ -857,6 +862,22 @@ void Ms5837_Process(void)
       if (ms5837_deadline_reached(now, ms5837.deadline_ms) != 0U)
       {
         ms5837_read_d2(now);
+      }
+      break;
+
+    case MS5837_STATE_DISCARD_WAIT:
+      /*
+       * 旧转换的等待时间已到：芯片不再 busy，可以安全地用新配置重新开始完整周期。
+       * 这一步之前既不重发转换命令，也不读 ADC。
+       */
+      if (ms5837_deadline_reached(now, ms5837.deadline_ms) != 0U)
+      {
+        ms5837.state = MS5837_STATE_IDLE;
+        ms5837.deadline_ms = now;
+        if (ms5837.prom_valid != 0U)
+        {
+          ms5837_start_cycle(now);
+        }
       }
       break;
 

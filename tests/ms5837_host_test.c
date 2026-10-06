@@ -49,6 +49,9 @@ typedef struct
   uint8_t conversion; /* 0 空闲 / 1 D1 / 2 D2。 */
   uint32_t conversion_command_ms; /* 收到转换命令的时刻。 */
   uint32_t conversion_ready_ms; /* 转换完成的时刻。 */
+  uint32_t busy_until; /* 芯片“忙”到什么时候（手册第11页：转换完成前一直 busy）。 */
+  uint32_t new_conversion_while_busy; /* 转换未完成又收到新 D1/D2 的次数（必须为 0）。 */
+  uint32_t read_while_busy; /* 转换未完成就读 ADC 的次数（手册：结果会是 0）。 */
   uint32_t min_conv_wait_ms; /* 观测到的最小“命令→读 ADC”间隔。 */
   uint8_t min_conv_wait_valid; /* 是否已记录过转换等待。 */
   uint32_t tx_time_ms; /* 每次 HAL I2C 事务占用总线的毫秒数（模拟真实事务耗时）。 */
@@ -129,8 +132,20 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
   {
     sim.conversion = 0U;
     sim.read_pending = 0U;
+    sim.busy_until = test_tick; /* 复位后不再忙（手册未给精确等待时间，项目另有保守延时）。 */
     sim.reset_count++;
     return HAL_OK;
+  }
+  if (((command & 0xF0U) == 0x40U) || ((command & 0xF0U) == 0x50U))
+  {
+    /*
+     * 手册第 11 页：转换进行中再发转换命令会得到错误结果（“stays busy until conversion is done”）。
+     * 这里把“旧转换未完成就重发 D1/D2”记成违规，便于回归证明驱动没有提前重发。
+     */
+    if ((int32_t)(test_tick - sim.busy_until) < 0)
+    {
+      sim.new_conversion_while_busy++;
+    }
   }
   if ((command & 0xF0U) == 0x40U) /* D1 转换 */
   {
@@ -142,6 +157,7 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
     sim.conversion = 1U;
     sim.conversion_command_ms = test_tick;
     sim.conversion_ready_ms = test_tick + sim_conversion_ms(sim.model, index);
+    sim.busy_until = sim.conversion_ready_ms;
     return HAL_OK;
   }
   if ((command & 0xF0U) == 0x50U) /* D2 转换 */
@@ -154,6 +170,7 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
     sim.conversion = 2U;
     sim.conversion_command_ms = test_tick;
     sim.conversion_ready_ms = test_tick + sim_conversion_ms(sim.model, index);
+    sim.busy_until = sim.conversion_ready_ms;
     return HAL_OK;
   }
   if ((command & 0xF0U) == 0xA0U) /* PROM 读 */
@@ -173,9 +190,16 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c,
   {
     uint32_t value = (sim.conversion == 1U) ? sim.d1_value : sim.d2_value;
     uint32_t waited;
-    if ((sim.conversion == 0U) || ((int32_t)(test_tick - sim.conversion_ready_ms) < 0))
+    uint8_t busy = ((int32_t)(test_tick - sim.busy_until) < 0) ? 1U : 0U;
+    if ((sim.conversion == 0U) || (busy != 0U))
     {
       sim.early_reads++; /* 转换未完成就被读取：驱动等待时间不足。 */
+    }
+    if (busy != 0U)
+    {
+      /* 手册第 11 页：转换中读 ADC 结果会是 0，且最终结果错误。 */
+      sim.read_while_busy++;
+      value = 0U;
     }
     waited = test_tick - sim.conversion_command_ms;
     if ((sim.min_conv_wait_valid == 0U) || (waited < sim.min_conv_wait_ms))
@@ -253,6 +277,19 @@ static const char *test_current;
   } while (0)
 
 #define TEST_END() printf("[  OK  ] %s\n", test_current)
+
+/* 与 CHECK 相同，但用于返回 uint8_t 的场景辅助函数。 */
+#define BUSY_CHECK(cond)                                                   \
+  do                                                                       \
+  {                                                                        \
+    if (!(cond))                                                           \
+    {                                                                      \
+      printf("[ FAIL ] %s: %s:%d: %s\n", test_current, __FILE__, __LINE__, \
+             #cond);                                                       \
+      test_failures++;                                                     \
+      return 0U;                                                           \
+    }                                                                      \
+  } while (0)
 
 /* ---------------------------------------------------------------- 参考实现与数据 */
 /* 官方算例（30BA）：TE MS5837-30BA 数据手册压力/温度计算示例。 */
@@ -495,6 +532,21 @@ static void Test_Crc4(void)
   }
   masked[7] = 0x1234U;
   CHECK(Ms5837_Crc4(masked) == Ms5837_Crc4(prom_30ba_example));
+
+  /* 计算 CRC 不得破坏调用方保存的原始 PROM（含字 0 高 4 位的原 CRC 与第 8 个软件辅助字）。 */
+  {
+    uint16_t keep[MS5837_PROM_WORDS];
+    uint16_t copy[MS5837_PROM_WORDS];
+    for (index = 0U; index < MS5837_PROM_WORDS; index++)
+    {
+      keep[index] = prom_30ba_example[index];
+    }
+    keep[0] = (uint16_t)(0xA000U | (keep[0] & 0x0FFFU)); /* 高 4 位是芯片给的 CRC */
+    keep[7] = 0x1234U;
+    memcpy(copy, keep, sizeof(copy));
+    (void)Ms5837_Crc4(keep);
+    CHECK(memcmp(copy, keep, sizeof(copy)) == 0);
+  }
   TEST_END();
 }
 
@@ -1856,7 +1908,10 @@ static void Test_ConfigChangeDuringConversion(void)
   sim.min_conv_wait_valid = 0U;
   sim.min_conv_wait_ms = 0U;
   CHECK(Ms5837_SetModel(MS5837_MODEL_02BA) == MS5837_OK);
-  CHECK(ms5837.state == MS5837_STATE_IDLE); /* 半周期被丢弃 */
+  /* 手册第11页：芯片仍 busy，因此只进入 DISCARD_WAIT，绝不能立刻重发转换。 */
+  CHECK(ms5837.state == MS5837_STATE_DISCARD_WAIT);
+  CHECK((int32_t)(test_tick - sim.busy_until) < 0);
+  CHECK(sim.new_conversion_while_busy == 0U);
   Ms5837_ClearNewSampleFlag();
   CHECK(run_until(pred_new_sample, 2000U) != 0U);
   first_d1 = 0U;
@@ -1872,6 +1927,333 @@ static void Test_ConfigChangeDuringConversion(void)
   CHECK(sim.min_conv_wait_ms >= Ms5837_MaxConversionTimeMs(MS5837_MODEL_02BA, MS5837_OSR_4096) +
                                     MS5837_CONVERSION_MARGIN_MS);
   CHECK(sim.early_reads == 0U);
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17h. 芯片 busy 期间不得重发转换（第11页） */
+/*
+ * 手册第 11 页：
+ *  - “If the ADC read command is sent during conversion the result will be 0, the conversion will not stop
+ *     and the final result will be wrong.”
+ *  - “Conversion sequence sent during the already started conversion process will yield incorrect result.”
+ *  - “When command is sent to the system it stays busy until conversion is done.”
+ * 因此“丢弃软件半周期”不能等于“取消芯片正在进行的转换”：改 OSR/型号后必须先等旧转换安全结束，
+ * 再发新的 D1/D2。仿真里 busy_until 表示芯片忙到什么时候，任何提前重发/提前读都会被计数。
+ */
+static uint8_t busy_expected_d1_cmd(uint16_t osr)
+{
+  switch (osr)
+  {
+    case MS5837_OSR_256: return 0x40U;
+    case MS5837_OSR_512: return 0x42U;
+    case MS5837_OSR_1024: return 0x44U;
+    case MS5837_OSR_2048: return 0x46U;
+    case MS5837_OSR_4096: return 0x48U;
+    case MS5837_OSR_8192: return 0x4AU;
+    default: return 0xFFU;
+  }
+}
+
+static uint8_t busy_scenario(const char *name,
+                             uint8_t start_model, uint16_t start_osr,
+                             uint8_t change_model, uint16_t change_osr,
+                             uint8_t in_d2_phase, uint8_t change_count,
+                             uint32_t tick_base)
+{
+  uint32_t index;
+  uint32_t first_d1 = 0U;
+  uint8_t step;
+
+  sim_reset();
+  sim.model = MS5837_MODEL_30BA; /* 物理器件取较慢的一侧，busy 判定更严格。 */
+  sim.d1_value = 5000000U;
+  sim.d2_value = 6981794U;
+  test_tick = tick_base;
+  I2c_Init(&fake_handle);
+  Ms5837_RestoreDefaults();
+  BUSY_CHECK(Ms5837_SetOutputRateHz(10U) == MS5837_OK); /* 10 Hz 周期足够容纳所有 OSR。 */
+  BUSY_CHECK(Ms5837_SetModel(start_model) == MS5837_OK);
+  BUSY_CHECK(Ms5837_SetOsr(start_osr) == MS5837_OK);
+  BUSY_CHECK(Ms5837_Init() == MS5837_OK);
+  BUSY_CHECK(run_until(pred_prom_valid, 400U) != 0U);
+
+  /* 走到目标转换阶段（D1 或 D2）。在推进 tick 之前就跳出，保证芯片此刻真的还在忙。 */
+  Ms5837_ClearNewSampleFlag();
+  step = 0U;
+  while (step < 200U)
+  {
+    Ms5837_Process();
+    if ((in_d2_phase == 0U) && (ms5837.state == MS5837_STATE_CONVERT_D1))
+    {
+      break;
+    }
+    if ((in_d2_phase != 0U) && (ms5837.state == MS5837_STATE_CONVERT_D2))
+    {
+      break;
+    }
+    test_tick++;
+    step++;
+  }
+  BUSY_CHECK(ms5837.state == ((in_d2_phase != 0U) ? MS5837_STATE_CONVERT_D2
+                                                  : MS5837_STATE_CONVERT_D1));
+  /* 此刻芯片必须真的还在忙，否则这个用例没有验证价值。 */
+  BUSY_CHECK((int32_t)(test_tick - sim.busy_until) < 0);
+
+  /* 转换途中改配置（可连续多次）。 */
+  sim.command_count = 0U;
+  for (index = 0U; index < change_count; index++)
+  {
+    BUSY_CHECK(Ms5837_SetModel(change_model) == MS5837_OK);
+    BUSY_CHECK(Ms5837_SetOsr(change_osr) == MS5837_OK);
+  }
+  /* 芯片仍忙：不得出现新的转换命令，也不得读 ADC。 */
+  BUSY_CHECK((int32_t)(test_tick - sim.busy_until) < 0);
+  BUSY_CHECK(sim.new_conversion_while_busy == 0U);
+  BUSY_CHECK(sim.read_while_busy == 0U);
+  BUSY_CHECK(sim.early_reads == 0U);
+
+  /* 旧转换结束后必须能正常出新样本，且第一条转换命令用的是新配置。 */
+  Ms5837_ClearNewSampleFlag();
+  BUSY_CHECK(run_until(pred_new_sample, 4000U) != 0U);
+  BUSY_CHECK(sim.new_conversion_while_busy == 0U);
+  BUSY_CHECK(sim.read_while_busy == 0U);
+  BUSY_CHECK(sim.early_reads == 0U);
+  for (index = 0U; index < sim.command_count; index++)
+  {
+    if ((sim.command_log[index] & 0xF0U) == 0x40U)
+    {
+      first_d1 = sim.command_log[index];
+      break;
+    }
+  }
+  BUSY_CHECK(first_d1 == busy_expected_d1_cmd(change_osr));
+  printf("        %-16s busy重发=%u busy读=%u 提前读=%u 新D1=0x%02X\n", name,
+         sim.new_conversion_while_busy, sim.read_while_busy, sim.early_reads, first_d1);
+  return 1U;
+}
+
+static void Test_BusyDeviceNoEarlyRestart(void)
+{
+  TEST_BEGIN("BusyDeviceNoEarlyRestart");
+
+  if (busy_scenario("D1-8192to256", MS5837_MODEL_30BA, MS5837_OSR_8192,
+                    MS5837_MODEL_30BA, MS5837_OSR_256, 0U, 1U, 0U) == 0U) { return; }
+  if (busy_scenario("D2-8192to256", MS5837_MODEL_30BA, MS5837_OSR_8192,
+                    MS5837_MODEL_30BA, MS5837_OSR_256, 1U, 1U, 0U) == 0U) { return; }
+  if (busy_scenario("D1-256to8192", MS5837_MODEL_30BA, MS5837_OSR_256,
+                    MS5837_MODEL_30BA, MS5837_OSR_8192, 0U, 1U, 0U) == 0U) { return; }
+  if (busy_scenario("D2-256to8192", MS5837_MODEL_30BA, MS5837_OSR_256,
+                    MS5837_MODEL_30BA, MS5837_OSR_8192, 1U, 1U, 0U) == 0U) { return; }
+  if (busy_scenario("D1-30BAto02BA", MS5837_MODEL_30BA, MS5837_OSR_4096,
+                    MS5837_MODEL_02BA, MS5837_OSR_4096, 0U, 1U, 0U) == 0U) { return; }
+  if (busy_scenario("D1-02BAto30BA", MS5837_MODEL_02BA, MS5837_OSR_4096,
+                    MS5837_MODEL_30BA, MS5837_OSR_4096, 0U, 1U, 0U) == 0U) { return; }
+  if (busy_scenario("D1-change-x4", MS5837_MODEL_30BA, MS5837_OSR_8192,
+                    MS5837_MODEL_30BA, MS5837_OSR_256, 0U, 4U, 0U) == 0U) { return; }
+  if (busy_scenario("D1-wrap-8192to256", MS5837_MODEL_30BA, MS5837_OSR_8192,
+                    MS5837_MODEL_30BA, MS5837_OSR_256, 0U, 1U, 0xFFFFFF00UL) == 0U) { return; }
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17i. 02BA 手册第7页算例逐项 */
+/*
+ * 手册第 7 页算例逐项（C1..C6 = 46372/43981/29059/27842/31553/28165，D1=6465444，D2=8077636）：
+ *   dT = 68；TEMP = 2000（20.00 °C）；OFF = 5764707214；SENS = 3039050829；P = 110002（1100.02 mbar）。
+ * 这里用测试自己的一阶表达式复算，逐项对照手册打印值；再断言驱动输出与之一致。
+ * 除法用有符号右移（= 向负无穷取整），与手册流程一致。
+ */
+static void Test_OfficialExample02baTerms(void)
+{
+  const uint16_t *c = prom_02ba_example;
+  int64_t dt;
+  int64_t temp;
+  int64_t off;
+  int64_t sens;
+  int64_t pressure;
+  int64_t driver_raw = 0;
+  int32_t driver_temp = 0;
+
+  TEST_BEGIN("OfficialExample02baTerms");
+
+  dt = (int64_t)8077636 - ((int64_t)c[5] << 8);
+  temp = 2000 + ((dt * (int64_t)c[6]) >> 23);
+  off = ((int64_t)c[2] << 17) + (((int64_t)c[4] * dt) >> 6);
+  sens = ((int64_t)c[1] << 16) + (((int64_t)c[3] * dt) >> 7);
+  pressure = ((((int64_t)6465444 * sens) >> 21) - off) >> 15;
+
+  CHECK(dt == 68);
+  CHECK(temp == 2000); /* 20.00 °C */
+  CHECK(off == 5764707214LL);
+  CHECK(sens == 3039050829LL);
+  CHECK(pressure == 110002LL); /* 0.01 mbar 整数 → 1100.02 mbar */
+  /* 0.01 mbar/LSB ⇒ 1 LSB = 1 Pa，与手册第7页换算一致。 */
+  CHECK(nearly_equal((float)pressure, 110002.0f, 0.5f));
+
+  CHECK(Ms5837_Compensate(MS5837_MODEL_02BA, c, 6465444U, 8077636U, &driver_raw,
+                          &driver_temp) == 1U);
+  CHECK(driver_temp == 2000);
+  CHECK(driver_raw == pressure);
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17j. 20 °C 边界与冷热切换 */
+static void Test_TemperatureBranchBoundary(void)
+{
+  const uint16_t *c = prom_30ba_example;
+  int64_t raw_cold = 0;
+  int64_t raw_exact = 0;
+  int64_t ref_cold = 0;
+  int64_t ref_exact = 0;
+  int32_t t_cold = 0;
+  int32_t t_exact = 0;
+  uint32_t d2_cold; /* TEMP = 1999，落在低温分支 */
+  uint32_t d2_exact; /* TEMP = 2000，不进低温分支 */
+  uint32_t d2_warm;
+  uint32_t d2_very_cold;
+  int64_t ref_warm = 0;
+  int32_t t_warm = 0;
+  Ms5837Sample_t sample;
+
+  TEST_BEGIN("TemperatureBranchBoundary");
+
+  d2_exact = (uint32_t)(c[5] * 256U); /* dT = 0 → TEMP = 2000 */
+  d2_cold = (uint32_t)(c[5] * 256U - 1U); /* dT = -1 → TEMP = 1999（向下取整） */
+  d2_warm = (uint32_t)(c[5] * 256U + 300000U);
+  d2_very_cold = (uint32_t)(c[5] * 256U - 500000U);
+
+  /* 边界两侧：TEMP=1999 走低温修正，TEMP=2000 不修正。 */
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, c, 4958179U, d2_cold, &raw_cold, &t_cold) == 1U);
+  CHECK(Ms5837_Compensate(MS5837_MODEL_30BA, c, 4958179U, d2_exact, &raw_exact, &t_exact) == 1U);
+  CHECK(t_cold == 1999);
+  CHECK(t_exact == 2000);
+  ref_compensate(MS5837_MODEL_30BA, c, 4958179U, d2_cold, &ref_cold, &t_cold);
+  ref_compensate(MS5837_MODEL_30BA, c, 4958179U, d2_exact, &ref_exact, &t_exact);
+  CHECK(raw_cold == ref_cold);
+  CHECK(raw_exact == ref_exact);
+  /* TEMP=2000 时 Ti/OFFi/SENSi 必须为 0：一阶压力与二阶压力完全一致。 */
+  {
+    int64_t dt = (int64_t)d2_exact - ((int64_t)c[5] << 8);
+    int64_t off = ((int64_t)c[2] << 16) + (((int64_t)c[4] * dt) >> 7);
+    int64_t sens = ((int64_t)c[1] << 15) + (((int64_t)c[3] * dt) >> 8);
+    int64_t first_order = ((((int64_t)4958179 * sens) >> 21) - off) >> 13;
+    CHECK(dt == 0);
+    CHECK(raw_exact == first_order);
+  }
+
+  /* 02BA 非低温分支同样不得有任何修正（手册第8页：没有高温项）。 */
+  {
+    const uint16_t *c2 = prom_02ba_example;
+    int64_t dt = 300000;
+    uint32_t d2 = (uint32_t)((int64_t)c2[5] * 256 + dt);
+    int64_t off = ((int64_t)c2[2] << 17) + (((int64_t)c2[4] * dt) >> 6);
+    int64_t sens = ((int64_t)c2[1] << 16) + (((int64_t)c2[3] * dt) >> 7);
+    int64_t first_order = ((((int64_t)6465444 * sens) >> 21) - off) >> 15;
+    int64_t raw2 = 0;
+    int32_t t2 = 0;
+    CHECK(Ms5837_Compensate(MS5837_MODEL_02BA, c2, 6465444U, d2, &raw2, &t2) == 1U);
+    CHECK(t2 > 2000);
+    CHECK(raw2 == first_order);
+  }
+
+  /* 冷 → 热连续两帧：第二帧不得残留第一帧的 Ti/OFFi/SENSi。 */
+  harness_start(MS5837_MODEL_30BA, 4958179U, d2_very_cold);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  /* dT=-500000 → 一阶 TEMP=441（4.41 °C），Ti=87，二阶 TEMP2=354。 */
+  CHECK(sample.temperature_centi_c == 354);
+  CHECK(sample.pressure_raw == 89502);
+  sim.d2_value = d2_warm;
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  /* 热的这一帧必须等于独立复算结果（Ti/OFFi/SENSi 用本帧的值，不能残留低温值）。 */
+  ref_compensate(MS5837_MODEL_30BA, prom_cross, 4958179U, d2_warm, &ref_warm, &t_warm);
+  CHECK(sample.temperature_centi_c == t_warm);
+  CHECK(sample.pressure_raw == ref_warm);
+  /* 反向再切回低温一帧，同样必须与独立复算一致。 */
+  sim.d2_value = d2_very_cold;
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  ref_compensate(MS5837_MODEL_30BA, prom_cross, 4958179U, d2_very_cold, &ref_warm, &t_warm);
+  CHECK(sample.temperature_centi_c == t_warm);
+  CHECK(sample.pressure_raw == ref_warm);
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 17k. 单位、负水深与无效零点 */
+static void Test_UnitsAndNegativeDepth(void)
+{
+  Ms5837Sample_t sample;
+  float depth_below_zero;
+  float depth_above_zero;
+
+  TEST_BEGIN("UnitsAndNegativeDepth");
+
+  /* 30BA：整数压力单位 0.1 mbar ⇒ pressure_pa = raw × 10。 */
+  harness_start(MS5837_MODEL_30BA, TEST_D1_SURFACE, TEST_D2_25C);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(nearly_equal(sample.pressure_pa, (float)sample.pressure_raw * 10.0f, 0.5f));
+  /* 24 位 ADC 按 MSB first 组装：仿真给 0x123456，样本里必须原样出现。 */
+  sim.d1_value = 0x123456U;
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(sample.d1 == 0x123456U);
+
+  /* 02BA：整数压力单位 0.01 mbar ⇒ 1 LSB = 1 Pa，mbar = raw / 100。 */
+  sim_reset();
+  sim.model = MS5837_MODEL_02BA;
+  sim.d1_value = 6465444U;
+  sim.d2_value = 8077636U;
+  sim_set_prom_from_coefficients(prom_02ba_example);
+  test_tick = 0U;
+  I2c_Init(&fake_handle);
+  Ms5837_RestoreDefaults();
+  CHECK(Ms5837_SetModel(MS5837_MODEL_02BA) == MS5837_OK);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  CHECK(run_until(pred_prom_valid, 200U) != 0U);
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  CHECK(nearly_equal(sample.pressure_pa, (float)sample.pressure_raw, 0.5f));
+  CHECK(nearly_equal(sample.pressure_pa / 100.0f, 1100.02f, 0.01f)); /* 手册第7页的 mbar 值 */
+
+  /* 负水深不得被夹到 0：先在水面建立零点，再给一个低于 P0 的压力。 */
+  sim_reset();
+  sim.model = MS5837_MODEL_30BA;
+  sim.d1_value = TEST_D1_SURFACE;
+  sim.d2_value = TEST_D2_25C;
+  test_tick = 0U;
+  I2c_Init(&fake_handle);
+  Ms5837_RestoreDefaults();
+  CHECK(Ms5837_SetModel(MS5837_MODEL_30BA) == MS5837_OK);
+  CHECK(Ms5837_Init() == MS5837_OK);
+  CHECK(run_until(pred_prom_valid, 200U) != 0U);
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_Zero() == MS5837_OK);
+
+  sim.d1_value = TEST_D1_DIVE; /* 高于 P0 → 正深度 */
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  depth_above_zero = sample.depth_raw_m;
+  CHECK(depth_above_zero > 0.0f);
+
+  sim.d1_value = TEST_D1_SURFACE - 20000U; /* 低于 P0 → 负深度，必须原样保留 */
+  Ms5837_ClearNewSampleFlag();
+  CHECK(run_until(pred_new_sample, 400U) != 0U);
+  CHECK(Ms5837_GetSample(&sample) == MS5837_OK);
+  depth_below_zero = sample.depth_raw_m;
+  CHECK(depth_below_zero < 0.0f);
+  CHECK((sample.status & MS5837_STATUS_DEPTH_VALID) != 0U); /* 压力有效且零点有效 */
+  CHECK(depth_below_zero < -0.1f);
+  CHECK(depth_below_zero > -2.0f);
+  /* 与 (P-P0)/(rho*g) 一致，没有被夹紧成 0。 */
+  CHECK(nearly_equal(depth_below_zero,
+                     (sample.pressure_pa - sample.surface_pressure_pa) /
+                         (MS5837_WATER_DENSITY_DEFAULT * MS5837_GRAVITY),
+                     1e-4f));
   TEST_END();
 }
 
@@ -1971,6 +2353,10 @@ int main(void)
   Test_ModelChangeClearsZero();
   Test_ZeroValidatesRange();
   Test_ConfigChangeDuringConversion();
+  Test_BusyDeviceNoEarlyRestart();
+  Test_OfficialExample02baTerms();
+  Test_TemperatureBranchBoundary();
+  Test_UnitsAndNegativeDepth();
   Test_SampleMetadataAndFreshness();
   Test_I2cBusLayer();
 

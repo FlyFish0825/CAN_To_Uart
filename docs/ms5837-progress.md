@@ -117,6 +117,22 @@ PS> .\build\ms5837_host_test.exe
 [  OK  ] ZeroValidatesRange
 [ RUN  ] ConfigChangeDuringConversion
 [  OK  ] ConfigChangeDuringConversion
+[ RUN  ] BusyDeviceNoEarlyRestart
+        D1-8192to256     busy重发=0 busy读=0 提前读=0 新D1=0x40
+        D2-8192to256     busy重发=0 busy读=0 提前读=0 新D1=0x40
+        D1-256to8192     busy重发=0 busy读=0 提前读=0 新D1=0x4A
+        D2-256to8192     busy重发=0 busy读=0 提前读=0 新D1=0x4A
+        D1-30BAto02BA    busy重发=0 busy读=0 提前读=0 新D1=0x48
+        D1-02BAto30BA    busy重发=0 busy读=0 提前读=0 新D1=0x48
+        D1-change-x4     busy重发=0 busy读=0 提前读=0 新D1=0x40
+        D1-wrap-8192to256 busy重发=0 busy读=0 提前读=0 新D1=0x40
+[  OK  ] BusyDeviceNoEarlyRestart
+[ RUN  ] OfficialExample02baTerms
+[  OK  ] OfficialExample02baTerms
+[ RUN  ] TemperatureBranchBoundary
+[  OK  ] TemperatureBranchBoundary
+[ RUN  ] UnitsAndNegativeDepth
+[  OK  ] UnitsAndNegativeDepth
 [ RUN  ] SampleMetadataAndFreshness
 [  OK  ] SampleMetadataAndFreshness
 [ RUN  ] I2cBusLayer
@@ -125,7 +141,9 @@ ms5837_host_test: PASS
 (exit 0)
 ```
 
-共 25 组测试，全部 PASS；`-O2` 构建同样 `PASS`（`gcc -std=c11 -Wall -Wextra -Werror -O2 ...`）。
+共 28 组测试，全部 PASS；`-O2` 构建同样 `PASS`（`gcc -std=c11 -Wall -Wextra -Werror -O2 ...`）。
+修复前的失败证据（同一条命令、同一套用例）：`BusyDeviceNoEarlyRestart: sim.new_conversion_while_busy == 0U` ×6
+（D1/D2 8192→256、30BA↔02BA、连续 4 次改配置、tick 回绕），修复后 8 场景全 0 违规。
 一键脚本：`powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_ms5837_host_test.ps1`（结果同上）。
 
 ### 3.2 目标交叉编译（只编译，不烧录、不启动 OpenOCD、不占用串口）
@@ -135,8 +153,10 @@ PS> arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -std=c11 -Wall -Wextra -Werror -O2
       -DSTM32H750xx -DUSE_HAL_DRIVER -c Core/Src/sensor_i2c_bus.c -o bus.o
 (exit 0)   text 400   data 1   bss 5
 PS> ... -c Core/Src/ms5837.c -o ms5837.o
-(exit 0)   text 4545  data 184 bss 0
+(exit 0)   text 4705  data 184 bss 0
 ```
+
+另：`gcc -std=c99 -Wall -Wextra -Werror -pedantic -DI2C_HOST_TEST -c Core/Src/ms5837.c` 也 exit 0。
 
 `-Wall -Wextra -Werror` 下无告警，说明驱动可被现有 CubeMX/HAL 工程直接编译。
 本次未调用 CMake（CMake 由协调人合入 `Core/Src/sensor_i2c_bus.c`、`Core/Src/ms5837.c` 后再跑）。
@@ -171,6 +191,16 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 | `SampleMetadataAndFreshness` | 序号递增、时间戳推进、样本年龄；总线故障后旧样本不得再报告 PRESSURE_VALID/DEPTH_VALID，但 PROM_VALID 保留 |
 | `I2cBusLayer` | 未绑定句柄拒绝事务；7 位地址范围校验；空指针/0 长度/超长拒绝；超时 0→5 ms、过大→50 ms 截断；HAL BUSY/ERROR/TIMEOUT 映射；错误地址被拒 |
 
+### 4.2 本轮（02BA01 06/2017 用户手册核对）
+
+| 测试 | 覆盖点 |
+| --- | --- |
+| `BusyDeviceNoEarlyRestart` | **手册第 11 页回归（先失败后修复）**：HAL mock 维护芯片 `busy_until`，转换未完成时收到新 D1/D2 或 ADC read 即计数。8 个场景：D1/D2 期间 8192→256、256→8192、30BA↔02BA、连续 4 次改配置、tick 从 0xFFFFFF00 回绕。修复前 6/8 场景报“busy 期间重发”，修复后全部 `busy重发=0 busy读=0 提前读=0`，且新周期首条命令等于新 OSR（0x40/0x4A/0x48） |
+| `OfficialExample02baTerms` | 手册第 7 页算例**逐项**断言：`dT=68`、`TEMP=2000`、`OFF=5764707214`、`SENS=3039050829`、`P=110002`（1100.02 mbar，1 LSB = 1 Pa），并断言驱动输出与逐项复算一致 |
+| `TemperatureBranchBoundary` | TEMP=1999 与 TEMP=2000 分界两侧（1999 走低温修正、2000 的二阶修正必须全为 0，且等于一阶结果）；02BA 非低温分支不得有任何修正（手册第 8 页无高温项）；冷→热→冷连续三帧都等于独立复算，证明没有残留上一帧的 Ti/OFFi/SENSi |
+| `UnitsAndNegativeDepth` | 30BA `pressure_pa = raw×10`（0.1 mbar/LSB）、02BA `pressure_pa = raw`（0.01 mbar/LSB = 1 Pa）且 `raw/100 = 1100.02 mbar`；24 位 ADC 按 MSB first 组装（仿真 0x123456 原样出现在样本里）；负水深不被夹到 0 且与 `(P−P0)/(rho·g)` 一致 |
+| `Crc4`（扩充） | 计算 CRC **不得破坏**调用方保存的原始 PROM：字 0 高 4 位原 CRC 与第 8 个软件辅助字在调用后必须逐字节不变 |
+
 主机测试里的从设备仿真带**独立复制的数据手册最大转换时间表**：驱动若提前读 ADC 会被记为违规
 （`early_reads`），当前为 0。
 仿真设备对 PROM 命令 index>6（即 0xAE 及以后）返回 `HAL_ERROR`，因此“能上线”本身就证明驱动不依赖第 8 个字。
@@ -188,13 +218,20 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 | 7) 型号切换必须清除旧水面零点与滤波（旧 P0 可能是错误型号算出来的） | `SetModel()` 在型号真正变化时调用 `ClearZero()` 并作废已发布样本补偿值；同型号重复设置保持幂等不清零点 | 新增 `ModelChangeClearsZero`：30BA→02BA、02BA→unknown 均断言 `ZERO_VALID` 清、`GET_PARAMETER(0103)` 由 OK 变 `NO_ZERO`、深度变 NaN；30BA→30BA 零点保留 |
 | 8) `Ms5837_Zero()` 未做范围校验，可能产生 `GET_PARAMETER` 认为越界的 P0 | `Zero()` 直接复用 `SetSurfacePressurePa()`（有限值 + 10000~200000 Pa）；越界返回 `ERR_PARAM` 且不建立零点，已有有效零点不被破坏 | 新增 `ZeroValidatesRange`：越界（<10000 / >200000 Pa）被拒且 `0103` 仍为 `NO_ZERO`；量程内成功后 `0103` 读回的 P0 与样本压力一致 |
 | 9) OSR/型号在 D1/D2 转换途中变更会沿用旧 deadline（可能提前读） | 新增 `ms5837_abort_half_cycle()`：`SetOsr()`/`SetModel()` 在 `CONVERT_D1/D2` 时丢弃半周期、清半截 D1/D2，回 IDLE 用新配置重新走完整周期 | 新增 `ConfigChangeDuringConversion`：256→8192 途中改配置后必须先出现新的 D1 `0x4A`（不能先出现被中断的 D2）、最小等待 ≥ 19+1 ms、提前读 0 次；型号切换同理 |
+| 10) **（本轮）** 手册第 11 页：转换期间芯片一直 busy，重发转换/提前读 ADC 都会得到错误结果——“丢弃软件半周期”不能等于“立刻重发” | `ms5837_abort_half_cycle()` 改为**延迟丢弃**：只清半截 D1/D2 并进入新状态 `DISCARD_WAIT`，**保留原 deadline**（按旧配置算、不会更短）；到点后（芯片已空闲）才用新配置重新发 D1。`Ms5837_Process()` 增加 `DISCARD_WAIT` 分支 | 新增 `BusyDeviceNoEarlyRestart`（8 场景）先复现失败：修复前 6/8 报“busy 期间重发”，修复后 8/8 全 0 违规 |
 
 ## 5. 未做 / 未验证（重要）
 
 * **硬件 NOT TESTED**：本分支没有烧录、没有复位设备、没有启动/终止 OpenOCD、没有打开 COM11/COM42，
-  也没有任何真实 I2C3 波形或真实 MS5837 读数。全部结论来自数据手册 + 主机仿真 + 交叉编译。
-* 真实型号（02BA vs 30BA）仍未确认，固件默认 unknown，必须由人显式设定；未实现任何自动型号猜测。
-* 未做：`SAVE_CONFIG` 持久化、温度校准（MS5837 无该命令，应回 UNSUPPORTED）、多实例、DMA/中断收发。
+  也没有任何真实 I2C3 波形或真实 MS5837 读数。全部结论来自**数据手册源码核对 + 主机仿真 + 交叉编译**，
+  与**实机验证**严格区分：本轮只完成前者。
+* **型号**：本次实物以用户提供的 MS5837-02BA01（06/2017）手册为板级选型依据，集成时由统筹方**显式 `SetModel(2)`**；
+  驱动保留 unknown 默认，**不凭 PROM 猜型号**（`C1` 阈值法不是手册定义行为）。
+* **水面 P0 未采集**：驱动不会自动归零；必须由操作员确认水面位置后显式 `ZERO_DEPTH`/`SetSurfacePressurePa()`。
+* 02BA 定量范围只按手册原文记录：工作范围 300..1200 mbar、扩展/ADC 线性范围 10..2000 mbar、耐压 10 bar；
+  **不宣称 0..10 bar 或 0..10 m 全程精度**；第 1 页 “13 cm” 是空气高度分辨率，不是水深分辨率。
+* 未做：`SAVE_CONFIG` 持久化、温度校准（MS5837 无该命令，应回 UNSUPPORTED）、多实例、DMA/中断收发、
+  GPIO 脉冲式总线恢复动作（手册第 10 页提到 SDA 卡 ACK 时的处理方式，本轮不引入）。
 * 复位后 10 ms 延时是保守余量（数据手册未给具体数值），未在硬件上测过最短安全值。
 * 集成方仍需完成：`.ioc` 使能 I2C3(PA8/PC9) 与 CubeMX 的 `MX_I2C3_Init`/MspInit、`main.c` 里
   `I2c_Init(&hi2c3)` + `Ms5837_Init()` + 主循环 `Ms5837_Process()`、`CMakeLists.txt` 增加
@@ -210,8 +247,12 @@ PS> ... -c Core/Src/ms5837.c -o ms5837.o
 * 文档提交：`e53785f` “文档：记录MS5837深度计实现提交与验证证据”。
 * 评审修正提交 1：`d753e54` “修正：传感器总线改名以避开CubeMX i2c.c/h，并固化PROM 7字读取断言”。
 * 评审修正提交 2：`7d73313` “修正：周期调度不累加转换等待、命令后重取tick加余量，并拒绝假PROM/无效转换”。
-* 评审修正提交 3：本文件所在提交 “修正：型号切换清零点、Zero 复用范围校验、转换途中改配置丢弃半周期”，
-  只包含 `Core/Inc/ms5837.h`、`Core/Src/ms5837.c`、`tests/ms5837_host_test.c`、`docs/ms5837.md`、
-  `docs/ms5837-progress.md`。
+* 评审修正提交 3：`b89c60d` “修正：型号切换清零点、Zero 复用范围校验、转换途中改配置丢弃半周期”。
+* 本轮（02BA01 06/2017 手册核对）提交：本文件所在提交
+  “按02BA01(06/2017)手册核对一阶/二阶与PROM，转换中改配置改为延迟丢弃”，只包含
+  `Core/Src/ms5837.c`、`tests/ms5837_host_test.c`、`docs/ms5837.md`、`docs/ms5837-progress.md`
+  （`Core/Inc/ms5837.h`、`sensor_i2c_bus.*` 本轮无需改动）。
+* 本轮使用的任务输入 `docs/MS5837-02BA01-user-manual-task-20261006.md` 由统筹方放入工作树，
+  非本人文件，**未纳入提交**（保持未跟踪，原样保留给统筹方）。
 * 只提交了本模块自己的文件（未 `git add .`，未改动/回退他人文件，未 push，未合并 main）。
 * 提交时 Git 提示 “LF will be replaced by CRLF”，来自本机 `core.autocrlf=true`，与仓库既有文件一致。
