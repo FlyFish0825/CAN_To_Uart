@@ -67,6 +67,7 @@ typedef struct
   uint32_t reset_count; /* 收到复位命令的次数。 */
   uint32_t tx_count; /* 写事务次数。 */
   uint32_t rx_count; /* 读事务次数。 */
+  uint32_t abort_count; /* 软件超时后请求 Abort 的次数。 */
   uint32_t last_timeout_ms; /* 最近一次 HAL 调用收到的超时参数。 */
   uint8_t read_buffer[4]; /* 待读数据。 */
   uint8_t read_length; /* 待读字节数。 */
@@ -76,6 +77,9 @@ typedef struct
 } SimDevice_t;
 
 static SimDevice_t sim;
+
+/* HAL 句柄替身：IT 替身与后面的测试都用这一个。 */
+static I2C_HandleTypeDef fake_handle;
 
 static const uint16_t sim_conv_us_30ba[6] = {600U, 1170U, 2280U, 4540U, 9040U, 18080U};
 static const uint16_t sim_conv_us_02ba[6] = {560U, 1100U, 2170U, 4320U, 8610U, 17200U};
@@ -267,9 +271,156 @@ HAL_StatusTypeDef HAL_I2C_Master_Receive(I2C_HandleTypeDef *hi2c,
   return HAL_OK;
 }
 
+/* ------------------------------------------------ 中断模式（IT）替身
+ *
+ * 真实硬件上 _IT 只启动传输，完成由中断回调通知；这里两种模式都支持：
+ *  - sim_it_defer = 0（默认）：_IT 调用内部立即完成并触发回调，
+ *    这样既有测试在“总线比 1 ms 快得多”的前提下行为完全不变；
+ *  - sim_it_defer = 1：_IT 只登记请求并返回，由测试调用 sim_it_pump()
+ *    （模拟中断到来）后才触发回调，用于验证驱动确实不阻塞、由回调推进。
+ * 卡死（sim.stall）时 _IT 不做任何计时推进：CPU 是空闲的，超时由 I2c_Process 负责。
+ */
+static uint8_t sim_it_defer = 0U;
+static uint8_t sim_it_pending = 0U; /* 0 无 / 1 Tx / 2 Rx / 3 Abort */
+static uint32_t sim_it_error = 0U;
+
+void sim_it_pump(void)
+{
+  uint8_t pending = sim_it_pending;
+  sim_it_pending = 0U;
+  switch (pending)
+  {
+    case 1U:
+      HAL_I2C_MasterTxCpltCallback(&fake_handle);
+      break;
+    case 2U:
+      HAL_I2C_MasterRxCpltCallback(&fake_handle);
+      break;
+    case 3U:
+      HAL_I2C_AbortCpltCallback(&fake_handle);
+      break;
+    default:
+      break;
+  }
+}
+
+HAL_StatusTypeDef HAL_I2C_Master_Transmit_IT(I2C_HandleTypeDef *hi2c,
+                                             uint16_t dev_address,
+                                             uint8_t *data,
+                                             uint16_t size)
+{
+  HAL_StatusTypeDef status;
+
+  sim.last_timeout_ms = I2C_BUS_DEFAULT_TIMEOUT_MS;
+  if (sim.stall != 0U)
+  {
+    if (sim_it_defer != 0U)
+    {
+      return HAL_OK; /* 真异步：CPU 空闲、时间由测试推进，超时交给 I2c_Process + Abort。 */
+    }
+    /* 同步兼容路径：假 HAL 不会自己走时间，用“推进到超时 + 报错”复现阻塞版本行为。 */
+    test_tick += I2C_BUS_DEFAULT_TIMEOUT_MS;
+    sim_it_error = 0x00000020U; /* HAL_I2C_ERROR_TIMEOUT */
+    HAL_I2C_ErrorCallback(hi2c);
+    return HAL_OK;
+  }
+  if (sim.online == 0U)
+  {
+    sim_it_error = 0x00000004U; /* HAL_I2C_ERROR_AF：地址未被应答 */
+    HAL_I2C_ErrorCallback(hi2c);
+    return HAL_OK;
+  }
+  status = HAL_I2C_Master_Transmit(hi2c, dev_address, data, size, I2C_BUS_DEFAULT_TIMEOUT_MS);
+  if (status == HAL_BUSY)
+  {
+    return HAL_BUSY;
+  }
+  if (status != HAL_OK)
+  {
+    sim_it_error = 0U;
+    HAL_I2C_ErrorCallback(hi2c);
+    return HAL_OK;
+  }
+  if (sim_it_defer != 0U)
+  {
+    sim_it_pending = 1U;
+  }
+  else
+  {
+    HAL_I2C_MasterTxCpltCallback(hi2c);
+  }
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef HAL_I2C_Master_Receive_IT(I2C_HandleTypeDef *hi2c,
+                                            uint16_t dev_address,
+                                            uint8_t *data,
+                                            uint16_t size)
+{
+  HAL_StatusTypeDef status;
+
+  if (sim.stall != 0U)
+  {
+    if (sim_it_defer != 0U)
+    {
+      return HAL_OK;
+    }
+    test_tick += I2C_BUS_DEFAULT_TIMEOUT_MS;
+    sim_it_error = 0x00000020U;
+    HAL_I2C_ErrorCallback(hi2c);
+    return HAL_OK;
+  }
+  if (sim.online == 0U)
+  {
+    sim_it_error = 0x00000004U;
+    HAL_I2C_ErrorCallback(hi2c);
+    return HAL_OK;
+  }
+  status = HAL_I2C_Master_Receive(hi2c, dev_address, data, size, I2C_BUS_DEFAULT_TIMEOUT_MS);
+  if (status == HAL_BUSY)
+  {
+    return HAL_BUSY;
+  }
+  if (status != HAL_OK)
+  {
+    sim_it_error = 0U;
+    HAL_I2C_ErrorCallback(hi2c);
+    return HAL_OK;
+  }
+  if (sim_it_defer != 0U)
+  {
+    sim_it_pending = 2U;
+  }
+  else
+  {
+    HAL_I2C_MasterRxCpltCallback(hi2c);
+  }
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef HAL_I2C_Master_Abort_IT(I2C_HandleTypeDef *hi2c, uint16_t dev_address)
+{
+  (void)dev_address;
+  sim.abort_count++;
+  if (sim_it_defer != 0U)
+  {
+    sim_it_pending = 3U;
+  }
+  else
+  {
+    HAL_I2C_AbortCpltCallback(hi2c);
+  }
+  return HAL_OK;
+}
+
+uint32_t HAL_I2C_GetError(I2C_HandleTypeDef *hi2c)
+{
+  (void)hi2c;
+  return sim_it_error;
+}
+
 #include "../Core/Src/sensor_i2c_bus.c"
 #include "../Core/Src/ms5837.c"
-
 /* ---------------------------------------------------------------- 测试框架 */
 static uint32_t test_failures;
 static const char *test_current;
@@ -421,7 +572,6 @@ static int nearly_equal(float a, float b, float tolerance)
 }
 
 /* ---------------------------------------------------------------- 测试辅助 */
-static I2C_HandleTypeDef fake_handle;
 
 static void sim_set_prom_from_coefficients(const uint16_t coefficients[MS5837_PROM_WORDS])
 {
@@ -2707,7 +2857,7 @@ static void Test_I2cBusLayer(void)
   CHECK(I2c_Write(big, (uint16_t)sizeof(big), 5U) == I2C_BUS_PARAM);
   CHECK(I2c_Read(0, 2U, 5U) == I2C_BUS_PARAM);
 
-  /* 超时收敛：0 → 默认值，过大 → 上限。 */
+  /* 超时收敛：0 → 默认值（用中断模式的超时行为验证，见下面“上限”一段）。 */
   CHECK(I2c_WriteRead(&command, 1U, buffer, 2U, 0U) == I2C_BUS_OK);
   CHECK(sim.last_timeout_ms == (uint32_t)I2C_BUS_DEFAULT_TIMEOUT_MS);
   CHECK(buffer[0] == (uint8_t)(sim.prom[0] >> 8));
@@ -2715,7 +2865,6 @@ static void Test_I2cBusLayer(void)
 
   sim.prom[0] = 0x1234U; /* 命令 0xA0 对应 PROM 字 0。 */
   CHECK(I2c_WriteRead(&command, 1U, buffer, 2U, 1000U) == I2C_BUS_OK);
-  CHECK(sim.last_timeout_ms == (uint32_t)I2C_BUS_MAX_TIMEOUT_MS);
   CHECK(buffer[0] == 0x12U);
   CHECK(buffer[1] == 0x34U);
 
@@ -2736,6 +2885,94 @@ static void Test_I2cBusLayer(void)
     CHECK((test_tick - before) == (uint32_t)I2C_BUS_DEFAULT_TIMEOUT_MS);
   }
   sim.stall = 0U;
+  TEST_END();
+}
+
+/* ---------------------------------------------------------------- 中断模式异步核心 */
+static void Test_InterruptModeAsync(void)
+{
+  uint8_t command = 0xA0U;
+  uint8_t buffer[3] = {0U, 0U, 0U};
+
+  TEST_BEGIN("InterruptModeAsync");
+
+  sim_reset();
+  test_tick = 0U;
+  I2c_Init(&fake_handle);
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_IDLE);
+  CHECK(I2c_IsBusy() == 0U);
+
+  /* 延迟完成模式：提交后必须立刻返回，阶段为 BUSY，CPU 不被占用（tick 不推进）。 */
+  sim_it_defer = 1U;
+  sim.prom[0] = 0x5678U;
+  {
+    uint32_t before = test_tick;
+    CHECK(I2c_Submit(&command, 1U, buffer, 2U, 0U) == I2C_BUS_OK);
+    CHECK(I2c_GetPhase() == I2C_BUS_PHASE_BUSY);
+    CHECK(I2c_IsBusy() == 1U);
+    CHECK(test_tick == before); /* 异步：提交不消耗时间，也不自旋 */
+  }
+
+  /* 事务在飞时不允许复用总线（结果没取走也不允许覆盖）。 */
+  CHECK(I2c_Submit(&command, 1U, buffer, 2U, 0U) == I2C_BUS_BUSY);
+  CHECK(I2c_GetResult() == I2C_BUS_BUSY); /* 还没完成 */
+
+  /* 中断到来：写阶段完成后自动发起读阶段，再完成读阶段。 */
+  CHECK(sim_it_pending == 1U);
+  sim_it_pump(); /* Tx 完成回调 → 内部启动 Rx */
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_BUSY);
+  CHECK(sim_it_pending == 2U);
+  sim_it_pump(); /* Rx 完成回调 */
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_DONE);
+  CHECK(I2c_GetResult() == I2C_BUS_OK);
+  CHECK(buffer[0] == 0x56U);
+  CHECK(buffer[1] == 0x78U);
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_IDLE);
+
+  /* 软件超时 + Abort：卡死时不再阻塞主循环，而是按上限超时后请求中止。 */
+  sim.stall = 1U;
+  CHECK(I2c_Submit(&command, 1U, buffer, 2U, 1000U) == I2C_BUS_OK);
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_BUSY);
+  test_tick += (uint32_t)I2C_BUS_MAX_TIMEOUT_MS - 1U; /* 上限内：不中止 */
+  I2c_Process();
+  CHECK(sim.abort_count == 0U);
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_BUSY);
+  test_tick += 1U; /* 到上限 50 ms：必须请求中止（1000 ms 被截断到 50 ms） */
+  I2c_Process();
+  CHECK(sim.abort_count == 1U);
+  sim_it_pump(); /* Abort 完成回调 */
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_DONE);
+  CHECK(I2c_GetResult() == I2C_BUS_TIMEOUT);
+  sim.stall = 0U;
+
+  /* 离线（地址无 ACK）在中断模式下由 ErrorCallback 结束，不阻塞。 */
+  sim.online = 0U;
+  CHECK(I2c_Submit(&command, 1U, 0, 0U, 0U) == I2C_BUS_OK);
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_DONE); /* 回调已同步触发（AF） */
+  CHECK(I2c_GetResult() == I2C_BUS_ERROR);
+  sim.online = 1U;
+
+  /* 只读事务（无写阶段）与参数校验：回到“立即完成”模式。 */
+  sim_it_defer = 0U;
+  sim.read_pending = 1U;
+  sim.read_length = 3U;
+  sim.read_buffer[0] = 0xAAU;
+  sim.read_buffer[1] = 0xBBU;
+  sim.read_buffer[2] = 0xCCU;
+  CHECK(I2c_Submit(0, 0U, buffer, 3U, 0U) == I2C_BUS_OK);
+  CHECK(I2c_GetPhase() == I2C_BUS_PHASE_DONE);
+  CHECK(I2c_GetResult() == I2C_BUS_OK);
+  CHECK(buffer[0] == 0xAAU);
+  CHECK(buffer[2] == 0xCCU);
+  CHECK(I2c_Submit(0, 0U, 0, 0U, 0U) == I2C_BUS_PARAM); /* 既不写也不读 */
+  CHECK(I2c_Submit(&command, (uint16_t)(I2C_BUS_MAX_TRANSFER + 1U), 0, 0U, 0U) == I2C_BUS_PARAM);
+
+  /* 未绑定句柄时异步接口必须拒绝。 */
+  I2c_Init(0);
+  CHECK(I2c_Submit(&command, 1U, 0, 0U, 0U) == I2C_BUS_NOT_READY);
+  I2c_Init(&fake_handle);
+
+  sim_it_defer = 0U;
   TEST_END();
 }
 
@@ -2774,6 +3011,7 @@ int main(void)
   Test_ReferenceVectors();
   Test_SampleMetadataAndFreshness();
   Test_I2cBusLayer();
+  Test_InterruptModeAsync();
 
   if (test_failures != 0U)
   {
