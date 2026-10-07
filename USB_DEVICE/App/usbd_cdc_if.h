@@ -121,6 +121,15 @@ void CDC_ResetTransmitState_FS(void);
  */
 uint8_t CDC_ResumeReceive_FS(void);
 
+/**
+ * @brief 查询 CDC OUT 端点当前是否已提交接收。
+ * @retval 1 已提交（主机可写入）；0 未提交（主机写入会被 NAK）。
+ *
+ * 供网关主循环判断是否需要调用 CDC_ResumeReceive_FS 重新提交，
+ * 覆盖 paused 标志无法表达的"端点意外失去提交"状态。
+ */
+uint8_t CDC_IsRxArmed(void);
+
 /* USER CODE END EXPORTED_FUNCTIONS */
 
 /**
