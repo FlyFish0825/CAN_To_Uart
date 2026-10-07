@@ -65,7 +65,7 @@ CRC16-CCITT 参数为多项式 `0x1021`、初值 `0xFFFF`，校验范围是偏�
 连续发送 AA55 数据时不需要在每个包后固定延时。固件通过队列水位和 USB 反压自动调节：
 
 - USB RX 每轮最多解析 256 字节，主循环会持续服务 CAN 和 USB TX；
-- USB RX 缓冲不足、USB TX 队列达到 192/254（双优先级队列合计）、或 CAN 软件发送普通队列达到 48/63（高优先级队列接近占满时同样反压）时，暂不重新提交下一次 USB OUT 接收；主机收到 USB NAK 后会自然减速；
+- USB RX 缓冲不足、USB TX 队列达到 192/255、或 CAN 软件发送普通队列达到 48/63（高优先级队列接近占满时同样反压）时，暂不重新提交下一次 USB OUT 接收；主机收到 USB NAK 后会自然减速；
 - USB TX 完成回调超过 1 秒没有回来时，刷新 IN 端点并重试当前包；
 - CAN→USB 发送队列忙时保留当前 CAN 帧，不提前移除；FDCAN 明确拒绝某帧时释放该失败帧并返回 `CAN_FAIL`，防止单帧把队列永久锁住；
 - 成功诊断提示（`USB_RX!!`、`CAN_PUT!`）按 100 ms 合并发送，不再为每个输入帧制造一个回包，避免诊断数据反过来占满 USB TX 队列；
@@ -153,29 +153,32 @@ status(1) | reserved(3)
 了发送请求，不表示总线节点已经 ACK。分片入队失败会保留当前分片位置并重试，明确
 失败则返回 `FORWARD_FAILED`，不会返还对应 credit。
 
-### 1.4 电机优先级调度（本分支特性）
+### 1.4 电机控制帧优先调度（本分支特性）
 
-为保障电机控制的实时性，固件在收发两个方向上对软件队列做了双优先级改造：
-**电机相关 CAN ID 的帧走高优先级队列，其余数据排在后面**。协议格式不变，
-上位机无需任何配合改动。
+为保障电机控制的实时性，固件在**下行方向（上位机→CAN）**对软件发送队列做了
+双优先级改造：**电机控制帧走高优先级队列，其余数据排在后面**。上行方向所有
+反馈帧一律普通 FIFO，不做优先级。协议格式不变，上位机无需配合改动。
 
-**识别规则**：电机相关 ID 由编译期范围表定义，见
-[can_gateway_priority.c](Core/Src/can_gateway_priority.c) 的
-`motor_priority_ranges[]`（闭区间 `{起始 ID, 结束 ID}`，标准帧/扩展帧统一按
-32 位数值比较）。默认覆盖 RoboMaster C620/C610/GM6020 电调常用段
-`0x1FF–0x208`；适配自己的机器人时只需修改该表并重新编译烧录。
+**识别规则**：依据电机控制器（Observer_Motor）协议《04-通信与调试》§8，控制
+通道为 **CAN ID 0x100**（FD/24 字节多节点控制向量 + Classic/8 字节兼容旧单节点
+命令）。注意电机**节点号不在 CAN ID 里**——向量帧在 DATA Byte2 的节点位图、
+Classic 帧在 DATA Byte0——但优先级调度只需区分"是否控制帧"，不需要知道目标
+节点。范围表见 [can_gateway_priority.c](Core/Src/can_gateway_priority.c)，需要
+扩展（例如让 0x000 ENTER_BOOT 也优先）时改表即可。
 
 **优先级行为**（严格优先级：高优先级队列非空时必先发送）：
 
-| 方向 | 队列 | 高优先级（电机相关 ID） | 普通队列 |
+| 方向 | 队列 | 高优先级 | 普通队列 |
 | --- | --- | --- | --- |
-| 下行 上位机→CAN | `can_tx` 高 16 槽 / 低 64 槽 | AA55 中 ID 命中范围表的命令帧 | 其余 AA55 命令、AA59 固件块分片 |
-| 上行 CAN→上位机 | `can_rx` 高 16 槽 / 低 64 槽 | ID 命中范围表的 CAN 帧（如电机反馈） | 其余 CAN 帧 |
-| 上行 汇聚→USB | `usb_can_tx` 高 128 槽 / 低 128 槽 | ID 命中范围表的 AA55 包 | AA5B 传感器遥测、AA58 心跳、状态帧、其余 AA55 包 |
+| 下行 上位机→CAN | `can_tx` 高 16 槽 / 低 64 槽 | CAN ID 0x100 控制帧（FD 向量 / Classic 兼容） | 其余 AA55 命令、AA59 固件块分片 |
+| 上行 CAN→上位机 | `can_rx` 单队列 64 槽 | —（反馈一律普通） | 全部反馈 |
+| 上行 汇聚→USB | `usb_can_tx` 单队列 256 槽 | — | AA55 回报、AA5B 遥测、AA58 心跳按入队顺序 FIFO |
 
 - USB 下行是字节流，无法按帧重排；优先级在 AA55 帧重组后的 `can_tx` 队列生效。
-- AA5B/AA58 与 AA55 共用 USB 发送队列，电机回报的 AA55 包会插到遥测/心跳前面；传感器帧本身另有水位让位保护。
-- 反压水位不变：USB TX 达 192（两队列合计）、CAN 普通队列达 48 或高优先级队列接近占满时暂停 USB OUT，形成 NAK 反压而不是丢电机帧。
+- AA59 固件块分片按其携带的 CAN_ID 分类；电机固件更新走 Boot 通道
+  （0x000 / 0x180+node），自动落在普通队列，不会插队控制帧。
+- 反压水位不变：USB TX 达 192、CAN 普通队列达 48 或高优先级队列接近占满时暂停
+  USB OUT，形成 NAK 反压而不是丢控制帧。
 
 ## 2. 接线与默认配置
 
@@ -200,7 +203,7 @@ FDCAN 内核时钟配置为 80 MHz；默认仲裁段 1 Mbit/s、FD 数据段 8 M
 - 连接后**自动推流**：IMU 0x80（原始九轴，单位 g / rad/s）/ 0x81（四元数+欧拉角，rad）/ 深度计 0x82（压力/温度/深度）/ 双 TARGET 状态 0x83 各 1 Hz。`STOP/START_STREAM` 可按 TARGET 独立暂停/恢复（仅控制转发，不影响采样）。
 - 命令：GET_INFO / GET_STATUS / 参数读写（IMU 输出率与算法模式、深度计 OSR/水密度/零点/滤波/型号）/ CALIBRATE / ZERO_DEPTH；回复命令码 = 请求 + 0x40，全部字段真机实测。
 - 校准策略：IMU **不使用设备侧硬件校准**（上位机软件校准，CALIBRATE 不实现）；深度计支持 ZERO_DEPTH 水面归零。
-- 发送队列水位 ≥25/254 时传感器帧被背压丢弃（保护 CAN 业务），上位机以 `sample_seq` 判断连续性。
+- 发送队列水位 ≥25/255 时传感器帧被背压丢弃（保护 CAN 业务），上位机以 `sample_seq` 判断连续性。
 - 详见《imu-aa5b-host-protocol.md》《ms5837-aa5b-host-protocol.md》两份真机实测协议文档。
 
 ## 3. 普通 CAN 帧的串口协议
@@ -517,8 +520,8 @@ def unpack_aa55_uplink(buf, ts_state):
     seq = int.from_bytes(buf[3:5], 'little')
     raw_ts = int.from_bytes(buf[body_len - 1:body_len + 3], 'little')
 
-    # 32 位回绕 → 64 位扩展：仅大幅倒退（超过半程，即真实回绕）才累加；
-    # 小幅倒退来自双队列优先级重排或同毫秒抖动，不调整。
+    # 32 位回绕 → 64 位扩展：上行上报为单队列 FIFO，时间戳正常单调
+    # 不减；仅大幅倒退（超过半程）视为真实回绕。
     prev_raw = ts_state[1]
     if raw_ts < prev_raw and (prev_raw - raw_ts) > 0x80000000:
         ts_state[2] += 1 << 32
@@ -679,7 +682,7 @@ cmake --build --preset Release --parallel
 | CAN_To_Uart.ioc | CubeMX 外设配置 |
 | CMakeLists.txt | 网关源文件加入构建 |
 
-RX 使用 DMA1 Stream0 循环模式，256 字节 DMA 缓冲，通过 IDLE、半满和全满事件搬入软件环形缓冲。软件环形缓冲分配 1024 字节、可用 1023 字节。TX 使用 DMA1 Stream1 普通模式，16 个队列槽、可用 15 个。USB CDC 为唯一上位机接口；CAN 收发软件队列各拆为电机优先级高 16 槽（可用 15 帧）+ 普通 64 槽（可用 63 帧），USB TX 队列为高 128 槽 + 普通 128 槽；CAN 硬件 TX FIFO 为 3 帧。
+RX 使用 DMA1 Stream0 循环模式，256 字节 DMA 缓冲，通过 IDLE、半满和全满事件搬入软件环形缓冲。软件环形缓冲分配 1024 字节、可用 1023 字节。TX 使用 DMA1 Stream1 普通模式，16 个队列槽、可用 15 个。USB CDC 为唯一上位机接口；CAN 发送软件队列拆为电机控制高 16 槽（可用 15 帧）+ 普通 64 槽（可用 63 帧），接收队列为单 64 槽；USB TX 队列 256 槽；CAN 硬件 TX FIFO 为 3 帧。
 
 DMA 缓冲区位于 D2 SRAM，32 字节对齐，避免落入 DMA1 不可访问的 DTCM。当前未启用 D-Cache；后续启用时必须处理 DMA 缓存一致性（非缓存区或正确的缓存维护），仅地址对齐并不足够。保持主循环持续调用 CanGateway_Process 和传输层服务函数，避免加入长时间阻塞操作。
 
@@ -747,7 +750,7 @@ firmware_flow_host_test: PASS
 | --- | --- |
 | [can_gateway_protocol.h](Core/Inc/can_gateway_protocol.h) | AA55 字段、标志位、长度和协议约束的共享定义 |
 | [can_gateway_core.h](Core/Inc/can_gateway_core.h) / [can_gateway_core.c](Core/Src/can_gateway_core.c) | AA55 解析、CRC、CAN 收发双优先级队列、状态回复、FDCAN 提交和速率命令 |
-| [can_gateway_priority.h](Core/Inc/can_gateway_priority.h) / [can_gateway_priority.c](Core/Src/can_gateway_priority.c) | 电机优先级 CAN ID 范围表与命中判断（见 §1.4） |
+| [can_gateway_priority.h](Core/Inc/can_gateway_priority.h) / [can_gateway_priority.c](Core/Src/can_gateway_priority.c) | 电机控制帧（CAN ID 0x100）判定，下行优先级队列的分类依据（见 §1.4） |
 | [firmware_flow.h](Core/Inc/firmware_flow.h) / [firmware_flow.c](Core/Src/firmware_flow.c) | AA59 会话、逻辑块队列、Classic CAN 分片、CAN FD DLC、累计 ACK |
 | [system_heartbeat.h](Core/Inc/system_heartbeat.h) / [system_heartbeat.c](Core/Src/system_heartbeat.c) | AA58 PING 和队列占用状态 |
 | [usb_can_gateway.h](Core/Inc/usb_can_gateway.h) / [usb_can_gateway.c](Core/Src/usb_can_gateway.c) | USB CDC 传输抽象、RX 环形缓存、TX 队列和回调衔接 |

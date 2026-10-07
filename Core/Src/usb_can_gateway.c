@@ -1,6 +1,5 @@
 #include "usb_can_gateway.h"
 
-#include "can_gateway_priority.h"
 #include "firmware_flow.h"
 #include "sensor_protocol.h"
 #include "usbd_cdc_if.h"
@@ -14,8 +13,7 @@ typedef struct
 } UsbCanTxPacket_t;
 
 #define USB_CAN_RX_RING_MASK  (USB_CAN_RX_RING_SIZE - 1U)
-#define USB_CAN_TX_QUEUE_HIGH_MASK (USB_CAN_TX_QUEUE_HIGH_SIZE - 1U)
-#define USB_CAN_TX_QUEUE_LOW_MASK  (USB_CAN_TX_QUEUE_LOW_SIZE - 1U)
+#define USB_CAN_TX_QUEUE_MASK (USB_CAN_TX_QUEUE_SIZE - 1U)
 /* 路由器半帧超过该时间没有新字节时，丢弃旧长度并重新同步。 */
 #define USB_PROTOCOL_ROUTE_TIMEOUT_MS 1000U
 
@@ -24,15 +22,10 @@ static volatile uint16_t usb_can_rx_head = 0U; /* RX 环写入索引。 */
 static volatile uint16_t usb_can_rx_tail = 0U; /* RX 环读取索引。 */
 static volatile uint8_t usb_can_rx_paused = 0U; /* 是否暂停提交 USB OUT 接收。 */
 
-/* USB TX 双优先级队列：电机相关 AA55 包进高优先级队列，其余进普通队列。 */
-static UsbCanTxPacket_t usb_can_tx_queue_high[USB_CAN_TX_QUEUE_HIGH_SIZE];
-static UsbCanTxPacket_t usb_can_tx_queue_low[USB_CAN_TX_QUEUE_LOW_SIZE];
-static volatile uint16_t usb_can_tx_head_high = 0U; /* 高优先级入队索引。 */
-static volatile uint16_t usb_can_tx_tail_high = 0U; /* 高优先级发送槽索引。 */
-static volatile uint16_t usb_can_tx_head_low = 0U; /* 普通队列入队索引。 */
-static volatile uint16_t usb_can_tx_tail_low = 0U; /* 普通队列发送槽索引。 */
+static UsbCanTxPacket_t usb_can_tx_queue[USB_CAN_TX_QUEUE_SIZE]; /* 待发送 TX 槽位。 */
+static volatile uint16_t usb_can_tx_head = 0U; /* TX 入队索引。 */
+static volatile uint16_t usb_can_tx_tail = 0U; /* 当前发送槽索引。 */
 static volatile uint8_t usb_can_tx_busy = 0U; /* 当前槽是否等待 CDC 完成。 */
-static volatile uint8_t usb_can_tx_busy_high = 0U; /* busy 期间在途包所属队列。 */
 static volatile uint32_t usb_can_tx_start_tick = 0U; /* 当前传输开始 tick。 */
 
 static volatile uint32_t usb_can_rx_drop_count = 0U; /* RX 环满丢弃的字节数。 */
@@ -72,15 +65,13 @@ static uint16_t UsbCanGateway_RxFree(void)
 
 static uint16_t UsbCanGateway_TxUsed(void)
 {
-  uint16_t used_high;
-  uint16_t used_low;
+  uint16_t head;
+  uint16_t tail;
 
   __DMB();
-  used_high = (uint16_t)((usb_can_tx_head_high - usb_can_tx_tail_high) &
-                         USB_CAN_TX_QUEUE_HIGH_MASK);
-  used_low = (uint16_t)((usb_can_tx_head_low - usb_can_tx_tail_low) &
-                        USB_CAN_TX_QUEUE_LOW_MASK);
-  return (uint16_t)(used_high + used_low);
+  head = usb_can_tx_head;
+  tail = usb_can_tx_tail;
+  return (uint16_t)((head - tail) & USB_CAN_TX_QUEUE_MASK);
 }
 
 static void UsbCanGateway_RouteReset(void)
@@ -356,77 +347,33 @@ void UsbCanGateway_RxPush(const uint8_t *data, uint16_t len)
   }
 }
 
-/*
- * 判断一个待发送协议包是否属于电机优先级流量。
- * 只有 AA55 CAN 数据帧携带 CAN_ID（偏移 5..8 小端）：电机相关 ID 的
- * 上行回报进高优先级队列；AA5B 传感器遥测、AA58 心跳、状态帧与其余
- * AA55 数据一律进普通队列，为电机数据让路。
- */
-static uint8_t UsbCanGateway_TxPacketPriority(const uint8_t *data,
-                                              uint16_t len)
-{
-  uint32_t id;
-
-  if ((len < 9U) || (data[0] != 0xAAU) || (data[1] != 0x55U))
-  {
-    return 0U;
-  }
-
-  id = ((uint32_t)data[5]) |
-       (((uint32_t)data[6]) << 8U) |
-       (((uint32_t)data[7]) << 16U) |
-       (((uint32_t)data[8]) << 24U);
-  return CanGateway_IsMotorPriorityId(id);
-}
-
 HAL_StatusTypeDef UsbCanGateway_TxEnqueue(const uint8_t *data, uint16_t len)
 {
-  UsbCanTxPacket_t *queue;
-  volatile uint16_t *head;
-  volatile uint16_t *tail;
-  uint16_t mask;
-  uint16_t head_index;
+  uint16_t head;
   uint16_t next;
   uint16_t i;
-  uint8_t high;
 
   if ((data == NULL) || (len == 0U) || (len > USB_CAN_PACKET_SIZE))
   {
     return HAL_ERROR;
   }
 
-  high = UsbCanGateway_TxPacketPriority(data, len);
-  if (high != 0U)
-  {
-    queue = usb_can_tx_queue_high;
-    head = &usb_can_tx_head_high;
-    tail = &usb_can_tx_tail_high;
-    mask = USB_CAN_TX_QUEUE_HIGH_MASK;
-  }
-  else
-  {
-    queue = usb_can_tx_queue_low;
-    head = &usb_can_tx_head_low;
-    tail = &usb_can_tx_tail_low;
-    mask = USB_CAN_TX_QUEUE_LOW_MASK;
-  }
-
-  head_index = *head;
-  next = (uint16_t)((head_index + 1U) & mask);
-  if (next == (*tail))
+  head = usb_can_tx_head;
+  next = (uint16_t)((head + 1U) & USB_CAN_TX_QUEUE_MASK);
+  if (next == usb_can_tx_tail)
   {
     /* 可靠队列满时明确返回 BUSY，不覆盖尚未发送的数据。 */
     usb_can_tx_drop_count++;
     return HAL_BUSY;
   }
 
-  queue[head_index].len = len;
+  usb_can_tx_queue[head].len = len;
   for (i = 0U; i < len; i++)
   {
-    queue[head_index].data[i] = data[i];
+    usb_can_tx_queue[head].data[i] = data[i];
   }
   __DMB();
-  *head = next;
+  usb_can_tx_head = next;
   return HAL_OK;
 }
 
@@ -498,9 +445,7 @@ void UsbCanGateway_RxMarkPaused(void)
 
 static void UsbCanGateway_ProcessTx(void)
 {
-  UsbCanTxPacket_t *queue;
   uint16_t tail;
-  uint8_t high;
   uint8_t result;
 
   /*
@@ -526,30 +471,18 @@ static void UsbCanGateway_ProcessTx(void)
     usb_can_tx_busy = 0U;
   }
 
-  /* 高优先级（电机相关）队列非空时先发送，普通队列随后。 */
-  if (usb_can_tx_tail_high != usb_can_tx_head_high)
-  {
-    high = 1U;
-    queue = usb_can_tx_queue_high;
-  }
-  else if (usb_can_tx_tail_low != usb_can_tx_head_low)
-  {
-    high = 0U;
-    queue = usb_can_tx_queue_low;
-  }
-  else
+  if (usb_can_tx_tail == usb_can_tx_head)
   {
     return;
   }
 
-  tail = (high != 0U) ? usb_can_tx_tail_high : usb_can_tx_tail_low;
-  /* 记录在途包所属队列，完成回调据此推进对应的 tail。 */
-  usb_can_tx_busy_high = high;
+  tail = usb_can_tx_tail;
   /* 先标记 busy，再调用底层，避免极短传输完成回调抢先到达。 */
   usb_can_tx_start_tick = HAL_GetTick();
   __DMB();
   usb_can_tx_busy = 1U;
-  result = CDC_Transmit_FS(queue[tail].data, queue[tail].len);
+  result = CDC_Transmit_FS(usb_can_tx_queue[tail].data,
+                           usb_can_tx_queue[tail].len);
   if (result != USBD_OK)
   {
     __DMB();
@@ -569,16 +502,8 @@ void UsbCanGateway_TxComplete(void)
     return;
   }
 
-  if (usb_can_tx_busy_high != 0U)
-  {
-    usb_can_tx_tail_high = (uint16_t)((usb_can_tx_tail_high + 1U) &
-                                      USB_CAN_TX_QUEUE_HIGH_MASK);
-  }
-  else
-  {
-    usb_can_tx_tail_low = (uint16_t)((usb_can_tx_tail_low + 1U) &
-                                     USB_CAN_TX_QUEUE_LOW_MASK);
-  }
+  usb_can_tx_tail = (uint16_t)((usb_can_tx_tail + 1U) &
+                               USB_CAN_TX_QUEUE_MASK);
   __DMB();
   usb_can_tx_busy = 0U;
   usb_can_tx_start_tick = 0U;
@@ -630,7 +555,8 @@ void UsbCanGateway_GetBufferUsage(uint8_t *rx_percent,
   __DMB();
   rx_used = (uint16_t)((usb_can_rx_head - usb_can_rx_tail) &
                        USB_CAN_RX_RING_MASK);
-  tx_used = UsbCanGateway_TxUsed();
+  tx_used = (uint16_t)((usb_can_tx_head - usb_can_tx_tail) &
+                       USB_CAN_TX_QUEUE_MASK);
 
   if (rx_percent != NULL)
   {
@@ -640,7 +566,7 @@ void UsbCanGateway_GetBufferUsage(uint8_t *rx_percent,
   if (tx_percent != NULL)
   {
     *tx_percent = UsbCanGateway_UsagePercent(tx_used,
-                                              USB_CAN_TX_QUEUE_USABLE);
+                                              USB_CAN_TX_QUEUE_SIZE - 1U);
   }
 }
 

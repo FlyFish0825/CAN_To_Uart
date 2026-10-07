@@ -38,24 +38,30 @@ typedef enum
 } GatewayParserState_t;
 
 /*
- * CAN 软件队列采用双优先级结构：电机相关 CAN ID（can_gateway_priority.h
- * 的范围表）命中高优先级队列，其余走普通队列；每个方向一对队列。
- * 两个容量都必须是 2 的幂，环形索引才能用掩码运算。
+ * CAN 软件队列结构：只有下行发送方向做优先级。电机控制帧（CAN ID
+ * 0x100，节点号在 DATA 中，见 can_gateway_priority.h）走高优先级队列，
+ * 其余命令和 AA59 固件块走普通队列；上行接收方向全部反馈按普通单队列
+ * 处理。所有容量都必须是 2 的幂，环形索引才能用掩码运算。
  */
-#define CAN_QUEUE_HIGH_SIZE     16U
-#define CAN_QUEUE_HIGH_MASK     (CAN_QUEUE_HIGH_SIZE - 1U)
-#define CAN_QUEUE_LOW_SIZE      64U
-#define CAN_QUEUE_LOW_MASK      (CAN_QUEUE_LOW_SIZE - 1U)
-/* 两队列合计可用容量，用于占用百分比统计。 */
-#define CAN_QUEUE_USABLE_TOTAL  (CAN_QUEUE_HIGH_SIZE - 1U + CAN_QUEUE_LOW_SIZE - 1U)
+#define CAN_QUEUE_SIZE          64U
+#define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U)
+#define CAN_TX_QUEUE_HIGH_SIZE  16U
+#define CAN_TX_QUEUE_HIGH_MASK  (CAN_TX_QUEUE_HIGH_SIZE - 1U)
+#define CAN_TX_QUEUE_LOW_SIZE   64U
+#define CAN_TX_QUEUE_LOW_MASK   (CAN_TX_QUEUE_LOW_SIZE - 1U)
+/* 下行两队列合计可用容量，用于占用百分比统计。 */
+#define CAN_TX_QUEUE_USABLE_TOTAL (CAN_TX_QUEUE_HIGH_SIZE - 1U + \
+                                   CAN_TX_QUEUE_LOW_SIZE - 1U)
 /* 普通队列保留一段余量，不能等到占满才停止接收；高优先级队列接近
- * 占满同样反压，让上层少投递而不是静默丢电机帧。 */
+ * 占满同样反压，让上层少投递而不是静默丢控制帧。 */
 #define CAN_TX_LOW_WATERMARK    48U
 
-_Static_assert((CAN_QUEUE_HIGH_SIZE & (CAN_QUEUE_HIGH_SIZE - 1U)) == 0U,
-               "CAN high-priority queue size must be a power of two");
-_Static_assert((CAN_QUEUE_LOW_SIZE & (CAN_QUEUE_LOW_SIZE - 1U)) == 0U,
-               "CAN low-priority queue size must be a power of two");
+_Static_assert((CAN_QUEUE_SIZE & (CAN_QUEUE_SIZE - 1U)) == 0U,
+               "CAN rx queue size must be a power of two");
+_Static_assert((CAN_TX_QUEUE_HIGH_SIZE & (CAN_TX_QUEUE_HIGH_SIZE - 1U)) == 0U,
+               "CAN tx high-priority queue size must be a power of two");
+_Static_assert((CAN_TX_QUEUE_LOW_SIZE & (CAN_TX_QUEUE_LOW_SIZE - 1U)) == 0U,
+               "CAN tx low-priority queue size must be a power of two");
 /* 成功状态只做低频诊断，不为每个数据帧生成一个 USB 回包。 */
 #define GATEWAY_STATUS_REPORT_INTERVAL_MS 100U
 /* 硬件 TX FIFO 长时间没有释放槽位时，触发一次控制器恢复。 */
@@ -97,19 +103,18 @@ _Static_assert((CAN_QUEUE_LOW_SIZE & (CAN_QUEUE_LOW_SIZE - 1U)) == 0U,
 #define UART_CFG_OK             0x00U
 #define UART_CFG_BAD_RATE       0x01U
 #define UART_CFG_APPLY_FAILED   0x02U
-/* CAN 接收软件队列：中断负责写入，主循环负责取出并封装上报。 */
-static CanFrame_t can_rx_queue_high[CAN_QUEUE_HIGH_SIZE];
-static volatile uint16_t can_rx_head_high = 0U;
-static volatile uint16_t can_rx_tail_high = 0U;
-static CanFrame_t can_rx_queue_low[CAN_QUEUE_LOW_SIZE];
-static volatile uint16_t can_rx_head_low = 0U;
-static volatile uint16_t can_rx_tail_low = 0U;
+/* CAN 接收软件队列：中断负责写入，主循环负责取出并封装上报。
+ * 上行反馈一律普通 FIFO，不做优先级。 */
+static CanFrame_t can_rx_queue[CAN_QUEUE_SIZE];
+static volatile uint16_t can_rx_head = 0U;
+static volatile uint16_t can_rx_tail = 0U;
 
-/* CAN 发送软件队列：协议解析后写入，主循环再提交给 FDCAN 硬件 FIFO。 */
-static CanTxQueueEntry_t can_tx_queue_high[CAN_QUEUE_HIGH_SIZE];
+/* CAN 发送软件队列：协议解析后按优先级写入，主循环再提交给 FDCAN
+ * 硬件 FIFO。电机控制帧（0x100）走高优先级队列。 */
+static CanTxQueueEntry_t can_tx_queue_high[CAN_TX_QUEUE_HIGH_SIZE];
 static volatile uint16_t can_tx_head_high = 0U;
 static volatile uint16_t can_tx_tail_high = 0U;
-static CanTxQueueEntry_t can_tx_queue_low[CAN_QUEUE_LOW_SIZE];
+static CanTxQueueEntry_t can_tx_queue_low[CAN_TX_QUEUE_LOW_SIZE];
 static volatile uint16_t can_tx_head_low = 0U;
 static volatile uint16_t can_tx_tail_low = 0U;
 static CanGatewayTxCompletionFn can_tx_completion_callback = NULL;
@@ -440,48 +445,26 @@ static HAL_StatusTypeDef Gateway_SendStatusPacket(uint32_t id,
 
 static void CanRx_ProcessTransport(void)
 {
-  CanFrame_t frame;
-  uint8_t high;
-  uint16_t tail;
-
   /*
    * 数据路径 2（CAN -> 上位机）的主循环阶段：
-   * HAL_FDCAN_RxFifo0Callback() 已在中断中把 CAN 报文按优先级存入
-   * can_rx 高/低队列，此处取出时高优先级（电机相关 ID）队列非空必先
-   * 上报，普通队列随后；封装成 AA 55 ... CRC 55 AA 交给外部发送队列。
-   * 每轮只处理一帧，避免 CAN 突发数据长期占用主循环。
+   * HAL_FDCAN_RxFifo0Callback() 已在中断中把 CAN 报文存入 can_rx_queue，
+   * 此处取出一帧，封装成 AA 55 ... CRC 55 AA，并交给外部接口发送队列。
+   * 上行反馈一律普通 FIFO；每轮只处理一帧，避免 CAN 突发数据长期占用
+   * 主循环。
    */
-  if (can_rx_tail_high != can_rx_head_high)
+  if (can_rx_tail != can_rx_head)
   {
-    high = 1U;
-    tail = can_rx_tail_high;
-    frame = can_rx_queue_high[tail];
-  }
-  else if (can_rx_tail_low != can_rx_head_low)
-  {
-    high = 0U;
-    tail = can_rx_tail_low;
-    frame = can_rx_queue_low[tail];
-  }
-  else
-  {
-    return;
-  }
+    uint16_t tail = can_rx_tail;
+    CanFrame_t frame = can_rx_queue[tail];
 
-  /* 外部发送队列暂忙时保留当前 CAN 帧，下一轮继续尝试。 */
-  if (Gateway_SendCanPacket(&frame) != HAL_OK)
-  {
-    return;
-  }
+    /* 外部发送队列暂忙时保留当前 CAN 帧，下一轮继续尝试。 */
+    if (Gateway_SendCanPacket(&frame) != HAL_OK)
+    {
+      return;
+    }
 
-  __DMB();
-  if (high != 0U)
-  {
-    can_rx_tail_high = (uint16_t)((tail + 1U) & CAN_QUEUE_HIGH_MASK);
-  }
-  else
-  {
-    can_rx_tail_low = (uint16_t)((tail + 1U) & CAN_QUEUE_LOW_MASK);
+    __DMB();
+    can_rx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
   }
 }
 
@@ -509,11 +492,11 @@ static void CanTx_AdvanceTail(uint8_t high, uint16_t tail)
   __DMB();
   if (high != 0U)
   {
-    can_tx_tail_high = (uint16_t)((tail + 1U) & CAN_QUEUE_HIGH_MASK);
+    can_tx_tail_high = (uint16_t)((tail + 1U) & CAN_TX_QUEUE_HIGH_MASK);
   }
   else
   {
-    can_tx_tail_low = (uint16_t)((tail + 1U) & CAN_QUEUE_LOW_MASK);
+    can_tx_tail_low = (uint16_t)((tail + 1U) & CAN_TX_QUEUE_LOW_MASK);
   }
 }
 
@@ -529,8 +512,8 @@ static void CanTx_ProcessBus(void)
   /*
    * 数据路径 1（外部接口 -> CAN）的最终发送阶段：
    * QueueCanTxFromPacket() 已把校验后的命令按优先级放入 can_tx 高/低
-   * 队列；电机相关 ID 的高优先级队列非空时必须先发送，普通队列随后。
-   * 此处转换为 FDCAN 发送头，并写入 FDCAN1 的硬件 TX FIFO。
+   * 队列；电机控制帧（0x100）的高优先级队列非空时必须先发送，普通
+   * 队列随后。此处转换为 FDCAN 发送头，并写入 FDCAN1 的硬件 TX FIFO。
    * HAL_OK 仅代表写入硬件 FIFO 成功，不代表总线已得到 ACK。
    */
   if ((can_tx_tail_high == can_tx_head_high) &&
@@ -774,8 +757,8 @@ static void Gateway_SendConfigResponse(void)
  *
  * tracked=0 用于普通 CAN 帧；tracked=1 时保存上层提供的 token，之后由
  * CanTx_ProcessBus() 在硬件提交成功或明确失败时产生一次完成通知。
- * 电机相关 CAN ID 进高优先级队列（CanTx_ProcessBus 先发），其余进普通
- * 队列；两个队列独立判满，互不挤占槽位。
+ * 电机控制帧（0x100，节点号在 DATA 中）进高优先级队列
+ * （CanTx_ProcessBus 先发），其余进普通队列；两个队列独立判满。
  */
 static CanGatewayIoResult_t CanGateway_QueueCanFrameInternal(
     const CanGatewayCanFrame_t *frame,
@@ -795,20 +778,20 @@ static CanGatewayIoResult_t CanGateway_QueueCanFrameInternal(
     return CAN_GATEWAY_IO_ERROR;
   }
 
-  high = CanGateway_IsMotorPriorityId(frame->id);
+  high = CanGateway_IsMotorControlId(frame->id);
   if (high != 0U)
   {
     queue = can_tx_queue_high;
     head = &can_tx_head_high;
     tail = &can_tx_tail_high;
-    mask = CAN_QUEUE_HIGH_MASK;
+    mask = CAN_TX_QUEUE_HIGH_MASK;
   }
   else
   {
     queue = can_tx_queue_low;
     head = &can_tx_head_low;
     tail = &can_tx_tail_low;
-    mask = CAN_QUEUE_LOW_MASK;
+    mask = CAN_TX_QUEUE_LOW_MASK;
   }
 
   head_index = *head;
@@ -1127,13 +1110,13 @@ uint8_t CanGateway_CanTxReady(void)
 
   __DMB();
   used_high = (uint16_t)((can_tx_head_high - can_tx_tail_high) &
-                         CAN_QUEUE_HIGH_MASK);
+                         CAN_TX_QUEUE_HIGH_MASK);
   used_low = (uint16_t)((can_tx_head_low - can_tx_tail_low) &
-                        CAN_QUEUE_LOW_MASK);
+                        CAN_TX_QUEUE_LOW_MASK);
   /* 普通队列超水位，或高优先级队列接近占满时，暂停输入形成反压，
-   * 让主机少投递而不是让电机帧在队列满后被丢弃。 */
+   * 让主机少投递而不是让控制帧在队列满后被丢弃。 */
   return ((used_low < CAN_TX_LOW_WATERMARK) &&
-          (used_high < (CAN_QUEUE_HIGH_SIZE - 1U))) ? 1U : 0U;
+          (used_high < (CAN_TX_QUEUE_HIGH_SIZE - 1U))) ? 1U : 0U;
 }
 
 static uint8_t CanGateway_UsagePercent(uint16_t used, uint16_t capacity)
@@ -1155,20 +1138,18 @@ void CanGateway_GetQueueUsage(uint8_t *rx_percent,
   uint16_t tx_used;
 
   __DMB();
-  rx_used = (uint16_t)(
-      ((can_rx_head_high - can_rx_tail_high) & CAN_QUEUE_HIGH_MASK) +
-      ((can_rx_head_low - can_rx_tail_low) & CAN_QUEUE_LOW_MASK));
+  rx_used = (uint16_t)((can_rx_head - can_rx_tail) & CAN_QUEUE_MASK);
   tx_used = (uint16_t)(
-      ((can_tx_head_high - can_tx_tail_high) & CAN_QUEUE_HIGH_MASK) +
-      ((can_tx_head_low - can_tx_tail_low) & CAN_QUEUE_LOW_MASK));
+      ((can_tx_head_high - can_tx_tail_high) & CAN_TX_QUEUE_HIGH_MASK) +
+      ((can_tx_head_low - can_tx_tail_low) & CAN_TX_QUEUE_LOW_MASK));
 
   if (rx_percent != NULL)
   {
-    *rx_percent = CanGateway_UsagePercent(rx_used, CAN_QUEUE_USABLE_TOTAL);
+    *rx_percent = CanGateway_UsagePercent(rx_used, CAN_QUEUE_SIZE - 1U);
   }
   if (tx_percent != NULL)
   {
-    *tx_percent = CanGateway_UsagePercent(tx_used, CAN_QUEUE_USABLE_TOTAL);
+    *tx_percent = CanGateway_UsagePercent(tx_used, CAN_TX_QUEUE_USABLE_TOTAL);
   }
 }
 
@@ -1177,8 +1158,8 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
 {
   /*
    * 数据路径 2（CAN -> 上位机）的中断入口：
-   * 从 FDCAN1 RX FIFO0 读出原始 CAN 帧，转换为 CanFrame_t 并按 CAN ID
-   * 优先级写入 can_rx 高/低队列。
+   * 从 FDCAN1 RX FIFO0 读出原始 CAN 帧，转换为 CanFrame_t 写入 can_rx_queue
+   * （上行反馈一律普通 FIFO）。
    * 中断中不直接调用外部接口发送，实际上报由 CanRx_ProcessTransport()
    * 在主循环完成。
    */
@@ -1235,36 +1216,18 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
       }
     }
 
-    /* 电机相关 CAN ID 进高优先级队列，保证上报实时性；其余进普通队列。
-     * 两个队列独立判满，任一队列满时丢弃当前帧并累加计数。 */
-    if (CanGateway_IsMotorPriorityId(frame.id) != 0U)
+    /* 上行反馈一律普通 FIFO 入队，不做优先级。 */
+    head = can_rx_head;
+    next = (uint16_t)((head + 1U) & CAN_QUEUE_MASK);
+    if (next == can_rx_tail)
     {
-      head = can_rx_head_high;
-      next = (uint16_t)((head + 1U) & CAN_QUEUE_HIGH_MASK);
-      if (next == can_rx_tail_high)
-      {
-        can_rx_drop_count++;
-        continue;
-      }
-
-      can_rx_queue_high[head] = frame;
-      __DMB();
-      can_rx_head_high = next;
+      can_rx_drop_count++;
+      continue;
     }
-    else
-    {
-      head = can_rx_head_low;
-      next = (uint16_t)((head + 1U) & CAN_QUEUE_LOW_MASK);
-      if (next == can_rx_tail_low)
-      {
-        can_rx_drop_count++;
-        continue;
-      }
 
-      can_rx_queue_low[head] = frame;
-      __DMB();
-      can_rx_head_low = next;
-    }
+    can_rx_queue[head] = frame;
+    __DMB();
+    can_rx_head = next;
   }
 }
 
