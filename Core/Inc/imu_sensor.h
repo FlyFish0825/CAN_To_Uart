@@ -7,7 +7,7 @@
  * UART/DMA/Pin，也不产生调试文本。上位机 AA5B 层（由统筹方实现）通过
  * GetSample/GetParameter/Request/PopResult 消费本模块。
  *
- * 数据路径约定（集成方负责传输层，见 docs/imu-sensor-progress.md）：
+ * 数据路径约定（集成方负责传输层，见 docs/imu-sensor.md）：
  *   USART1 RX（DMA 循环 + IDLE）→ 集成层在主循环里按 NDTR 游标取有界
  *   分段（读前对 D-Cache 做 Invalidate，缓冲必须放在 DMA 可访问内存如
  *   .dma_buffer/RAM_D2，32 字节对齐）→ ImuSensor_Feed() 有界拷贝入本
@@ -45,7 +45,7 @@ extern "C" {
 #define IMU_SENSOR_FRESH_US 500000ULL
 #endif
 
-/** 请求操作码；与 AA5B CMD 的映射关系见 docs/imu-sensor-progress.md。 */
+/** 请求操作码；与 AA5B CMD 的映射关系见 docs/imu-sensor.md。 */
 enum ImuSensorRequestOp
 {
   IMU_SENSOR_REQ_SET_RATE = 1,            /* 原生 0x60，arg=Hz(10..100)，无回复。 */

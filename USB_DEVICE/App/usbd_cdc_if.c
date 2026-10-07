@@ -148,6 +148,19 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 };
 
 /* Private functions ---------------------------------------------------------*/
+/*
+ * CDC OUT 端点接收状态跟踪：0 表示端点未提交接收（主机写入会被 NAK）。
+ * 该标志与 usb_can_gateway 的 paused 标志配合：paused=1 表示主动反压，
+ * armed=0 则覆盖"端点意外失去提交且 paused 已被配置事件清零"的死角，
+ * 让主循环的恢复逻辑能在两种情况下都重新提交 OUT 接收。
+ */
+static volatile uint8_t cdc_rx_armed = 0U;
+
+uint8_t CDC_IsRxArmed(void)
+{
+  return cdc_rx_armed;
+}
+
 /**
   * @brief  Initializes the CDC media low layer over the FS USB IP
   * @retval USBD_OK if all operations are OK else USBD_FAIL
@@ -160,6 +173,8 @@ static int8_t CDC_Init_FS(void)
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
   UsbCanGateway_OnConfigured();
+  /* USBD_CDC_Init 在类初始化末尾通过 PrepareReceive 提交 OUT 接收。 */
+  cdc_rx_armed = 1U;
   return (USBD_OK);
   /* USER CODE END 3 */
 }
@@ -173,6 +188,7 @@ static int8_t CDC_DeInit_FS(void)
   /* USER CODE BEGIN 4 */
   /* USB 反初始化时保留网关队列数据，只清理当前 CDC 发送状态。 */
   UsbCanGateway_OnDeconfigured();
+  cdc_rx_armed = 0U;
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -271,6 +287,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   /* USER CODE BEGIN 6 */
   /* Buf/Len 属于 USB OUT 回调上下文，必须在本次回调内完成必要的入队。 */
   /* USB OUT 回调只搬字节到 8 KB 环形缓冲，不在中断中解析 AA55 协议。 */
+  cdc_rx_armed = 0U; /* 当前包已到达并消费，OUT 端点暂处于未提交状态。 */
   if ((Buf != NULL) && (Len != NULL) && (*Len <= UINT16_MAX))
   {
     /* OUT 已在上一轮通过水位检查后提交；当前包到达后只写入 RX 队列。 */
@@ -284,7 +301,10 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   if (UsbCanGateway_RxCanRearm(USB_CAN_RX_PACKET_RESERVE) != 0U)
   {
     USBD_CDC_SetRxBuffer(&hUsbDeviceFS, Buf);
-    (void)USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+    if (USBD_CDC_ReceivePacket(&hUsbDeviceFS) == USBD_OK)
+    {
+      cdc_rx_armed = 1U;
+    }
   }
   else
   {
@@ -396,7 +416,14 @@ uint8_t CDC_ResumeReceive_FS(void)
     return USBD_BUSY;
   }
 
-  return USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+  {
+    uint8_t result = USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+    if (result == USBD_OK)
+    {
+      cdc_rx_armed = 1U;
+    }
+    return result;
+  }
 }
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */

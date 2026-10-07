@@ -6,7 +6,7 @@
 
 | 分类 | 入口 | 内容 |
 | --- | --- | --- |
-| 使用与协议 | [快速上手](#1-快速上手)、[普通 CAN 帧协议](#3-普通-can-帧的串口协议)、[状态回复](#4-状态回复怎么读) | USB CDC、AA55/AA58/AA59、CRC、流控和状态包 |
+| 使用与协议 | [快速上手](#1-快速上手)、[普通 CAN 帧协议](#3-普通-can-帧的串口协议)、[上行时间戳适配](#39-上行时间戳与上位机适配指南)、[状态回复](#4-状态回复怎么读) | USB CDC、AA55/AA58/AA59、CRC、流控、状态包和上位机拆包适配 |
 | 构建与维护 | [编译、烧录与维护](#6-编译烧录与维护)、[测试与验证](#10-测试验证入口与审查清单) | CMake 构建、烧录边界、主机测试和板上验证范围 |
 | 源码索引 | [工程边界与文件分工](#8-工程边界与文件分工)、[手写模块与配置文件索引](#9-手写模块与配置文件索引) | CubeMX 生成区、手写模块、配置文件和职责划分 |
 | 硬件参考 | [硬件资料目录](docs/hardware/) | 原理图和 STM32H750 数据手册，按资料归档，不作为自动化构建输入 |
@@ -65,7 +65,8 @@ CRC16-CCITT 参数为多项式 `0x1021`、初值 `0xFFFF`，校验范围是偏�
 连续发送 AA55 数据时不需要在每个包后固定延时。固件通过队列水位和 USB 反压自动调节：
 
 - USB RX 每轮最多解析 256 字节，主循环会持续服务 CAN 和 USB TX；
-- USB RX 缓冲不足、USB TX 队列达到 192/255、或 CAN 软件发送队列达到 48/63 时，暂不重新提交下一次 USB OUT 接收；主机收到 USB NAK 后会自然减速；
+- USB RX 缓冲不足、USB TX 队列达到 192/255、或 CAN 软件发送普通队列达到 48/63（高优先级队列接近占满时同样反压）时，暂不重新提交下一次 USB OUT 接收；主机收到 USB NAK 后会自然减速；
+- 反压期间主机的串口写入会阻塞直至超时（典型报错"信号灯超时时间已到"）——**上位机必须持续读取串口**：若电机反馈等上行流持续灌入而主机长时间不读，发送队列保持满位，写入会一直被拒；暂停恢复后由主循环重新提交 OUT 接收，OUT 端点的提交状态由 armed 标志跟踪，端点意外失去提交时也会自动恢复；
 - USB TX 完成回调超过 1 秒没有回来时，刷新 IN 端点并重试当前包；
 - CAN→USB 发送队列忙时保留当前 CAN 帧，不提前移除；FDCAN 明确拒绝某帧时释放该失败帧并返回 `CAN_FAIL`，防止单帧把队列永久锁住；
 - 成功诊断提示（`USB_RX!!`、`CAN_PUT!`）按 100 ms 合并发送，不再为每个输入帧制造一个回包，避免诊断数据反过来占满 USB TX 队列；
@@ -153,6 +154,35 @@ status(1) | reserved(3)
 了发送请求，不表示总线节点已经 ACK。分片入队失败会保留当前分片位置并重试，明确
 失败则返回 `FORWARD_FAILED`，不会返还对应 credit。
 
+### 1.4 电机控制帧优先调度（本分支特性）
+
+为保障电机控制的实时性，固件在**下行方向（上位机→CAN）**对软件发送队列做了
+双优先级改造：**电机控制帧走高优先级队列，其余数据排在后面**。上行方向所有
+反馈帧一律普通 FIFO，不做优先级。协议格式不变，上位机无需配合改动。
+
+**识别规则**：依据电机控制器（Observer_Motor）协议《04-通信与调试》§8，控制
+通道为 **CAN ID 0x100**（FD/24 字节多节点控制向量 + Classic/8 字节兼容旧单节点
+命令）。注意电机**节点号不在 CAN ID 里**——向量帧在 DATA Byte2 的节点位图、
+Classic 帧在 DATA Byte0——但优先级调度只需区分"是否控制帧"，不需要知道目标
+节点。范围表见 [can_gateway_priority.c](Core/Src/can_gateway_priority.c)，需要
+扩展（例如让 0x000 ENTER_BOOT 也优先）时改表即可。
+
+**优先级行为**（严格优先级：高优先级队列非空时必先发送）：
+
+| 方向 | 队列 | 高优先级 | 普通队列 |
+| --- | --- | --- | --- |
+| 下行 上位机→CAN | `can_tx` 高 16 槽 / 低 64 槽 | CAN ID 0x100 控制帧（FD 向量 / Classic 兼容） | 其余 AA55 命令、AA59 固件块分片 |
+| 上行 CAN→上位机 | `can_rx` 单队列 64 槽 | —（反馈一律普通） | 全部反馈 |
+| 上行 汇聚→USB | `usb_can_tx` 单队列 256 槽 | — | AA55 回报、AA5B 遥测、AA58 心跳按入队顺序 FIFO |
+
+- USB 下行是字节流，无法按帧重排；优先级在 AA55 帧重组后的 `can_tx` 队列生效。
+- AA59 固件块分片按其携带的 CAN_ID 分类；电机固件更新走 Boot 通道
+  （0x000 / 0x180+node），自动落在普通队列，不会插队控制帧。
+- 反压水位不变：USB TX 达 192、CAN 普通队列达 48 或高优先级队列接近占满时暂停
+  USB OUT，形成 NAK 反压而不是丢控制帧。
+- **已实机验证**：致远 ZDS2024B CAN-FD 解码实测——突发写入"8 短帧 + 1 长帧（长帧
+  在字节流末尾）"，总线上长帧插到短帧串最前，整串 1.55ms，严格优先级生效。
+
 ## 2. 接线与默认配置
 
 | 接口 | MCU 引脚 | 接法 / 用途 |
@@ -191,11 +221,21 @@ FDCAN 内核时钟配置为 80 MHz；默认仲裁段 1 Mbit/s、FD 数据段 8 M
 
 `|` 只是文档分隔符；`SEQ(2)` 表示 SEQ 占 2 字节；`DATA(N)` 表示 DATA 占 N 字节，N 由 LEN 指定。偏移从 0 开始，因此偏移 9 是第 10 个字节。
 
-电脑发送与板卡上报的普通 CAN 帧使用同一格式。所有多字节整数均为**小端序**。
+电脑发送与板卡上报的普通 CAN 帧使用同一格式，仅有一处差异：**板卡上行帧在 DATA 之后追加 4 字节 `TIMESTAMP_US` 时间戳**，电脑下行帧没有该字段。所有多字节整数均为**小端序**。
+
+下行帧格式（电脑 → H750）：
 
 ```text
 AA 55 | BODY_LEN | SEQ(2) | CAN_ID(4) | FLAGS | LEN | DATA(N) | CRC8 | 55 AA
 ```
+
+上行帧格式（H750 → 电脑）：
+
+```text
+AA 55 | BODY_LEN | SEQ(2) | CAN_ID(4) | FLAGS | LEN | DATA(N) | TIMESTAMP_US(4) | CRC8 | 55 AA
+```
+
+下行帧字段表：
 
 | 字节偏移（从 0 开始） | 字节数 | 含义 |
 | --- | --- | --- |
@@ -209,13 +249,15 @@ AA 55 | BODY_LEN | SEQ(2) | CAN_ID(4) | FLAGS | LEN | DATA(N) | CRC8 | 55 AA
 | 11 + N | 1 | CRC8 |
 | 12 + N | 2 | 帧尾 `55 AA` |
 
-紧凑格式总长度为 `14 + N`，也就是 `BODY_LEN + 6`。上例 BODY_LEN=`0x10`，LEN=`0x08`，总长 22 字节。
+上行帧的 DATA 之后、CRC 之前多出 4 字节 `TIMESTAMP_US`：CAN 接收上报帧记录**中断捕获时刻**，状态提示与配置回复记录**封装时刻**。单位为微秒（毫秒时基 ×1000，分辨率 1 ms），32 位无符号约 71.6 分钟回绕一次，与 AA58/AA59/AA5B 帧族的时间戳同一时基。上行 BODY_LEN 为 `12 + N`，总长 `18 + N`；CRC 覆盖从 BODY_LEN 到 TIMESTAMP_US 末尾（`BODY_LEN + 1` 字节）。
+
+下行帧紧凑格式总长度为 `14 + N`，也就是 `BODY_LEN + 6`。上例 BODY_LEN=`0x10`，LEN=`0x08`，总长 22 字节。
 
 ### 3.2 每个字段怎么填写
 
 **帧头 AA 55**：固定两个字节，帮助接收端找到报文起点。不是 CAN ID，也不计入 BODY_LEN。帧尾固定为反向的 `55 AA`，不要写成 `AA 55`。
 
-**BODY_LEN（包体长度）**：包体从 SEQ 开始，到 DATA 最后一个字节结束。其固定部分为 `SEQ 2 + CAN_ID 4 + FLAGS 1 + LEN 1 = 8` 字节，所以紧凑格式填 `8 + N`。不包含帧头、BODY_LEN 自己、CRC、帧尾。例如 N=0 填 `08`；N=8 填 `10`；N=12 填 `14`；N=64 填 `48`。它与 LEN 不是同一个长度。
+**BODY_LEN（包体长度）**：包体从 SEQ 开始，到 DATA 最后一个字节结束（上行帧还包含其后的 TIMESTAMP_US）。其固定部分为 `SEQ 2 + CAN_ID 4 + FLAGS 1 + LEN 1 = 8` 字节，所以**下行**紧凑格式填 `8 + N`，**上行**为 `12 + N`。不包含帧头、BODY_LEN 自己、CRC、帧尾。例如下行 N=0 填 `08`；N=8 填 `10`；N=12 填 `14`；N=64 填 `48`（上行对应为 `0C`/`14`/`18`/`4C`）。它与 LEN 不是同一个长度。
 
 **SEQ（序号）**：占 2 字节，范围 0..65535。手工测试可固定为 `01 00`；上位机可以每发一帧加 1，65535 后回到 0。当前固件不检查输入序号是否连续，也不去重，不要把重复序号当成重发保护。普通输出序号由板卡独立生成，不能拿它匹配某条输入命令。
 
@@ -293,9 +335,11 @@ AA 55 | BODY_LEN | SEQ(2) | CAN_ID(4) | FLAGS | LEN | DATA(N) | CRC8 | 55 AA
 
 例如想用 FD 发送 10 字节，不能填写 LEN=`0A`。应按目标设备协议允许的方式补到 12 字节，然后填 LEN=`0C`，BODY_LEN=`14`，重新计算 CRC。固件不会自动补齐不合法长度。
 
+上表为**下行**帧长度。**上行**帧每行总长加 4 字节（TIMESTAMP_US），即 `18 + N`：N=8 时 BODY_LEN=`14`、总长 26 字节；N=64 时 BODY_LEN=`4C`、总长 82 字节。
+
 接收端还接受 BODY_LEN=`0x48` 的固定长度格式：DATA 区占满 64 字节，不足部分填零，CRC 覆盖填充字节，总长 78 字节。优先使用紧凑格式。**旧版无帧尾的 76 字节报文不兼容，不能直接发送。**
 
-固定格式的 SEQ、ID、FLAGS、LEN 偏移不变；DATA 区为偏移 11..74，CRC 为偏移 75，帧尾为偏移 76..77。LEN 仍写真实数据长度，例如经典 CAN 8 字节仍填 `08`。后续填充字节不发送到 CAN，但参与串口 CRC。板卡输出普通帧统一采用紧凑格式，不跟随电脑输入格式。
+固定格式的 SEQ、ID、FLAGS、LEN 偏移不变；DATA 区为偏移 11..74，CRC 为偏移 75，帧尾为偏移 76..77。LEN 仍写真实数据长度，例如经典 CAN 8 字节仍填 `08`。后续填充字节不发送到 CAN，但参与串口 CRC。板卡输出普通帧统一采用紧凑格式并在 DATA 后追加时间戳，不跟随电脑输入格式。
 
 ### 3.5 将快速示例逐项拆开
 
@@ -320,10 +364,10 @@ AA 55 | 10 | 01 00 | 23 01 00 00 | 00 | 08 | 11 22 33 44 55 66 77 88 | BC | 55 A
 ### 3.6 接收程序如何拆包
 
 1. 将串口收到的字节追加到接收缓存，查找帧头 `AA 55`，丢弃它前面的杂字节。
-2. 至少有 3 字节时读取 BODY_LEN，合法范围为 8..72；范围错误则继续寻找帧头。
+2. 至少有 3 字节时读取 BODY_LEN；板卡上行帧合法范围为 12..76（数据/状态帧 `12+N`、配置回复 `15`）；范围错误则继续寻找帧头。
 3. 缓存不足 `BODY_LEN + 6` 字节时继续等待，不能将当前半包当成完整包。
 4. 检查偏移 `BODY_LEN + 4` 与 `BODY_LEN + 5` 为 `55 AA`，检查偏移 `BODY_LEN + 3` 的 CRC。
-5. 再按 FLAGS 区分普通帧与配置回复，检查各字段语义；消费这一包后继续处理缓存中剩余数据。
+5. 再按 FLAGS 区分普通帧与配置回复，检查各字段语义；上行普通帧的 TIMESTAMP_US 位于 DATA 之后（偏移 `11 + N` 起 4 字节）；消费这一包后继续处理缓存中剩余数据。
 
 这是上位机的建议拆包流程。上位机遇到坏包可从候选帧头后一字节重新搜索，并自行设计半包超时。当前固件在已接受的长度收满后才判定坏包，并不会回扫该坏包内部寻找下一个帧头；也未实现半包超时。因此不能宣称丢字节后下一帧必定立即恢复。
 
@@ -430,17 +474,111 @@ AA 55 10 01 00 E5 50 FF 18 09 08 00 00 00 00 00 00 00 00 74 55 AA
 
 第一条最后三个字节为 `55 55 AA`，第一个 `55` 是 CRC，后两个才是帧尾，这是合法报文。不要因为 CRC 恰好等于标记字节而删除它。
 
-## 4. 状态回复怎么读
+### 3.9 上行时间戳与上位机适配指南
 
-状态包只在串口输出，使用普通 CAN 帧形状，FLAGS=0，LEN=8。
+**适用固件**：`电机优先调度` 分支 `2119add` 及之后烧录的固件。仅板卡→上位机方向变化，下行完全不变，本变更与电机优先调度功能相互独立。
 
-例如以下为 SEQ=1 的 UART_RX! 状态包（实际 SEQ、CRC 随运行改变）：
+| 帧族 | 是否变化 | 时间戳位置 |
+| --- | --- | --- |
+| AA55 数据上报 / 状态提示 | **变了**：DATA 后新增 4 字节 | 帧尾，CRC 之前 |
+| AA55 波特率配置回复 | **变了**：包体 17→21 字节，总长 23→27 字节（见第 5 节） | 参数后、CRC 前 |
+| AA55 下行命令 | 不变（`BODY_LEN=8+N`，不要自行加时间戳） | — |
+| AA58 / AA59 / AA5B | 不变（原本就有） | 固定偏移 12..15 |
 
-```text
-AA 55 10 01 00 FE 07 00 00 00 08 55 41 52 54 5F 52 58 21 6D 55 AA
+注意：AA58/AA59/AA5B 的时间戳在固定偏移 12..15；AA55 上行因为沿用旧 8 位 LEN 布局，时间戳在**帧尾**，两处不要混淆。
+
+**TIMESTAMP_US 语义**：CAN 上报帧记录**中断从 FDCAN RX FIFO 读出的时刻**（总线到达时间，不含软件排队延迟）；状态/提示/配置回复记录封装时刻。单位微秒（毫秒 tick ×1000，分辨率 1 ms，同一毫秒内多帧相同），32 位约 71.6 分钟回绕，与 AA58/AA59/AA5B 同一时基可跨帧族差分。
+
+**新旧固件兼容**：`body_len == 12+N` 为新格式、`8+N` 为旧格式，但 `body_len==20` 时两者有歧义（新 N=8 vs 旧 N=12）——先按新格式验 CRC，失败再按旧格式重试，以 CRC 通过者为准。
+
+参考拆包代码（Python 3，`ts_state` 初始化为 `[0, 0, 0]`）：
+
+```python
+def crc8(data):
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+    return crc
+
+
+def unpack_aa55_uplink(buf, ts_state):
+    """从 buf 解析一帧板卡上行 AA55。返回 (packet, consumed)：
+    packet=None 时 consumed 为应丢弃字节数（0=等待更多数据）。"""
+    i = buf.find(b'\xAA\x55')
+    if i > 0:
+        return None, i                      # 丢弃帧头前杂字节
+    if len(buf) < 3:
+        return None, 0
+    body_len = buf[2]
+    if not (12 <= body_len <= 76):          # 上行合法范围（数据帧 12+N、配置回复 0x15）
+        return None, 2
+    total = body_len + 6
+    if len(buf) < total:
+        return None, 0                      # 半包，等待
+    if buf[total - 2:total] != b'\x55\xAA':
+        return None, 2
+    ok = crc8(buf[2:3 + body_len]) == buf[body_len + 3]
+    seq = int.from_bytes(buf[3:5], 'little')
+    raw_ts = int.from_bytes(buf[body_len - 1:body_len + 3], 'little')
+
+    # 32 位回绕 → 64 位扩展：上行上报为单队列 FIFO，时间戳正常单调
+    # 不减；仅大幅倒退（超过半程）视为真实回绕。
+    prev_raw = ts_state[1]
+    if raw_ts < prev_raw and (prev_raw - raw_ts) > 0x80000000:
+        ts_state[2] += 1 << 32
+    ts_state[1] = raw_ts
+    ts64 = ts_state[2] | raw_ts
+
+    if buf[9] == 0x80:                      # 配置回复
+        if body_len != 0x15:
+            return None, 2
+        packet = {'type': 'config_rsp', 'seq': seq, 'cmd': buf[10],
+                  'status': buf[11],
+                  'nominal_bps': int.from_bytes(buf[12:16], 'little'),
+                  'data_bps': int.from_bytes(buf[16:20], 'little'),
+                  'timestamp_us': ts64, 'crc_ok': ok}
+    else:                                   # 普通 CAN 上报 / 状态帧
+        n = buf[10]
+        if body_len != 12 + n:
+            return None, 2
+        packet = {'type': 'can', 'seq': seq,
+                  'can_id': int.from_bytes(buf[5:9], 'little'),
+                  'flags': buf[9], 'len': n,
+                  'data': bytes(buf[11:11 + n]),
+                  'timestamp_us': ts64, 'crc_ok': ok}
+    return packet, total
 ```
 
-`FE 07 00 00` 解码为 ID=0x7FE；`55 41 52 54 5F 52 58 21` 按 ASCII 解码为 `UART_RX!`。串口助手选择 Hex 时只会显示这些字节，不一定直接显示英文。不能把整包都当作文本，因为其中还包含二进制头部和 CRC。
+要点：时间戳取 `buf[body_len-1 : body_len+3]`（CRC 前推 4 字节），CAN 帧/状态帧/配置回复通用；CRC 输入 `buf[2 : 3+body_len]`。
+
+测试向量（CRC 已按固件算法算好；**各向量独立解析，单测时回绕状态清零**）：
+
+```text
+① CAN 上报 N=8 ID=0x123 FLAGS=00 SEQ=1 TS=0：
+AA 55 14 01 00 23 01 00 00 00 08 11 22 33 44 55 66 77 88 00 00 00 00 69 55 AA
+② 状态包 UART_RX! N=8 ID=0x7FE SEQ=1 TS=0：
+AA 55 14 01 00 FE 07 00 00 00 08 55 41 52 54 5F 52 58 21 00 00 00 00 B2 55 AA
+③ CAN FD 上报 N=12 ID=0x123 FLAGS=02 SEQ=1 TS=1000：
+AA 55 18 01 00 23 01 00 00 02 0C AA BB CC DD EE FF 01 02 03 04 05 06 E8 03 00 00 9E 55 AA
+④ 配置回复 SEQ=2 STATUS=00 500k/5M TS=0：
+AA 55 15 02 00 00 00 00 00 80 81 00 20 A1 07 00 40 4B 4C 00 00 00 00 00 C9 55 AA
+```
+
+常见坑：① 不要把时间戳当 DATA（LEN 仍是真实长度，按 `body_len == 12+N` 兜底校验）；② 接收缓冲上限按 82 字节（N=64 FD 帧）预留；③ 同毫秒时间戳相同属正常，排序以接收顺序为准；④ 半包/粘包处理与旧版一致（按 `BODY_LEN+6` 收齐再验帧尾和 CRC）；⑤ 下行帧不要自行加时间戳。
+
+## 4. 状态回复怎么读
+
+状态包只在串口输出，使用上行 CAN 帧形状（DATA 后带 4 字节时间戳），FLAGS=0，LEN=8。
+
+例如以下为 SEQ=1 的 UART_RX! 状态包（实际 SEQ、TIMESTAMP_US、CRC 随运行改变；此处时间戳恰为 0）：
+
+```text
+AA 55 14 01 00 FE 07 00 00 00 08 55 41 52 54 5F 52 58 21 00 00 00 00 B2 55 AA
+```
+
+`FE 07 00 00` 解码为 ID=0x7FE；`55 41 52 54 5F 52 58 21` 按 ASCII 解码为 `UART_RX!`；其后的 `00 00 00 00` 为 TIMESTAMP_US。串口助手选择 Hex 时只会显示这些字节，不一定直接显示英文。不能把整包都当作文本，因为其中还包含二进制头部和 CRC。
 
 | ID | DATA 的 ASCII 内容 | 含义 |
 | --- | --- | --- |
@@ -494,16 +632,16 @@ print(wrap(body).hex(' ').upper())
 AA 55 10 02 00 00 00 00 00 80 01 20 A1 07 00 40 4B 4C 00 02 55 AA
 ```
 
-回复共 23 字节，格式为：
+回复共 27 字节，格式为：
 
 ```text
-AA 55 | 11 | 请求SEQ(2) | 00 00 00 00 | 80 | 81 | STATUS | 当前仲裁速率(4) | 当前数据速率(4) | CRC | 55 AA
+AA 55 | 15 | 请求SEQ(2) | 00 00 00 00 | 80 | 81 | STATUS | 当前仲裁速率(4) | 当前数据速率(4) | TIMESTAMP_US(4) | CRC | 55 AA
 ```
 
 | 回复偏移 | 字节数 | 含义 |
 | --- | --- | --- |
 | 0..1 | 2 | AA 55 |
-| 2 | 1 | 11，即包体 17 字节，不是十进制 11 |
+| 2 | 1 | 15，即包体 21 字节（17 字节参数 + 4 字节时间戳），不是十进制 15 |
 | 3..4 | 2 | 请求序号 |
 | 5..8 | 4 | 00 00 00 00 |
 | 9 | 1 | 80，配置消息 |
@@ -511,8 +649,9 @@ AA 55 | 11 | 请求SEQ(2) | 00 00 00 00 | 80 | 81 | STATUS | 当前仲裁速率(
 | 11 | 1 | STATUS，结果码 |
 | 12..15 | 4 | 软件记录的仲裁速率，小端，bit/s |
 | 16..19 | 4 | 软件记录的数据速率，小端，bit/s |
-| 20 | 1 | 对偏移 2..19 共 18 字节计算 CRC |
-| 21..22 | 2 | 55 AA |
+| 20..23 | 4 | TIMESTAMP_US，毫秒时基×1000，约 71.6 分钟回绕 |
+| 24 | 1 | 对偏移 2..23 共 22 字节计算 CRC |
+| 25..26 | 2 | 55 AA |
 
 配置回复没有普通帧的 LEN 字段，上位机不能用偏移 10 的 `81` 当作数据长度。应先按外层 BODY_LEN 收齐包并验 CRC，再根据 FLAGS 和命令字解析。不要把板卡发回的 `81` 回复直接回发给板卡：它不是有效的设置请求。
 
@@ -546,7 +685,7 @@ cmake --build --preset Release --parallel
 | CAN_To_Uart.ioc | CubeMX 外设配置 |
 | CMakeLists.txt | 网关源文件加入构建 |
 
-RX 使用 DMA1 Stream0 循环模式，256 字节 DMA 缓冲，通过 IDLE、半满和全满事件搬入软件环形缓冲。软件环形缓冲分配 1024 字节、可用 1023 字节。TX 使用 DMA1 Stream1 普通模式，16 个队列槽、可用 15 个。CAN 收发软件队列各 64 槽、可用 63 帧；CAN 硬件 TX FIFO 为 3 帧。
+RX 使用 DMA1 Stream0 循环模式，256 字节 DMA 缓冲，通过 IDLE、半满和全满事件搬入软件环形缓冲。软件环形缓冲分配 1024 字节、可用 1023 字节。TX 使用 DMA1 Stream1 普通模式，16 个队列槽、可用 15 个。USB CDC 为唯一上位机接口；CAN 发送软件队列拆为电机控制高 16 槽（可用 15 帧）+ 普通 64 槽（可用 63 帧），接收队列为单 64 槽；USB TX 队列 256 槽；CAN 硬件 TX FIFO 为 3 帧。
 
 DMA 缓冲区位于 D2 SRAM，32 字节对齐，避免落入 DMA1 不可访问的 DTCM。当前未启用 D-Cache；后续启用时必须处理 DMA 缓存一致性（非缓存区或正确的缓存维护），仅地址对齐并不足够。保持主循环持续调用 CanGateway_Process 和传输层服务函数，避免加入长时间阻塞操作。
 
@@ -613,7 +752,8 @@ firmware_flow_host_test: PASS
 | 文件 | 当前职责 |
 | --- | --- |
 | [can_gateway_protocol.h](Core/Inc/can_gateway_protocol.h) | AA55 字段、标志位、长度和协议约束的共享定义 |
-| [can_gateway_core.h](Core/Inc/can_gateway_core.h) / [can_gateway_core.c](Core/Src/can_gateway_core.c) | AA55 解析、CRC、CAN 收发队列、状态回复、FDCAN 提交和速率命令 |
+| [can_gateway_core.h](Core/Inc/can_gateway_core.h) / [can_gateway_core.c](Core/Src/can_gateway_core.c) | AA55 解析、CRC、CAN 收发双优先级队列、状态回复、FDCAN 提交和速率命令 |
+| [can_gateway_priority.h](Core/Inc/can_gateway_priority.h) / [can_gateway_priority.c](Core/Src/can_gateway_priority.c) | 电机控制帧（CAN ID 0x100）判定，下行优先级队列的分类依据（见 §1.4） |
 | [firmware_flow.h](Core/Inc/firmware_flow.h) / [firmware_flow.c](Core/Src/firmware_flow.c) | AA59 会话、逻辑块队列、Classic CAN 分片、CAN FD DLC、累计 ACK |
 | [system_heartbeat.h](Core/Inc/system_heartbeat.h) / [system_heartbeat.c](Core/Src/system_heartbeat.c) | AA58 PING 和队列占用状态 |
 | [usb_can_gateway.h](Core/Inc/usb_can_gateway.h) / [usb_can_gateway.c](Core/Src/usb_can_gateway.c) | USB CDC 传输抽象、RX 环形缓存、TX 队列和回调衔接 |

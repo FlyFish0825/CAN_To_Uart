@@ -80,6 +80,12 @@ typedef struct
   uint8_t len;
   /** CAN 负载缓冲区；未使用区域不参与发送。 */
   uint8_t data[64];
+  /**
+   * 上行时间戳，单位微秒（毫秒时基 ×1000，32 位约 71.6 分钟回绕）。
+   * CAN 接收帧由接收中断在捕获报文时填写；下行帧和本地构造的
+   * 状态/提示帧不使用该字段，封装上行包时自动按当前时基补填。
+   */
+  uint32_t timestamp_us;
 } CanGatewayCanFrame_t;
 
 /**

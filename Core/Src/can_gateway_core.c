@@ -1,4 +1,5 @@
 #include "can_gateway_core.h"
+#include "can_gateway_priority.h"
 #include "fdcan.h"
 
 typedef CanGatewayCanFrame_t CanFrame_t;
@@ -36,10 +37,31 @@ typedef enum
   GATEWAY_PARSER_READ_BODY          /* 已知总长度，接收剩余字段 */
 } GatewayParserState_t;
 
+/*
+ * CAN 软件队列结构：只有下行发送方向做优先级。电机控制帧（CAN ID
+ * 0x100，节点号在 DATA 中，见 can_gateway_priority.h）走高优先级队列，
+ * 其余命令和 AA59 固件块走普通队列；上行接收方向全部反馈按普通单队列
+ * 处理。所有容量都必须是 2 的幂，环形索引才能用掩码运算。
+ */
 #define CAN_QUEUE_SIZE          64U
 #define CAN_QUEUE_MASK          (CAN_QUEUE_SIZE - 1U)
-/* 保留一段余量，不能等到 63 个槽位全部占满才停止接收。 */
-#define CAN_TX_QUEUE_HIGH_WATERMARK 48U
+#define CAN_TX_QUEUE_HIGH_SIZE  16U
+#define CAN_TX_QUEUE_HIGH_MASK  (CAN_TX_QUEUE_HIGH_SIZE - 1U)
+#define CAN_TX_QUEUE_LOW_SIZE   64U
+#define CAN_TX_QUEUE_LOW_MASK   (CAN_TX_QUEUE_LOW_SIZE - 1U)
+/* 下行两队列合计可用容量，用于占用百分比统计。 */
+#define CAN_TX_QUEUE_USABLE_TOTAL (CAN_TX_QUEUE_HIGH_SIZE - 1U + \
+                                   CAN_TX_QUEUE_LOW_SIZE - 1U)
+/* 普通队列保留一段余量，不能等到占满才停止接收；高优先级队列接近
+ * 占满同样反压，让上层少投递而不是静默丢控制帧。 */
+#define CAN_TX_LOW_WATERMARK    48U
+
+_Static_assert((CAN_QUEUE_SIZE & (CAN_QUEUE_SIZE - 1U)) == 0U,
+               "CAN rx queue size must be a power of two");
+_Static_assert((CAN_TX_QUEUE_HIGH_SIZE & (CAN_TX_QUEUE_HIGH_SIZE - 1U)) == 0U,
+               "CAN tx high-priority queue size must be a power of two");
+_Static_assert((CAN_TX_QUEUE_LOW_SIZE & (CAN_TX_QUEUE_LOW_SIZE - 1U)) == 0U,
+               "CAN tx low-priority queue size must be a power of two");
 /* 成功状态只做低频诊断，不为每个数据帧生成一个 USB 回包。 */
 #define GATEWAY_STATUS_REPORT_INTERVAL_MS 100U
 /* 硬件 TX FIFO 长时间没有释放槽位时，触发一次控制器恢复。 */
@@ -47,14 +69,16 @@ typedef enum
 /* USB 字节流中半帧超过该时间仍未收齐，认为本帧已损坏并重新找帧头。 */
 #define UART_PARSER_TIMEOUT_MS  1000U
 /*
- * AA55 协议长度常量：完整固定缓冲区最大 78 字节；BODY_LEN 包含 SEQ、
- * CAN_ID、FLAGS、LEN 和 DATA，不包含帧头、CRC、帧尾；完整帧总长为
- * BODY_LEN + 6。普通数据帧的 BODY_LEN 范围为 8..72。
+ * AA55 协议长度常量。下行（电脑 -> 板卡）BODY_LEN 包含 SEQ、CAN_ID、
+ * FLAGS、LEN 和 DATA，范围为 8..72；上行（板卡 -> 电脑）在 DATA 后追加
+ * 4 字节 TIMESTAMP_US（毫秒时基×1000，约 71.6 分钟回绕），BODY_LEN 为
+ * 12+LEN。两类帧总长均为 BODY_LEN + 6，上行最大帧 18+64=82 字节。
  */
-#define UART_PACKET_SIZE        78U
+#define UART_TIMESTAMP_SIZE     4U
+#define UART_PACKET_SIZE        82U
 #define UART_PACKET_BODY_LEN    72U
 #define UART_PACKET_MIN_BODY_LEN 8U
-#define UART_CONFIG_RESPONSE_BODY_LEN 17U
+#define UART_CONFIG_RESPONSE_BODY_LEN 21U
 #define UART_FRAME_START_0      0xAAU
 #define UART_FRAME_START_1      0x55U
 #define UART_FRAME_END_0        0x55U
@@ -79,15 +103,20 @@ typedef enum
 #define UART_CFG_OK             0x00U
 #define UART_CFG_BAD_RATE       0x01U
 #define UART_CFG_APPLY_FAILED   0x02U
-/* CAN 接收软件队列：中断负责写入，主循环负责取出并封装上报。 */
+/* CAN 接收软件队列：中断负责写入，主循环负责取出并封装上报。
+ * 上行反馈一律普通 FIFO，不做优先级。 */
 static CanFrame_t can_rx_queue[CAN_QUEUE_SIZE];
 static volatile uint16_t can_rx_head = 0U;
 static volatile uint16_t can_rx_tail = 0U;
 
-/* CAN 发送软件队列：协议解析后写入，主循环再提交给 FDCAN 硬件 FIFO。 */
-static CanTxQueueEntry_t can_tx_queue[CAN_QUEUE_SIZE];
-static volatile uint16_t can_tx_head = 0U;
-static volatile uint16_t can_tx_tail = 0U;
+/* CAN 发送软件队列：协议解析后按优先级写入，主循环再提交给 FDCAN
+ * 硬件 FIFO。电机控制帧（0x100）走高优先级队列。 */
+static CanTxQueueEntry_t can_tx_queue_high[CAN_TX_QUEUE_HIGH_SIZE];
+static volatile uint16_t can_tx_head_high = 0U;
+static volatile uint16_t can_tx_tail_high = 0U;
+static CanTxQueueEntry_t can_tx_queue_low[CAN_TX_QUEUE_LOW_SIZE];
+static volatile uint16_t can_tx_head_low = 0U;
+static volatile uint16_t can_tx_tail_low = 0U;
 static CanGatewayTxCompletionFn can_tx_completion_callback = NULL;
 static void *can_tx_completion_context = NULL;
 
@@ -323,12 +352,16 @@ static HAL_StatusTypeDef GatewayTx_Enqueue(const uint8_t *data, uint16_t len)
   return HAL_ERROR;
 }
 
+static uint32_t ReadU32Le(const uint8_t *p);
+static void WriteU32Le(uint8_t *p, uint32_t value);
+
 static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
 {
   uint8_t packet[UART_PACKET_SIZE];
   uint8_t crc_index;
   uint16_t packet_len;
   uint16_t i;
+  uint32_t timestamp_us;
 
   if (CanFrame_Validate(frame) == 0U)
   {
@@ -338,10 +371,15 @@ static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
   /*
    * 此函数只做“CAN 帧 -> AA55 协议帧”的封装并写入外部接口发送队列。
    * 它用于 CAN 接收上报、启动提示和状态提示；不会向 CAN 总线发送数据。
+   * 上行帧在 DATA 之后追加 4 字节 TIMESTAMP_US：CAN 接收帧沿用中断
+   * 捕获时刻，本地构造的状态/提示帧回退为当前时基（毫秒×1000）。
    */
+  timestamp_us = (frame->timestamp_us != 0U) ? frame->timestamp_us
+                                              : (HAL_GetTick() * 1000U);
   packet[0] = UART_FRAME_START_0;
   packet[1] = UART_FRAME_START_1;
-  packet[2] = (uint8_t)(UART_PACKET_MIN_BODY_LEN + frame->len);
+  packet[2] = (uint8_t)(UART_PACKET_MIN_BODY_LEN + UART_TIMESTAMP_SIZE +
+                        frame->len);
   packet[3] = (uint8_t)(uart_tx_sequence & 0xFFU);
   packet[4] = (uint8_t)(uart_tx_sequence >> 8U);
   packet[5] = (uint8_t)(frame->id & 0xFFU);
@@ -356,7 +394,8 @@ static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
     packet[11U + i] = frame->data[i];
   }
 
-  crc_index = (uint8_t)(11U + frame->len);
+  WriteU32Le(&packet[11U + frame->len], timestamp_us);
+  crc_index = (uint8_t)(11U + frame->len + UART_TIMESTAMP_SIZE);
   packet[crc_index] = Crc8AtmHw(&packet[2],
                                  (uint16_t)packet[2] + 1U);
   packet[crc_index + 1U] = UART_FRAME_END_0;
@@ -410,7 +449,8 @@ static void CanRx_ProcessTransport(void)
    * 数据路径 2（CAN -> 上位机）的主循环阶段：
    * HAL_FDCAN_RxFifo0Callback() 已在中断中把 CAN 报文存入 can_rx_queue，
    * 此处取出一帧，封装成 AA 55 ... CRC 55 AA，并交给外部接口发送队列。
-   * 每轮只处理一帧，避免 CAN 突发数据长期占用主循环。
+   * 上行反馈一律普通 FIFO；每轮只处理一帧，避免 CAN 突发数据长期占用
+   * 主循环。
    */
   if (can_rx_tail != can_rx_head)
   {
@@ -446,21 +486,38 @@ static void CanTx_NotifyCompletion(const CanTxQueueEntry_t *entry,
   }
 }
 
+/* 出队结束后推进对应优先级队列的 tail；调用前必须已复制条目。 */
+static void CanTx_AdvanceTail(uint8_t high, uint16_t tail)
+{
+  __DMB();
+  if (high != 0U)
+  {
+    can_tx_tail_high = (uint16_t)((tail + 1U) & CAN_TX_QUEUE_HIGH_MASK);
+  }
+  else
+  {
+    can_tx_tail_low = (uint16_t)((tail + 1U) & CAN_TX_QUEUE_LOW_MASK);
+  }
+}
+
 static void CanTx_ProcessBus(void)
 {
   FDCAN_TxHeaderTypeDef header;
   CanTxQueueEntry_t entry;
   CanFrame_t frame;
   uint32_t dlc;
+  uint8_t high;
   uint16_t tail;
 
   /*
    * 数据路径 1（外部接口 -> CAN）的最终发送阶段：
-   * QueueCanTxFromPacket() 已把校验后的命令放入 can_tx_queue；
-   * 此处转换为 FDCAN 发送头，并写入 FDCAN1 的硬件 TX FIFO。
+   * QueueCanTxFromPacket() 已把校验后的命令按优先级放入 can_tx 高/低
+   * 队列；电机控制帧（0x100）的高优先级队列非空时必须先发送，普通
+   * 队列随后。此处转换为 FDCAN 发送头，并写入 FDCAN1 的硬件 TX FIFO。
    * HAL_OK 仅代表写入硬件 FIFO 成功，不代表总线已得到 ACK。
    */
-  if (can_tx_tail == can_tx_head)
+  if ((can_tx_tail_high == can_tx_head_high) &&
+      (can_tx_tail_low == can_tx_head_low))
   {
     can_tx_fifo_stall_active = 0U;
     return;
@@ -485,15 +542,26 @@ static void CanTx_ProcessBus(void)
 
   can_tx_fifo_stall_active = 0U;
 
-  tail = can_tx_tail;
-  entry = can_tx_queue[tail];
+  /* 高优先级队列非空时先发，保证电机指令/反馈的实时性。 */
+  if (can_tx_tail_high != can_tx_head_high)
+  {
+    high = 1U;
+    tail = can_tx_tail_high;
+    entry = can_tx_queue_high[tail];
+  }
+  else
+  {
+    high = 0U;
+    tail = can_tx_tail_low;
+    entry = can_tx_queue_low[tail];
+  }
   frame = entry.frame;
+
   if ((CanFrame_Validate(&frame) == 0U) ||
       (CanLengthToDlc(frame.len, &dlc) == 0U))
   {
     can_tx_drop_count++;
-    __DMB();
-    can_tx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
+    CanTx_AdvanceTail(high, tail);
     CanTx_NotifyCompletion(&entry, 0U);
     return;
   }
@@ -520,15 +588,13 @@ static void CanTx_ProcessBus(void)
      * 不再重复占用队列槽位，错误计数会在主循环转换成 CAN_FAIL 状态包；
      * 后续帧仍可继续尝试，避免一次硬件错误拖死整条 USB->CAN 链路。
      */
-    __DMB();
-    can_tx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
+    CanTx_AdvanceTail(high, tail);
     CanTx_NotifyCompletion(&entry, 0U);
     return;
   }
 
   can_tx_submit_count++;
-  __DMB();
-  can_tx_tail = (uint16_t)((tail + 1U) & CAN_QUEUE_MASK);
+  CanTx_AdvanceTail(high, tail);
   CanTx_NotifyCompletion(&entry, 1U);
 }
 
@@ -671,11 +737,13 @@ static void Gateway_SendConfigResponse(void)
   packet[11] = config_response_status;
   WriteU32Le(&packet[12], current_nominal_bps);
   WriteU32Le(&packet[16], current_data_bps);
-  packet[20] = Crc8AtmHw(&packet[2], 18U);
-  packet[21] = UART_FRAME_END_0;
-  packet[22] = UART_FRAME_END_1;
+  /* 与普通上行帧一致：DATA/参数之后追加 4 字节 TIMESTAMP_US。 */
+  WriteU32Le(&packet[20], HAL_GetTick() * 1000U);
+  packet[24] = Crc8AtmHw(&packet[2], 22U);
+  packet[25] = UART_FRAME_END_0;
+  packet[26] = UART_FRAME_END_1;
 
-  if (GatewayTx_Enqueue(packet, 23U) != HAL_OK)
+  if (GatewayTx_Enqueue(packet, 27U) != HAL_OK)
   {
     uart_tx_error_count++;
     /* 外部发送队列暂忙时保留 pending，下一轮继续尝试，不能丢配置回复。 */
@@ -689,32 +757,55 @@ static void Gateway_SendConfigResponse(void)
  *
  * tracked=0 用于普通 CAN 帧；tracked=1 时保存上层提供的 token，之后由
  * CanTx_ProcessBus() 在硬件提交成功或明确失败时产生一次完成通知。
+ * 电机控制帧（0x100，节点号在 DATA 中）进高优先级队列
+ * （CanTx_ProcessBus 先发），其余进普通队列；两个队列独立判满。
  */
 static CanGatewayIoResult_t CanGateway_QueueCanFrameInternal(
     const CanGatewayCanFrame_t *frame,
     uint8_t tracked,
     uint32_t token)
 {
-  uint16_t head;
+  CanTxQueueEntry_t *queue;
+  volatile uint16_t *head;
+  volatile uint16_t *tail;
+  uint16_t mask;
+  uint16_t head_index;
   uint16_t next;
+  uint8_t high;
 
   if ((frame == NULL) || (CanFrame_Validate(frame) == 0U))
   {
     return CAN_GATEWAY_IO_ERROR;
   }
 
-  head = can_tx_head;
-  next = (uint16_t)((head + 1U) & CAN_QUEUE_MASK);
-  if (next == can_tx_tail)
+  high = CanGateway_IsMotorControlId(frame->id);
+  if (high != 0U)
+  {
+    queue = can_tx_queue_high;
+    head = &can_tx_head_high;
+    tail = &can_tx_tail_high;
+    mask = CAN_TX_QUEUE_HIGH_MASK;
+  }
+  else
+  {
+    queue = can_tx_queue_low;
+    head = &can_tx_head_low;
+    tail = &can_tx_tail_low;
+    mask = CAN_TX_QUEUE_LOW_MASK;
+  }
+
+  head_index = *head;
+  next = (uint16_t)((head_index + 1U) & mask);
+  if (next == (*tail))
   {
     return CAN_GATEWAY_IO_BUSY;
   }
 
-  can_tx_queue[head].frame = *frame;
-  can_tx_queue[head].token = token;
-  can_tx_queue[head].tracked = tracked;
+  queue[head_index].frame = *frame;
+  queue[head_index].token = token;
+  queue[head_index].tracked = tracked;
   __DMB();
-  can_tx_head = next;
+  *head = next;
   return CAN_GATEWAY_IO_OK;
 }
 
@@ -758,11 +849,12 @@ static void QueueCanTxFromPacket(const uint8_t *packet)
   /*
    * 数据路径 1（外部接口 -> CAN）的协议转换点：
    * 输入 packet 已通过帧头、帧尾和 CRC 校验；这里读取 CAN_ID、FLAGS、LEN、DATA，
-   * 校验 CAN 帧属性后写入 can_tx_queue。真正访问 FDCAN 硬件在 CanTx_ProcessBus()。
+   * 校验 CAN 帧属性后按优先级写入 can_tx 高/低队列。真正访问 FDCAN 硬件在 CanTx_ProcessBus()。
    */
   frame.id = ReadU32Le(&packet[5]);
   frame.flags = packet[9];
   frame.len = packet[10];
+  frame.timestamp_us = 0U; /* 下行帧不使用时间戳，入 CAN 队列前显式清零。 */
   if (((packet[2] != UART_PACKET_BODY_LEN) &&
        (packet[2] != (uint8_t)(UART_PACKET_MIN_BODY_LEN + frame.len))) ||
       (CanFrame_Validate(&frame) == 0U))
@@ -1013,11 +1105,18 @@ void CanGateway_RxFeed(const uint8_t *data, uint16_t len)
 
 uint8_t CanGateway_CanTxReady(void)
 {
-  uint16_t used;
+  uint16_t used_high;
+  uint16_t used_low;
 
   __DMB();
-  used = (uint16_t)((can_tx_head - can_tx_tail) & CAN_QUEUE_MASK);
-  return (used < CAN_TX_QUEUE_HIGH_WATERMARK) ? 1U : 0U;
+  used_high = (uint16_t)((can_tx_head_high - can_tx_tail_high) &
+                         CAN_TX_QUEUE_HIGH_MASK);
+  used_low = (uint16_t)((can_tx_head_low - can_tx_tail_low) &
+                        CAN_TX_QUEUE_LOW_MASK);
+  /* 普通队列超水位，或高优先级队列接近占满时，暂停输入形成反压，
+   * 让主机少投递而不是让控制帧在队列满后被丢弃。 */
+  return ((used_low < CAN_TX_LOW_WATERMARK) &&
+          (used_high < (CAN_TX_QUEUE_HIGH_SIZE - 1U))) ? 1U : 0U;
 }
 
 static uint8_t CanGateway_UsagePercent(uint16_t used, uint16_t capacity)
@@ -1040,7 +1139,9 @@ void CanGateway_GetQueueUsage(uint8_t *rx_percent,
 
   __DMB();
   rx_used = (uint16_t)((can_rx_head - can_rx_tail) & CAN_QUEUE_MASK);
-  tx_used = (uint16_t)((can_tx_head - can_tx_tail) & CAN_QUEUE_MASK);
+  tx_used = (uint16_t)(
+      ((can_tx_head_high - can_tx_tail_high) & CAN_TX_QUEUE_HIGH_MASK) +
+      ((can_tx_head_low - can_tx_tail_low) & CAN_TX_QUEUE_LOW_MASK));
 
   if (rx_percent != NULL)
   {
@@ -1048,7 +1149,7 @@ void CanGateway_GetQueueUsage(uint8_t *rx_percent,
   }
   if (tx_percent != NULL)
   {
-    *tx_percent = CanGateway_UsagePercent(tx_used, CAN_QUEUE_SIZE - 1U);
+    *tx_percent = CanGateway_UsagePercent(tx_used, CAN_TX_QUEUE_USABLE_TOTAL);
   }
 }
 
@@ -1057,7 +1158,8 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
 {
   /*
    * 数据路径 2（CAN -> 上位机）的中断入口：
-   * 从 FDCAN1 RX FIFO0 读出原始 CAN 帧，转换为 CanFrame_t 并写入 can_rx_queue。
+   * 从 FDCAN1 RX FIFO0 读出原始 CAN 帧，转换为 CanFrame_t 写入 can_rx_queue
+   * （上行反馈一律普通 FIFO）。
    * 中断中不直接调用外部接口发送，实际上报由 CanRx_ProcessTransport()
    * 在主循环完成。
    */
@@ -1099,6 +1201,9 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
     if (rx_header.BitRateSwitch == FDCAN_BRS_ON) frame.flags |= CAN_FLAG_BRS;
     if (rx_header.RxFrameType == FDCAN_REMOTE_FRAME) frame.flags |= CAN_FLAG_REMOTE;
 
+    /* 在中断里捕获接收时刻，作为该帧上行 AA55 包的 TIMESTAMP_US。 */
+    frame.timestamp_us = HAL_GetTick() * 1000U;
+
     for (i = 0U; i < 64U; i++)
     {
       if ((rx_header.RxFrameType == FDCAN_DATA_FRAME) && (i < frame.len))
@@ -1111,6 +1216,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
       }
     }
 
+    /* 上行反馈一律普通 FIFO 入队，不做优先级。 */
     head = can_rx_head;
     next = (uint16_t)((head + 1U) & CAN_QUEUE_MASK);
     if (next == can_rx_tail)

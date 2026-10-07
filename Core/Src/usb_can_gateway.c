@@ -402,8 +402,10 @@ static void UsbCanGateway_ProcessRx(void)
     processed++;
   }
 
-  /* 空间恢复后再重新提交 OUT 接收，避免缓存满时静默丢字节。 */
-  if ((usb_can_rx_paused != 0U) &&
+  /* 空间恢复后再重新提交 OUT 接收，避免缓存满时静默丢字节。
+   * 恢复条件覆盖两种失衡：主动反压（paused=1），以及端点意外失去
+   * 提交且 paused 已被配置事件清零的死角（armed=0）。 */
+  if (((usb_can_rx_paused != 0U) || (CDC_IsRxArmed() == 0U)) &&
       (UsbCanGateway_TxUsed() <= USB_CAN_TX_LOW_WATERMARK) &&
       (CanGateway_CanTxReady() != 0U) &&
       (UsbCanGateway_RxCanRearm(USB_CAN_RX_PACKET_RESERVE) != 0U))

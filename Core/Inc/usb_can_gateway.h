@@ -17,8 +17,8 @@ extern "C" {
  * 这样 USB 中断上下文不会执行 CRC、CAN 入队或阻塞式发送。
  */
 #define USB_CAN_RX_RING_SIZE       (8U * 1024U) /* USB RX 环形缓冲总字节数，必须为 2 的幂。 */
-#define USB_CAN_TX_QUEUE_SIZE      256U /* USB TX 槽位总数，实际可用容量少 1 个槽。 */
-#define USB_CAN_PACKET_SIZE        78U /* AA55 普通 CAN 协议包的固定最大长度。 */
+#define USB_CAN_TX_QUEUE_SIZE      256U /* USB TX 槽位总数，实际可用容量少 1 个槽。上行不做优先级，纯 FIFO。 */
+#define USB_CAN_PACKET_SIZE        82U /* AA55 协议包固定最大长度（上行含 4 字节 TIMESTAMP_US 后缀）。 */
 /* 每轮最多解析固定数量的输入字节，避免连续输入长期独占主循环。 */
 #define USB_CAN_RX_PROCESS_BUDGET  256U /* 单次主循环最多转交给协议解析器的字节数。 */
 /* USB FS CDC 单个 OUT 包最大 64 字节，重新接收前至少预留一个包空间。 */
@@ -111,6 +111,7 @@ const SystemHeartbeatTransportOps_t *UsbCanGateway_GetSystemTransport(void);
  * @return HAL_OK 已复制入队；HAL_BUSY 队列满；HAL_ERROR 参数非法。
  *
  * 函数只负责入队，不等待 USB。入队成功后调用方可以立即复用 data。
+ * 上行队列是纯 FIFO（反馈/遥测不做优先级），按入队顺序串行发送。
  */
 HAL_StatusTypeDef UsbCanGateway_TxEnqueue(const uint8_t *data, uint16_t len);
 

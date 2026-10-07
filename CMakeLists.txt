@@ -45,6 +45,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/can_gateway_core.c
+    Core/Src/can_gateway_priority.c
     Core/Src/firmware_flow.c
     Core/Src/imu_sensor.c
     Core/Src/imu_uart_debug.c
