@@ -17,7 +17,15 @@ extern "C" {
  * 这样 USB 中断上下文不会执行 CRC、CAN 入队或阻塞式发送。
  */
 #define USB_CAN_RX_RING_SIZE       (8U * 1024U) /* USB RX 环形缓冲总字节数，必须为 2 的幂。 */
-#define USB_CAN_TX_QUEUE_SIZE      256U /* USB TX 槽位总数，实际可用容量少 1 个槽。 */
+/*
+ * USB TX 双优先级队列：电机相关 AA55 包（按 CAN_ID 范围表识别）进高
+ * 优先级队列，AA5B 遥测、AA58 心跳与其余 AA55 数据进普通队列；出队时
+ * 高优先级队列非空必先发送。两容量都必须为 2 的幂。
+ */
+#define USB_CAN_TX_QUEUE_HIGH_SIZE 128U /* 高优先级（电机相关）TX 槽位总数，实际可用少 1 个槽。 */
+#define USB_CAN_TX_QUEUE_LOW_SIZE  128U /* 普通（遥测/心跳等）TX 槽位总数，实际可用少 1 个槽。 */
+#define USB_CAN_TX_QUEUE_SIZE      (USB_CAN_TX_QUEUE_HIGH_SIZE + USB_CAN_TX_QUEUE_LOW_SIZE) /* TX 槽位总数。 */
+#define USB_CAN_TX_QUEUE_USABLE    (USB_CAN_TX_QUEUE_SIZE - 2U) /* 两队列合计可用槽位。 */
 #define USB_CAN_PACKET_SIZE        78U /* AA55 普通 CAN 协议包的固定最大长度。 */
 /* 每轮最多解析固定数量的输入字节，避免连续输入长期独占主循环。 */
 #define USB_CAN_RX_PROCESS_BUDGET  256U /* 单次主循环最多转交给协议解析器的字节数。 */
@@ -31,8 +39,10 @@ extern "C" {
 
 _Static_assert((USB_CAN_RX_RING_SIZE & (USB_CAN_RX_RING_SIZE - 1U)) == 0U,
                "USB CAN RX ring size must be a power of two");
-_Static_assert((USB_CAN_TX_QUEUE_SIZE & (USB_CAN_TX_QUEUE_SIZE - 1U)) == 0U,
-               "USB CAN TX queue size must be a power of two");
+_Static_assert((USB_CAN_TX_QUEUE_HIGH_SIZE & (USB_CAN_TX_QUEUE_HIGH_SIZE - 1U)) == 0U,
+               "USB CAN TX high-priority queue size must be a power of two");
+_Static_assert((USB_CAN_TX_QUEUE_LOW_SIZE & (USB_CAN_TX_QUEUE_LOW_SIZE - 1U)) == 0U,
+               "USB CAN TX low-priority queue size must be a power of two");
 
 /**
  * @brief 将 USB CDC OUT 回调收到的字节复制到 RX 环形缓冲。
@@ -111,6 +121,8 @@ const SystemHeartbeatTransportOps_t *UsbCanGateway_GetSystemTransport(void);
  * @return HAL_OK 已复制入队；HAL_BUSY 队列满；HAL_ERROR 参数非法。
  *
  * 函数只负责入队，不等待 USB。入队成功后调用方可以立即复用 data。
+ * AA55 包按 CAN_ID 优先级范围表分入高/普通队列，其余帧族一律进普通
+ * 队列；出队时高优先级队列非空必先发送。
  */
 HAL_StatusTypeDef UsbCanGateway_TxEnqueue(const uint8_t *data, uint16_t len);
 

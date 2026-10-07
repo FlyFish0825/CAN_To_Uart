@@ -65,7 +65,7 @@ CRC16-CCITT 参数为多项式 `0x1021`、初值 `0xFFFF`，校验范围是偏�
 连续发送 AA55 数据时不需要在每个包后固定延时。固件通过队列水位和 USB 反压自动调节：
 
 - USB RX 每轮最多解析 256 字节，主循环会持续服务 CAN 和 USB TX；
-- USB RX 缓冲不足、USB TX 队列达到 192/255、或 CAN 软件发送队列达到 48/63 时，暂不重新提交下一次 USB OUT 接收；主机收到 USB NAK 后会自然减速；
+- USB RX 缓冲不足、USB TX 队列达到 192/254（双优先级队列合计）、或 CAN 软件发送普通队列达到 48/63（高优先级队列接近占满时同样反压）时，暂不重新提交下一次 USB OUT 接收；主机收到 USB NAK 后会自然减速；
 - USB TX 完成回调超过 1 秒没有回来时，刷新 IN 端点并重试当前包；
 - CAN→USB 发送队列忙时保留当前 CAN 帧，不提前移除；FDCAN 明确拒绝某帧时释放该失败帧并返回 `CAN_FAIL`，防止单帧把队列永久锁住；
 - 成功诊断提示（`USB_RX!!`、`CAN_PUT!`）按 100 ms 合并发送，不再为每个输入帧制造一个回包，避免诊断数据反过来占满 USB TX 队列；
@@ -152,6 +152,30 @@ status(1) | reserved(3)
 并且被 FDCAN 硬件 TX FIFO 接受后才返还该块 credit；这只表示控制器接受
 了发送请求，不表示总线节点已经 ACK。分片入队失败会保留当前分片位置并重试，明确
 失败则返回 `FORWARD_FAILED`，不会返还对应 credit。
+
+### 1.4 电机优先级调度（本分支特性）
+
+为保障电机控制的实时性，固件在收发两个方向上对软件队列做了双优先级改造：
+**电机相关 CAN ID 的帧走高优先级队列，其余数据排在后面**。协议格式不变，
+上位机无需任何配合改动。
+
+**识别规则**：电机相关 ID 由编译期范围表定义，见
+[can_gateway_priority.c](Core/Src/can_gateway_priority.c) 的
+`motor_priority_ranges[]`（闭区间 `{起始 ID, 结束 ID}`，标准帧/扩展帧统一按
+32 位数值比较）。默认覆盖 RoboMaster C620/C610/GM6020 电调常用段
+`0x1FF–0x208`；适配自己的机器人时只需修改该表并重新编译烧录。
+
+**优先级行为**（严格优先级：高优先级队列非空时必先发送）：
+
+| 方向 | 队列 | 高优先级（电机相关 ID） | 普通队列 |
+| --- | --- | --- | --- |
+| 下行 上位机→CAN | `can_tx` 高 16 槽 / 低 64 槽 | AA55 中 ID 命中范围表的命令帧 | 其余 AA55 命令、AA59 固件块分片 |
+| 上行 CAN→上位机 | `can_rx` 高 16 槽 / 低 64 槽 | ID 命中范围表的 CAN 帧（如电机反馈） | 其余 CAN 帧 |
+| 上行 汇聚→USB | `usb_can_tx` 高 128 槽 / 低 128 槽 | ID 命中范围表的 AA55 包 | AA5B 传感器遥测、AA58 心跳、状态帧、其余 AA55 包 |
+
+- USB 下行是字节流，无法按帧重排；优先级在 AA55 帧重组后的 `can_tx` 队列生效。
+- AA5B/AA58 与 AA55 共用 USB 发送队列，电机回报的 AA55 包会插到遥测/心跳前面；传感器帧本身另有水位让位保护。
+- 反压水位不变：USB TX 达 192（两队列合计）、CAN 普通队列达 48 或高优先级队列接近占满时暂停 USB OUT，形成 NAK 反压而不是丢电机帧。
 
 ## 2. 接线与默认配置
 
@@ -613,7 +637,8 @@ firmware_flow_host_test: PASS
 | 文件 | 当前职责 |
 | --- | --- |
 | [can_gateway_protocol.h](Core/Inc/can_gateway_protocol.h) | AA55 字段、标志位、长度和协议约束的共享定义 |
-| [can_gateway_core.h](Core/Inc/can_gateway_core.h) / [can_gateway_core.c](Core/Src/can_gateway_core.c) | AA55 解析、CRC、CAN 收发队列、状态回复、FDCAN 提交和速率命令 |
+| [can_gateway_core.h](Core/Inc/can_gateway_core.h) / [can_gateway_core.c](Core/Src/can_gateway_core.c) | AA55 解析、CRC、CAN 收发双优先级队列、状态回复、FDCAN 提交和速率命令 |
+| [can_gateway_priority.h](Core/Inc/can_gateway_priority.h) / [can_gateway_priority.c](Core/Src/can_gateway_priority.c) | 电机优先级 CAN ID 范围表与命中判断（见 §1.4） |
 | [firmware_flow.h](Core/Inc/firmware_flow.h) / [firmware_flow.c](Core/Src/firmware_flow.c) | AA59 会话、逻辑块队列、Classic CAN 分片、CAN FD DLC、累计 ACK |
 | [system_heartbeat.h](Core/Inc/system_heartbeat.h) / [system_heartbeat.c](Core/Src/system_heartbeat.c) | AA58 PING 和队列占用状态 |
 | [usb_can_gateway.h](Core/Inc/usb_can_gateway.h) / [usb_can_gateway.c](Core/Src/usb_can_gateway.c) | USB CDC 传输抽象、RX 环形缓存、TX 队列和回调衔接 |
