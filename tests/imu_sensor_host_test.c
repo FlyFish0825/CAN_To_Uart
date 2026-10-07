@@ -8,7 +8,7 @@
  * 时间序号、非有限浮点、未对齐偏移、缓冲溢出、BUSY/UNSUPPORTED 与发送
  * 失败路径。它不代表已在真实 UART、DMA 或目标板上运行。
  *
- * 编译（见 docs/imu-sensor-progress.md）：
+ * 编译（见 docs/imu-sensor.md）：
  *   gcc -std=c11 -Wall -Wextra -Werror -O0 -ICore/Inc \
  *       tests/imu_sensor_host_test.c -o build/imu_sensor_host_test.exe
  */

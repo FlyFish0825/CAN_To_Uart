@@ -6,7 +6,7 @@
 
 | 分类 | 入口 | 内容 |
 | --- | --- | --- |
-| 使用与协议 | [快速上手](#1-快速上手)、[普通 CAN 帧协议](#3-普通-can-帧的串口协议)、[状态回复](#4-状态回复怎么读)、[AA55 上行时间戳变更说明](docs/aa55-uplink-timestamp-changes.md) | USB CDC、AA55/AA58/AA59、CRC、流控和状态包；上行帧新增 TIMESTAMP_US 后上位机适配指南（含参考解析代码与测试向量） |
+| 使用与协议 | [快速上手](#1-快速上手)、[普通 CAN 帧协议](#3-普通-can-帧的串口协议)、[上行时间戳适配](#39-上行时间戳与上位机适配指南)、[状态回复](#4-状态回复怎么读) | USB CDC、AA55/AA58/AA59、CRC、流控、状态包和上位机拆包适配 |
 | 构建与维护 | [编译、烧录与维护](#6-编译烧录与维护)、[测试与验证](#10-测试验证入口与审查清单) | CMake 构建、烧录边界、主机测试和板上验证范围 |
 | 源码索引 | [工程边界与文件分工](#8-工程边界与文件分工)、[手写模块与配置文件索引](#9-手写模块与配置文件索引) | CubeMX 生成区、手写模块、配置文件和职责划分 |
 | 硬件参考 | [硬件资料目录](docs/hardware/) | 原理图和 STM32H750 数据手册，按资料归档，不作为自动化构建输入 |
@@ -467,6 +467,100 @@ AA 55 10 01 00 E5 50 FF 18 09 08 00 00 00 00 00 00 00 00 74 55 AA
 ```
 
 第一条最后三个字节为 `55 55 AA`，第一个 `55` 是 CRC，后两个才是帧尾，这是合法报文。不要因为 CRC 恰好等于标记字节而删除它。
+
+### 3.9 上行时间戳与上位机适配指南
+
+**适用固件**：`电机优先调度` 分支 `2119add` 及之后烧录的固件。仅板卡→上位机方向变化，下行完全不变，本变更与电机优先调度功能相互独立。
+
+| 帧族 | 是否变化 | 时间戳位置 |
+| --- | --- | --- |
+| AA55 数据上报 / 状态提示 | **变了**：DATA 后新增 4 字节 | 帧尾，CRC 之前 |
+| AA55 波特率配置回复 | **变了**：包体 17→21 字节，总长 23→27 字节（见第 5 节） | 参数后、CRC 前 |
+| AA55 下行命令 | 不变（`BODY_LEN=8+N`，不要自行加时间戳） | — |
+| AA58 / AA59 / AA5B | 不变（原本就有） | 固定偏移 12..15 |
+
+注意：AA58/AA59/AA5B 的时间戳在固定偏移 12..15；AA55 上行因为沿用旧 8 位 LEN 布局，时间戳在**帧尾**，两处不要混淆。
+
+**TIMESTAMP_US 语义**：CAN 上报帧记录**中断从 FDCAN RX FIFO 读出的时刻**（总线到达时间，不含软件排队延迟）；状态/提示/配置回复记录封装时刻。单位微秒（毫秒 tick ×1000，分辨率 1 ms，同一毫秒内多帧相同），32 位约 71.6 分钟回绕，与 AA58/AA59/AA5B 同一时基可跨帧族差分。
+
+**新旧固件兼容**：`body_len == 12+N` 为新格式、`8+N` 为旧格式，但 `body_len==20` 时两者有歧义（新 N=8 vs 旧 N=12）——先按新格式验 CRC，失败再按旧格式重试，以 CRC 通过者为准。
+
+参考拆包代码（Python 3，`ts_state` 初始化为 `[0, 0, 0]`）：
+
+```python
+def crc8(data):
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+    return crc
+
+
+def unpack_aa55_uplink(buf, ts_state):
+    """从 buf 解析一帧板卡上行 AA55。返回 (packet, consumed)：
+    packet=None 时 consumed 为应丢弃字节数（0=等待更多数据）。"""
+    i = buf.find(b'\xAA\x55')
+    if i > 0:
+        return None, i                      # 丢弃帧头前杂字节
+    if len(buf) < 3:
+        return None, 0
+    body_len = buf[2]
+    if not (12 <= body_len <= 76):          # 上行合法范围（数据帧 12+N、配置回复 0x15）
+        return None, 2
+    total = body_len + 6
+    if len(buf) < total:
+        return None, 0                      # 半包，等待
+    if buf[total - 2:total] != b'\x55\xAA':
+        return None, 2
+    ok = crc8(buf[2:3 + body_len]) == buf[body_len + 3]
+    seq = int.from_bytes(buf[3:5], 'little')
+    raw_ts = int.from_bytes(buf[body_len - 1:body_len + 3], 'little')
+
+    # 32 位回绕 → 64 位扩展：仅大幅倒退（超过半程，即真实回绕）才累加；
+    # 小幅倒退来自双队列优先级重排或同毫秒抖动，不调整。
+    prev_raw = ts_state[1]
+    if raw_ts < prev_raw and (prev_raw - raw_ts) > 0x80000000:
+        ts_state[2] += 1 << 32
+    ts_state[1] = raw_ts
+    ts64 = ts_state[2] | raw_ts
+
+    if buf[9] == 0x80:                      # 配置回复
+        if body_len != 0x15:
+            return None, 2
+        packet = {'type': 'config_rsp', 'seq': seq, 'cmd': buf[10],
+                  'status': buf[11],
+                  'nominal_bps': int.from_bytes(buf[12:16], 'little'),
+                  'data_bps': int.from_bytes(buf[16:20], 'little'),
+                  'timestamp_us': ts64, 'crc_ok': ok}
+    else:                                   # 普通 CAN 上报 / 状态帧
+        n = buf[10]
+        if body_len != 12 + n:
+            return None, 2
+        packet = {'type': 'can', 'seq': seq,
+                  'can_id': int.from_bytes(buf[5:9], 'little'),
+                  'flags': buf[9], 'len': n,
+                  'data': bytes(buf[11:11 + n]),
+                  'timestamp_us': ts64, 'crc_ok': ok}
+    return packet, total
+```
+
+要点：时间戳取 `buf[body_len-1 : body_len+3]`（CRC 前推 4 字节），CAN 帧/状态帧/配置回复通用；CRC 输入 `buf[2 : 3+body_len]`。
+
+测试向量（CRC 已按固件算法算好；**各向量独立解析，单测时回绕状态清零**）：
+
+```text
+① CAN 上报 N=8 ID=0x123 FLAGS=00 SEQ=1 TS=0：
+AA 55 14 01 00 23 01 00 00 00 08 11 22 33 44 55 66 77 88 00 00 00 00 69 55 AA
+② 状态包 UART_RX! N=8 ID=0x7FE SEQ=1 TS=0：
+AA 55 14 01 00 FE 07 00 00 00 08 55 41 52 54 5F 52 58 21 00 00 00 00 B2 55 AA
+③ CAN FD 上报 N=12 ID=0x123 FLAGS=02 SEQ=1 TS=1000：
+AA 55 18 01 00 23 01 00 00 02 0C AA BB CC DD EE FF 01 02 03 04 05 06 E8 03 00 00 9E 55 AA
+④ 配置回复 SEQ=2 STATUS=00 500k/5M TS=0：
+AA 55 15 02 00 00 00 00 00 80 81 00 20 A1 07 00 40 4B 4C 00 00 00 00 00 C9 55 AA
+```
+
+常见坑：① 不要把时间戳当 DATA（LEN 仍是真实长度，按 `body_len == 12+N` 兜底校验）；② 接收缓冲上限按 82 字节（N=64 FD 帧）预留；③ 同毫秒时间戳相同属正常，排序以接收顺序为准；④ 半包/粘包处理与旧版一致（按 `BODY_LEN+6` 收齐再验帧尾和 CRC）；⑤ 下行帧不要自行加时间戳。
 
 ## 4. 状态回复怎么读
 
