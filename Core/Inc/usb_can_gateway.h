@@ -26,7 +26,7 @@ extern "C" {
 #define USB_CAN_TX_QUEUE_LOW_SIZE  128U /* 普通（遥测/心跳等）TX 槽位总数，实际可用少 1 个槽。 */
 #define USB_CAN_TX_QUEUE_SIZE      (USB_CAN_TX_QUEUE_HIGH_SIZE + USB_CAN_TX_QUEUE_LOW_SIZE) /* TX 槽位总数。 */
 #define USB_CAN_TX_QUEUE_USABLE    (USB_CAN_TX_QUEUE_SIZE - 2U) /* 两队列合计可用槽位。 */
-#define USB_CAN_PACKET_SIZE        78U /* AA55 普通 CAN 协议包的固定最大长度。 */
+#define USB_CAN_PACKET_SIZE        82U /* AA55 协议包固定最大长度（上行含 4 字节 TIMESTAMP_US 后缀）。 */
 /* 每轮最多解析固定数量的输入字节，避免连续输入长期独占主循环。 */
 #define USB_CAN_RX_PROCESS_BUDGET  256U /* 单次主循环最多转交给协议解析器的字节数。 */
 /* USB FS CDC 单个 OUT 包最大 64 字节，重新接收前至少预留一个包空间。 */

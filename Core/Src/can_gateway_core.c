@@ -63,14 +63,16 @@ _Static_assert((CAN_QUEUE_LOW_SIZE & (CAN_QUEUE_LOW_SIZE - 1U)) == 0U,
 /* USB 字节流中半帧超过该时间仍未收齐，认为本帧已损坏并重新找帧头。 */
 #define UART_PARSER_TIMEOUT_MS  1000U
 /*
- * AA55 协议长度常量：完整固定缓冲区最大 78 字节；BODY_LEN 包含 SEQ、
- * CAN_ID、FLAGS、LEN 和 DATA，不包含帧头、CRC、帧尾；完整帧总长为
- * BODY_LEN + 6。普通数据帧的 BODY_LEN 范围为 8..72。
+ * AA55 协议长度常量。下行（电脑 -> 板卡）BODY_LEN 包含 SEQ、CAN_ID、
+ * FLAGS、LEN 和 DATA，范围为 8..72；上行（板卡 -> 电脑）在 DATA 后追加
+ * 4 字节 TIMESTAMP_US（毫秒时基×1000，约 71.6 分钟回绕），BODY_LEN 为
+ * 12+LEN。两类帧总长均为 BODY_LEN + 6，上行最大帧 18+64=82 字节。
  */
-#define UART_PACKET_SIZE        78U
+#define UART_TIMESTAMP_SIZE     4U
+#define UART_PACKET_SIZE        82U
 #define UART_PACKET_BODY_LEN    72U
 #define UART_PACKET_MIN_BODY_LEN 8U
-#define UART_CONFIG_RESPONSE_BODY_LEN 17U
+#define UART_CONFIG_RESPONSE_BODY_LEN 21U
 #define UART_FRAME_START_0      0xAAU
 #define UART_FRAME_START_1      0x55U
 #define UART_FRAME_END_0        0x55U
@@ -345,12 +347,16 @@ static HAL_StatusTypeDef GatewayTx_Enqueue(const uint8_t *data, uint16_t len)
   return HAL_ERROR;
 }
 
+static uint32_t ReadU32Le(const uint8_t *p);
+static void WriteU32Le(uint8_t *p, uint32_t value);
+
 static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
 {
   uint8_t packet[UART_PACKET_SIZE];
   uint8_t crc_index;
   uint16_t packet_len;
   uint16_t i;
+  uint32_t timestamp_us;
 
   if (CanFrame_Validate(frame) == 0U)
   {
@@ -360,10 +366,15 @@ static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
   /*
    * 此函数只做“CAN 帧 -> AA55 协议帧”的封装并写入外部接口发送队列。
    * 它用于 CAN 接收上报、启动提示和状态提示；不会向 CAN 总线发送数据。
+   * 上行帧在 DATA 之后追加 4 字节 TIMESTAMP_US：CAN 接收帧沿用中断
+   * 捕获时刻，本地构造的状态/提示帧回退为当前时基（毫秒×1000）。
    */
+  timestamp_us = (frame->timestamp_us != 0U) ? frame->timestamp_us
+                                              : (HAL_GetTick() * 1000U);
   packet[0] = UART_FRAME_START_0;
   packet[1] = UART_FRAME_START_1;
-  packet[2] = (uint8_t)(UART_PACKET_MIN_BODY_LEN + frame->len);
+  packet[2] = (uint8_t)(UART_PACKET_MIN_BODY_LEN + UART_TIMESTAMP_SIZE +
+                        frame->len);
   packet[3] = (uint8_t)(uart_tx_sequence & 0xFFU);
   packet[4] = (uint8_t)(uart_tx_sequence >> 8U);
   packet[5] = (uint8_t)(frame->id & 0xFFU);
@@ -378,7 +389,8 @@ static HAL_StatusTypeDef Gateway_SendCanPacket(const CanFrame_t *frame)
     packet[11U + i] = frame->data[i];
   }
 
-  crc_index = (uint8_t)(11U + frame->len);
+  WriteU32Le(&packet[11U + frame->len], timestamp_us);
+  crc_index = (uint8_t)(11U + frame->len + UART_TIMESTAMP_SIZE);
   packet[crc_index] = Crc8AtmHw(&packet[2],
                                  (uint16_t)packet[2] + 1U);
   packet[crc_index + 1U] = UART_FRAME_END_0;
@@ -742,11 +754,13 @@ static void Gateway_SendConfigResponse(void)
   packet[11] = config_response_status;
   WriteU32Le(&packet[12], current_nominal_bps);
   WriteU32Le(&packet[16], current_data_bps);
-  packet[20] = Crc8AtmHw(&packet[2], 18U);
-  packet[21] = UART_FRAME_END_0;
-  packet[22] = UART_FRAME_END_1;
+  /* 与普通上行帧一致：DATA/参数之后追加 4 字节 TIMESTAMP_US。 */
+  WriteU32Le(&packet[20], HAL_GetTick() * 1000U);
+  packet[24] = Crc8AtmHw(&packet[2], 22U);
+  packet[25] = UART_FRAME_END_0;
+  packet[26] = UART_FRAME_END_1;
 
-  if (GatewayTx_Enqueue(packet, 23U) != HAL_OK)
+  if (GatewayTx_Enqueue(packet, 27U) != HAL_OK)
   {
     uart_tx_error_count++;
     /* 外部发送队列暂忙时保留 pending，下一轮继续尝试，不能丢配置回复。 */
@@ -857,6 +871,7 @@ static void QueueCanTxFromPacket(const uint8_t *packet)
   frame.id = ReadU32Le(&packet[5]);
   frame.flags = packet[9];
   frame.len = packet[10];
+  frame.timestamp_us = 0U; /* 下行帧不使用时间戳，入 CAN 队列前显式清零。 */
   if (((packet[2] != UART_PACKET_BODY_LEN) &&
        (packet[2] != (uint8_t)(UART_PACKET_MIN_BODY_LEN + frame.len))) ||
       (CanFrame_Validate(&frame) == 0U))
@@ -1204,6 +1219,9 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
     if (rx_header.FDFormat == FDCAN_FD_CAN) frame.flags |= CAN_FLAG_FD;
     if (rx_header.BitRateSwitch == FDCAN_BRS_ON) frame.flags |= CAN_FLAG_BRS;
     if (rx_header.RxFrameType == FDCAN_REMOTE_FRAME) frame.flags |= CAN_FLAG_REMOTE;
+
+    /* 在中断里捕获接收时刻，作为该帧上行 AA55 包的 TIMESTAMP_US。 */
+    frame.timestamp_us = HAL_GetTick() * 1000U;
 
     for (i = 0U; i < 64U; i++)
     {
