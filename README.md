@@ -204,8 +204,8 @@ FDCAN 内核时钟配置为 80 MHz；默认仲裁段 1 Mbit/s、FD 数据段 8 M
 固件内置双传感器后端，经同一 USB CDC 以 AA5B v1 帧族与上位机通信：`TARGET=1` IMU、`TARGET=2` 深度计，与 AA55/AA58/AA59 帧族按帧头家族字节路由、同一发送队列串行输出。
 
 - 连接后**自动推流**：IMU 0x80（原始九轴，单位 g / rad/s）/ 0x81（四元数+欧拉角，rad）/ 深度计 0x82（压力/温度/深度）/ 双 TARGET 状态 0x83 各 1 Hz。`STOP/START_STREAM` 可按 TARGET 独立暂停/恢复（仅控制转发，不影响采样）。
-- 命令：GET_INFO / GET_STATUS / 参数读写（IMU 输出率与算法模式、深度计 OSR/水密度/零点/滤波/型号）/ CALIBRATE / ZERO_DEPTH；回复命令码 = 请求 + 0x40，全部字段真机实测。
-- 校准策略：IMU **不使用设备侧硬件校准**（上位机软件校准，CALIBRATE 不实现）；深度计支持 ZERO_DEPTH 水面归零。
+- 命令：GET_INFO / GET_STATUS / 参数读写（IMU 输出率与算法模式、深度计 OSR/水密度/滤波）；深度计固定为 MS5837-02BA，型号参数已移除，P0 参数只读，只有显式 ZERO_DEPTH 可采集新基准。回复命令码 = 请求 + 0x40。
+- 校准策略：IMU **不使用设备侧硬件校准**（上位机软件校准，CALIBRATE 不实现）；深度计只在操作者明确调用 ZERO_DEPTH 时采集空气/水面压力，不自动归零。
 - 发送队列水位 ≥25/255 时传感器帧被背压丢弃（保护 CAN 业务），上位机以 `sample_seq` 判断连续性。
 - 详见《imu-aa5b-host-protocol.md》《ms5837-aa5b-host-protocol.md》两份真机实测协议文档。
 

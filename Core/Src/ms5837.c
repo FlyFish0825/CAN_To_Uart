@@ -4,7 +4,7 @@
  * 结构：
  *  1) I2C 事务层（中断异步）：原 sensor_i2c_bus.c 的全部内容；外部只需要 I2c_Init()，
  *     提交/轮询/回调/中断服务都在本文件内部（static），不对外暴露。
- *  2) 深度计驱动：PROM+CRC4、02BA/30BA 一阶+二阶补偿、非阻塞状态机、显式零点、参数与统计。
+ *  2) 深度计驱动：PROM+CRC4、固定 02BA 补偿、非阻塞状态机、显式零点、参数与统计。
  */
 #include "ms5837.h"
 
@@ -448,7 +448,6 @@ typedef enum
 
 typedef struct
 {
-  uint8_t model; /* 型号：0/2/30。 */
   uint16_t osr; /* 过采样率。 */
   uint16_t output_rate_hz; /* 采样率。 */
   float water_density; /* 水体密度 kg/m3。 */
@@ -484,7 +483,7 @@ typedef struct
   uint8_t prom_bytes[MS5837_PROM_BYTES]; /* PROM 单字读缓冲。 */
 } Ms5837Sensor_t;
 
-/* 单实例驱动状态。上电默认：型号未确认、OSR4096、25 Hz、海水密度、无零点、不做滤波。 */
+/* 单实例驱动状态。探头固定为 02BA；OSR4096、25 Hz、海水密度、无零点、不做滤波。 */
 static Ms5837Sensor_t ms5837 =
 {
   .state = MS5837_STATE_OFFLINE,
@@ -504,7 +503,6 @@ static Ms5837Sensor_t ms5837 =
   .prom = {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U},
   .config =
   {
-    .model = MS5837_MODEL_UNKNOWN,
     .osr = MS5837_OSR_DEFAULT,
     .output_rate_hz = MS5837_OUTPUT_RATE_HZ_DEFAULT,
     .water_density = MS5837_WATER_DENSITY_DEFAULT,
@@ -519,8 +517,7 @@ static Ms5837Sensor_t ms5837 =
   }
 };
 
-/* 数据手册 ADC 表给出的最大转换时间（微秒）：下标对应 OSR 256/512/1024/2048/4096/8192。 */
-static const uint16_t ms5837_conv_time_us_30ba[6] = {600U, 1170U, 2280U, 4540U, 9040U, 18080U};
+/* 本机固定 02BA 的最大转换时间（微秒）：下标对应 OSR 256/512/1024/2048/4096/8192。 */
 static const uint16_t ms5837_conv_time_us_02ba[6] = {560U, 1100U, 2170U, 4320U, 8610U, 17200U};
 
 static const uint16_t ms5837_osr_table[6] = {
@@ -566,37 +563,25 @@ static uint8_t ms5837_osr_to_index(uint16_t osr)
   return 0xFFU;
 }
 
-/* 型号/OSR 对应的最大转换时间（微秒）；型号未知时取两者较大值。 */
-static uint32_t ms5837_conversion_time_us(uint8_t model, uint16_t osr)
+static uint32_t ms5837_conversion_time_us(uint16_t osr)
 {
   uint8_t index = ms5837_osr_to_index(osr);
   if (index == 0xFFU)
   {
     return 0U;
   }
-  if (model == MS5837_MODEL_02BA)
-  {
-    return (uint32_t)ms5837_conv_time_us_02ba[index];
-  }
-  if (model == MS5837_MODEL_30BA)
-  {
-    return (uint32_t)ms5837_conv_time_us_30ba[index];
-  }
-  /* 型号未确认：按较慢的一侧等待，避免提前读到未完成的 ADC 结果。 */
-  return (uint32_t)(ms5837_conv_time_us_30ba[index] > ms5837_conv_time_us_02ba[index]
-                        ? ms5837_conv_time_us_30ba[index]
-                        : ms5837_conv_time_us_02ba[index]);
+  return (uint32_t)ms5837_conv_time_us_02ba[index];
 }
 
 /* 向上取整到毫秒：宁可多等 1 ms，也不提前读 ADC。 */
-static uint32_t ms5837_conversion_time_ms(uint8_t model, uint16_t osr)
+static uint32_t ms5837_conversion_time_ms(uint16_t osr)
 {
-  uint32_t us = ms5837_conversion_time_us(model, osr);
+  uint32_t us = ms5837_conversion_time_us(osr);
   return (us + 999U) / 1000U;
 }
 
 /* 一个 D1+D2 采样周期能否塞进当前采样率周期。 */
-static uint8_t ms5837_schedule_fits(uint8_t model, uint16_t osr, uint16_t rate_hz)
+static uint8_t ms5837_schedule_fits(uint16_t osr, uint16_t rate_hz)
 {
   uint32_t period_ms;
   uint32_t needed_ms;
@@ -606,15 +591,15 @@ static uint8_t ms5837_schedule_fits(uint8_t model, uint16_t osr, uint16_t rate_h
   }
   period_ms = 1000U / (uint32_t)rate_hz;
   /* 两次保守等待（每次含 1 ms 余量）+ 一帧内 4 次短事务的预算。 */
-  needed_ms = (2U * (ms5837_conversion_time_ms(model, osr) + MS5837_CONVERSION_MARGIN_MS)) +
+  needed_ms = (2U * (ms5837_conversion_time_ms(osr) + MS5837_CONVERSION_MARGIN_MS)) +
               MS5837_SCHEDULE_TX_BUDGET_MS;
   return (needed_ms <= period_ms) ? 1U : 0U;
 }
 
 /* 本次转换的等待时长：按“命令已发完”的时刻计算，并含 1 ms 余量。 */
-static uint32_t ms5837_conversion_deadline(uint8_t model, uint16_t osr, uint32_t command_done_ms)
+static uint32_t ms5837_conversion_deadline(uint16_t osr, uint32_t command_done_ms)
 {
-  return command_done_ms + ms5837_conversion_time_ms(model, osr) + MS5837_CONVERSION_MARGIN_MS;
+  return command_done_ms + ms5837_conversion_time_ms(osr) + MS5837_CONVERSION_MARGIN_MS;
 }
 
 /* 24 位 ADC 结果是否可用：全 0 / 全 1 是典型“无有效转换”码字，不能当有效数据发布。 */
@@ -758,26 +743,6 @@ static void ms5837_record_invalid_conversion(uint32_t now)
 }
 
 /*
- * 让“已发布样本”的补偿结果立即失效。
- * 用于型号变化/恢复默认这类会让旧补偿值不再成立的操作：
- * 清掉 PRESSURE/TEMPERATURE/DEPTH 有效位并把测量字段置回 NaN，
- * 绝不允许“已知型号算出的旧压力”在型号变回 unknown 后仍带着有效位被读走。
- */
-static void ms5837_invalidate_compensated(void)
-{
-  ms5837.status &= ~(MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID |
-                     MS5837_STATUS_DEPTH_VALID);
-  ms5837.sample.pressure_raw = 0;
-  ms5837.sample.temperature_centi_c = 0;
-  ms5837.sample.pressure_pa = ms5837_nan();
-  ms5837.sample.temperature_c = ms5837_nan();
-  ms5837.sample.depth_raw_m = ms5837_nan();
-  ms5837.sample.depth_filtered_m = ms5837_nan();
-  ms5837.filter_valid = 0U;
-  ms5837.sample.status = ms5837.status;
-}
-
-/*
  * PROM 内容可信度检查：CRC 通过也可能碰上全 0 / 全 0xFFFF 的假 PROM
  * （典型的 I2C 卡死或空器件特征）。真实模块的 C1~C6 是工厂标定值，
  * 不可能 6 个字全 0 或全 0xFFFF。
@@ -839,7 +804,7 @@ static void ms5837_abort_half_cycle(void)
       ms5837.d2_raw = 0U;
       ms5837.state = MS5837_STATE_DISCARD_WAIT;
       ms5837.deadline_ms = ms5837_conversion_deadline(
-          MS5837_MODEL_UNKNOWN, ms5837_osr_from_index(ms5837.inflight_osr_index), HAL_GetTick());
+          ms5837_osr_from_index(ms5837.inflight_osr_index), HAL_GetTick());
     }
     else if ((ms5837.pending_action == MS5837_PENDING_D1_ADC) ||
              (ms5837.pending_action == MS5837_PENDING_D2_ADC))
@@ -901,13 +866,12 @@ uint8_t Ms5837_Crc4(const uint16_t prom[MS5837_PROM_WORDS])
   return (uint8_t)((remainder >> 12) & 0x000FU);
 }
 
-uint16_t Ms5837_MaxConversionTimeMs(uint8_t model, uint16_t osr)
+uint16_t Ms5837_MaxConversionTimeMs(uint16_t osr)
 {
-  return (uint16_t)ms5837_conversion_time_ms(model, osr);
+  return (uint16_t)ms5837_conversion_time_ms(osr);
 }
 
-uint8_t Ms5837_Compensate(uint8_t model,
-                          const uint16_t prom[MS5837_PROM_WORDS],
+uint8_t Ms5837_Compensate(const uint16_t prom[MS5837_PROM_WORDS],
                           uint32_t d1,
                           uint32_t d2,
                           int64_t *pressure_raw,
@@ -924,11 +888,7 @@ uint8_t Ms5837_Compensate(uint8_t model,
   int64_t sens2;
   int64_t pressure;
 
-  if ((prom == 0) || (model == MS5837_MODEL_UNKNOWN))
-  {
-    return 0U;
-  }
-  if ((model != MS5837_MODEL_02BA) && (model != MS5837_MODEL_30BA))
+  if (prom == 0)
   {
     return 0U;
   }
@@ -946,62 +906,23 @@ uint8_t Ms5837_Compensate(uint8_t model,
   dt = (int64_t)d2 - ((int64_t)prom[5] << 8);
   temp = 2000 + ms5837_floor_div_pow2(dt * (int64_t)prom[6], 23);
 
-  if (model == MS5837_MODEL_02BA)
-  {
-    off = ((int64_t)prom[2] << 17) + ms5837_floor_div_pow2((int64_t)prom[4] * dt, 6);
-    sens = ((int64_t)prom[1] << 16) + ms5837_floor_div_pow2((int64_t)prom[3] * dt, 7);
-  }
-  else
-  {
-    off = ((int64_t)prom[2] << 16) + ms5837_floor_div_pow2((int64_t)prom[4] * dt, 7);
-    sens = ((int64_t)prom[1] << 15) + ms5837_floor_div_pow2((int64_t)prom[3] * dt, 8);
-  }
+  off = ((int64_t)prom[2] << 17) + ms5837_floor_div_pow2((int64_t)prom[4] * dt, 6);
+  sens = ((int64_t)prom[1] << 16) + ms5837_floor_div_pow2((int64_t)prom[3] * dt, 7);
 
   /* 二阶温度补偿。比较用 0.01 °C 整数：TEMP/100 < 20 °C 等价 TEMP < 2000。 */
-  if (model == MS5837_MODEL_02BA)
+  if (temp < 2000)
   {
-    if (temp < 2000)
-    {
-      ti = ms5837_floor_div_pow2(11 * dt * dt, 35);
-      off_i = ms5837_floor_div_pow2(31 * (temp - 2000) * (temp - 2000), 3);
-      sens_i = ms5837_floor_div_pow2(63 * (temp - 2000) * (temp - 2000), 5);
-    }
-  }
-  else
-  {
-    if (temp < 2000) /* 低温：< 20 °C。 */
-    {
-      ti = ms5837_floor_div_pow2(3 * dt * dt, 33);
-      off_i = ms5837_floor_div_pow2(3 * (temp - 2000) * (temp - 2000), 1);
-      sens_i = ms5837_floor_div_pow2(5 * (temp - 2000) * (temp - 2000), 3);
-      if (temp < -1500) /* 极低温：< -15 °C。 */
-      {
-        off_i += 7 * (temp + 1500) * (temp + 1500);
-        sens_i += 4 * (temp + 1500) * (temp + 1500);
-      }
-    }
-    else /* 高温：>= 20 °C。 */
-    {
-      ti = ms5837_floor_div_pow2(2 * dt * dt, 37);
-      off_i = ms5837_floor_div_pow2((temp - 2000) * (temp - 2000), 4);
-      sens_i = 0;
-    }
+    ti = ms5837_floor_div_pow2(11 * dt * dt, 35);
+    off_i = ms5837_floor_div_pow2(31 * (temp - 2000) * (temp - 2000), 3);
+    sens_i = ms5837_floor_div_pow2(63 * (temp - 2000) * (temp - 2000), 5);
   }
 
   off2 = off - off_i;
   sens2 = sens - sens_i;
   temp -= ti;
 
-  if (model == MS5837_MODEL_02BA)
-  {
-    /* 02BA 整数压力单位为 0.01 mbar，正好 1 LSB = 1 Pa。 */
-    pressure = ms5837_floor_div_pow2(ms5837_floor_div_pow2((int64_t)d1 * sens2, 21) - off2, 15);
-  }
-  else
-  {
-    /* 30BA 整数压力单位为 0.1 mbar，1 LSB = 10 Pa。 */
-    pressure = ms5837_floor_div_pow2(ms5837_floor_div_pow2((int64_t)d1 * sens2, 21) - off2, 13);
-  }
+  /* 02BA 压力单位为 0.01 mbar，正好 1 LSB = 1 Pa。 */
+  pressure = ms5837_floor_div_pow2(ms5837_floor_div_pow2((int64_t)d1 * sens2, 21) - off2, 15);
 
   if (pressure_raw != 0)
   {
@@ -1060,7 +981,6 @@ static void ms5837_finish_sample(uint32_t now)
   ms5837.sample.d1 = ms5837.d1_raw;
   ms5837.sample.d2 = ms5837.d2_raw;
   ms5837.sample.timestamp_ms = now;
-  ms5837.sample.model = ms5837.config.model;
   memcpy(ms5837.sample.prom, ms5837.prom, sizeof(ms5837.sample.prom));
   ms5837.sample.pressure_raw = 0;
   ms5837.sample.temperature_centi_c = 0;
@@ -1076,22 +996,18 @@ static void ms5837_finish_sample(uint32_t now)
   ms5837.status &= ~(MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID |
                      MS5837_STATUS_DEPTH_VALID);
 
-  if (Ms5837_Compensate(ms5837.config.model, ms5837.prom, ms5837.d1_raw, ms5837.d2_raw,
+  if (Ms5837_Compensate(ms5837.prom, ms5837.d1_raw, ms5837.d2_raw,
                         &pressure_raw, &temperature_centi_c) != 0U)
   {
     ms5837.sample.pressure_raw = pressure_raw;
     ms5837.sample.temperature_centi_c = temperature_centi_c;
-    /* 30BA 的 0.1 mbar 换算 10 Pa/LSB；02BA 的 0.01 mbar 正好 1 Pa/LSB。 */
-    ms5837.sample.pressure_pa = (ms5837.config.model == MS5837_MODEL_30BA)
-                                    ? ((float)pressure_raw * 10.0f)
-                                    : ((float)pressure_raw);
+    /* 本机固定 02BA：0.01 mbar 每 LSB，pressure_raw 单位正好是 Pa。 */
+    ms5837.sample.pressure_pa = (float)pressure_raw;
     ms5837.sample.temperature_c = (float)temperature_centi_c / 100.0f;
     ms5837.status |= (MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID);
-    ms5837.status &= ~MS5837_STATUS_CONFIG_UNKNOWN;
   }
   else
   {
-    ms5837.status |= MS5837_STATUS_CONFIG_UNKNOWN;
     ms5837.status &= ~(MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID);
   }
 
@@ -1138,7 +1054,7 @@ static void ms5837_done_d1_command(void)
 {
   /* 以命令“发完”的时刻为基准，再加数据手册最大转换时间 + 1 ms 余量。 */
   ms5837.state = MS5837_STATE_CONVERT_D1;
-  ms5837.deadline_ms = ms5837_conversion_deadline(ms5837.config.model, ms5837.config.osr,
+  ms5837.deadline_ms = ms5837_conversion_deadline(ms5837.config.osr,
                                                   HAL_GetTick());
 }
 
@@ -1199,7 +1115,7 @@ static void ms5837_done_d1_adc(uint32_t now)
 static void ms5837_done_d2_command(void)
 {
   ms5837.state = MS5837_STATE_CONVERT_D2;
-  ms5837.deadline_ms = ms5837_conversion_deadline(ms5837.config.model, ms5837.config.osr,
+  ms5837.deadline_ms = ms5837_conversion_deadline(ms5837.config.osr,
                                                   HAL_GetTick());
 }
 
@@ -1310,16 +1226,6 @@ static void ms5837_done_prom_word(uint32_t now)
   ms5837.prom_valid = 1U;
   ms5837.stats.prom_valid = 1U;
   ms5837.status |= (MS5837_STATUS_PROM_VALID | MS5837_STATUS_ONLINE);
-  if (ms5837.config.model == MS5837_MODEL_UNKNOWN)
-  {
-    ms5837.status |= MS5837_STATUS_CONFIG_UNKNOWN;
-    ms5837.status &= ~MS5837_STATUS_MODEL_CONFIRMED;
-  }
-  else
-  {
-    ms5837.status &= ~MS5837_STATUS_CONFIG_UNKNOWN;
-    ms5837.status |= MS5837_STATUS_MODEL_CONFIRMED;
-  }
   ms5837.state = MS5837_STATE_IDLE;
   ms5837.deadline_ms = now; /* 立即可开始第一帧。 */
 }
@@ -1383,7 +1289,7 @@ void Ms5837_Process(void)
   I2c_Process();
 
   /*
-   * 弃单清理：事务在飞期间配置被改（SetOsr/SetModel/RestoreDefaults）或重新 Init 时，
+   * 弃单清理：事务在飞期间配置被改（SetOsr/RestoreDefaults）或重新 Init 时，
    * 状态机会离开 BUS_WAIT，那个已完成的结果就没人认领了。如果不在这里取走，
    * 总线层会一直停在 DONE，后续每次提交都被拒（死锁）。这里只丢弃结果，不解析。
    */
@@ -1578,7 +1484,6 @@ Ms5837Result_t Ms5837_GetStats(Ms5837Stats_t *stats)
   {
     return MS5837_ERR_PARAM;
   }
-  ms5837.stats.model = ms5837.config.model;
   ms5837.stats.osr = ms5837.config.osr;
   ms5837.stats.output_rate_hz = ms5837.config.output_rate_hz;
   ms5837.stats.prom_valid = ms5837.prom_valid;
@@ -1600,6 +1505,9 @@ Ms5837Result_t Ms5837_GetProm(uint16_t prom[MS5837_PROM_WORDS])
   return MS5837_OK;
 }
 
+/* P0 只允许 ZERO_DEPTH 调用该内部设定函数，通用参数接口保持只读。 */
+static Ms5837Result_t ms5837_set_surface_pressure_pa(float pa);
+
 /* ---------------------------------------------------------------- 零点 */
 Ms5837Result_t Ms5837_Zero(void)
 {
@@ -1607,17 +1515,13 @@ Ms5837Result_t Ms5837_Zero(void)
   {
     return MS5837_ERR_NO_SAMPLE;
   }
-  if ((ms5837.status & MS5837_STATUS_PRESSURE_VALID) == 0U)
-  {
-    return (ms5837.config.model == MS5837_MODEL_UNKNOWN) ? MS5837_ERR_MODEL_UNKNOWN
-                                                         : MS5837_ERR_NOT_READY;
-  }
+  if ((ms5837.status & MS5837_STATUS_PRESSURE_VALID) == 0U) return MS5837_ERR_NOT_READY;
 
   /*
-   * 直接复用 SetSurfacePressurePa 的校验（有限值 + 10000~200000 Pa），
+   * 直接复用内部 P0 写入辅助函数的校验（有限值 + 10000~200000 Pa），
    * 否则可能建立一个 GET_PARAMETER 认为越界的 P0，出现“ZERO 成功但参数读不回来”的矛盾状态。
    */
-  return Ms5837_SetSurfacePressurePa(ms5837.sample.pressure_pa);
+  return ms5837_set_surface_pressure_pa(ms5837.sample.pressure_pa);
 }
 
 Ms5837Result_t Ms5837_ClearZero(void)
@@ -1638,79 +1542,29 @@ uint8_t Ms5837_IsZeroValid(void)
 
 Ms5837Result_t Ms5837_RestoreDefaults(void)
 {
-  ms5837.config.model = MS5837_MODEL_UNKNOWN;
   ms5837.config.osr = MS5837_OSR_DEFAULT;
   ms5837.config.output_rate_hz = MS5837_OUTPUT_RATE_HZ_DEFAULT;
   ms5837.config.water_density = MS5837_WATER_DENSITY_DEFAULT;
   ms5837.config.filter_k = MS5837_FILTER_K_DEFAULT;
-  ms5837.stats.model = MS5837_MODEL_UNKNOWN;
   ms5837.stats.osr = MS5837_OSR_DEFAULT;
   ms5837.stats.output_rate_hz = MS5837_OUTPUT_RATE_HZ_DEFAULT;
-  ms5837.status |= MS5837_STATUS_CONFIG_UNKNOWN;
-  ms5837.status &= ~MS5837_STATUS_MODEL_CONFIRMED;
-  /* 型号回到 unknown：旧的补偿值（压力/温度）也随之失效，不能带有效位被读走。 */
-  ms5837_invalidate_compensated();
-  (void)Ms5837_ClearZero();
+  /* 参数恢复不覆盖现有空气/水面参考 P0，也不修改固定探头型号。 */
+  ms5837.filter_valid = 0U;
+  if (ms5837.sample_ready != 0U)
+  {
+    ms5837_apply_depth();
+    ms5837.sample.status = ms5837.status;
+  }
   /*
-   * 默认值里的 OSR/型号也会改变转换时间：与 SetOsr/SetModel 一样，
-   * 必须丢弃正在进行的半周期（延迟丢弃），否则 D1/D2 会跨配置配对。
+   * OSR 会改变转换时间：必须丢弃正在进行的半周期（延迟丢弃），否则 D1/D2 会跨配置配对。
    */
   ms5837_abort_half_cycle();
   return MS5837_OK;
 }
 
-/* ---------------------------------------------------------------- 参数 */
-Ms5837Result_t Ms5837_SetModel(uint8_t model)
-{
-  uint8_t changed;
-
-  if ((model != MS5837_MODEL_UNKNOWN) && (model != MS5837_MODEL_02BA) &&
-      (model != MS5837_MODEL_30BA))
-  {
-    return MS5837_ERR_PARAM;
-  }
-  if (ms5837_schedule_fits(model, ms5837.config.osr, ms5837.config.output_rate_hz) == 0U)
-  {
-    /* 切换型号会改变最大转换时间：当前采样率放不下时拒绝，而不是偷偷降速。 */
-    return MS5837_ERR_PARAM;
-  }
-
-  changed = (model != ms5837.config.model) ? 1U : 0U;
-  ms5837.config.model = model;
-  ms5837.stats.model = model;
-
-  if (model == MS5837_MODEL_UNKNOWN)
-  {
-    ms5837.status |= MS5837_STATUS_CONFIG_UNKNOWN;
-    ms5837.status &= ~MS5837_STATUS_MODEL_CONFIRMED;
-  }
-  else
-  {
-    ms5837.status &= ~MS5837_STATUS_CONFIG_UNKNOWN;
-    ms5837.status |= MS5837_STATUS_MODEL_CONFIRMED;
-  }
-
-  /* 旧样本是按旧型号算的，立即失效，等下一帧重新补偿。 */
-  ms5837_invalidate_compensated();
-
-  /*
-   * 型号变了：旧的 P0 很可能是用错误型号算出来的，因此连同零点一起清除；
-   * 同时丢弃按旧型号转换时间计算等待的半周期（例如 02BA → 30BA 会变慢）。
-   * 同一个型号重复设置（changed == 0）时两者都不做，保持幂等。
-   */
-  if (changed != 0U)
-  {
-    (void)Ms5837_ClearZero();
-    ms5837_abort_half_cycle();
-  }
-
-  ms5837.sample.status = ms5837.status;
-  return MS5837_OK;
-}
-
 uint8_t Ms5837_GetModel(void)
 {
-  return ms5837.config.model;
+  return MS5837_MODEL_FIXED;
 }
 
 Ms5837Result_t Ms5837_SetOsr(uint16_t osr)
@@ -1719,7 +1573,7 @@ Ms5837Result_t Ms5837_SetOsr(uint16_t osr)
   {
     return MS5837_ERR_PARAM;
   }
-  if (ms5837_schedule_fits(ms5837.config.model, osr, ms5837.config.output_rate_hz) == 0U)
+  if (ms5837_schedule_fits(osr, ms5837.config.output_rate_hz) == 0U)
   {
     return MS5837_ERR_PARAM;
   }
@@ -1741,7 +1595,7 @@ Ms5837Result_t Ms5837_SetOutputRateHz(uint16_t rate_hz)
   {
     return MS5837_ERR_PARAM;
   }
-  if (ms5837_schedule_fits(ms5837.config.model, ms5837.config.osr, rate_hz) == 0U)
+  if (ms5837_schedule_fits(ms5837.config.osr, rate_hz) == 0U)
   {
     return MS5837_ERR_PARAM;
   }
@@ -1776,7 +1630,7 @@ float Ms5837_GetWaterDensity(void)
   return ms5837.config.water_density;
 }
 
-Ms5837Result_t Ms5837_SetSurfacePressurePa(float pa)
+static Ms5837Result_t ms5837_set_surface_pressure_pa(float pa)
 {
   if (MS5837_IS_NAN(pa) || (pa < MS5837_SURFACE_PRESSURE_MIN) ||
       (pa > MS5837_SURFACE_PRESSURE_MAX))
@@ -1874,11 +1728,8 @@ Ms5837Result_t Ms5837_SetParam(uint16_t param_id,
       return Ms5837_SetWaterDensity(ms5837_read_le_f32(bytes));
 
     case MS5837_PARAM_SURFACE_PRESSURE:
-      if ((type != MS5837_PARAM_TYPE_F32) || (length != 4U))
-      {
-        return MS5837_ERR_PARAM;
-      }
-      return Ms5837_SetSurfacePressurePa(ms5837_read_le_f32(bytes));
+      /* P0 is changed only by the explicit ZERO_DEPTH action, never by a generic SET. */
+      return MS5837_ERR_UNSUPPORTED;
 
     case MS5837_PARAM_FILTER_K:
       if ((type != MS5837_PARAM_TYPE_F32) || (length != 4U))
@@ -1886,13 +1737,6 @@ Ms5837Result_t Ms5837_SetParam(uint16_t param_id,
         return MS5837_ERR_PARAM;
       }
       return Ms5837_SetFilterK(ms5837_read_le_f32(bytes));
-
-    case MS5837_PARAM_DEPTH_MODEL:
-      if ((type != MS5837_PARAM_TYPE_U8) || (length != 1U))
-      {
-        return MS5837_ERR_PARAM;
-      }
-      return Ms5837_SetModel(bytes[0]);
 
     default:
       return MS5837_ERR_UNSUPPORTED;
@@ -1964,12 +1808,6 @@ Ms5837Result_t Ms5837_GetParam(uint16_t param_id,
       value[3] = (uint8_t)((bits >> 24) & 0xFFU);
       return MS5837_OK;
     }
-
-    case MS5837_PARAM_DEPTH_MODEL:
-      *type = MS5837_PARAM_TYPE_U8;
-      *length = 1U;
-      value[0] = ms5837.config.model;
-      return MS5837_OK;
 
     default:
       return MS5837_ERR_UNSUPPORTED;

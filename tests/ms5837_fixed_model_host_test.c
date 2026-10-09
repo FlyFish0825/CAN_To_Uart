@@ -1,0 +1,82 @@
+/* Host regression for the single fixed MS5837-02BA runtime policy. */
+#define I2C_BUS_ENABLE_NVIC 0
+#include "ms5837.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static unsigned checks;
+#define CHECK(condition) do { \
+  ++checks; \
+  if (!(condition)) { \
+    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); \
+    return 1; \
+  } \
+} while (0)
+
+uint32_t HAL_GetTick(void) { return 0U; }
+HAL_StatusTypeDef HAL_I2C_Master_Transmit_IT(I2C_HandleTypeDef *handle,
+                                             uint16_t address,
+                                             uint8_t *data,
+                                             uint16_t size) {
+  (void)handle; (void)address; (void)data; (void)size; return HAL_BUSY;
+}
+HAL_StatusTypeDef HAL_I2C_Master_Receive_IT(I2C_HandleTypeDef *handle,
+                                            uint16_t address,
+                                            uint8_t *data,
+                                            uint16_t size) {
+  (void)handle; (void)address; (void)data; (void)size; return HAL_BUSY;
+}
+HAL_StatusTypeDef HAL_I2C_Master_Abort_IT(I2C_HandleTypeDef *handle, uint16_t address) {
+  (void)handle; (void)address; return HAL_OK;
+}
+uint32_t HAL_I2C_GetError(const I2C_HandleTypeDef *handle) { (void)handle; return 0U; }
+void HAL_I2C_EV_IRQHandler(I2C_HandleTypeDef *handle) { (void)handle; }
+void HAL_I2C_ER_IRQHandler(I2C_HandleTypeDef *handle) { (void)handle; }
+
+/* White-box host regression: exercise the real driver with the interrupt bus stubbed. */
+#include "../Core/Src/ms5837.c"
+
+int main(void) {
+  Ms5837Stats_t stats;
+  uint8_t type = 0U, length = 0U, value[4] = {0U, 0U, 0U, 0U};
+  uint16_t prom[MS5837_PROM_WORDS] = {0U, 46372U, 43981U, 29059U, 27842U, 31553U, 28165U, 0U};
+  int64_t pressure_raw = 0;
+  int32_t temperature_centi_c = 0;
+
+  CHECK(Ms5837_GetModel() == MS5837_MODEL_02BA);
+  memset(&stats, 0, sizeof(stats));
+  CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
+  CHECK(stats.osr == MS5837_OSR_DEFAULT && stats.output_rate_hz == MS5837_OUTPUT_RATE_HZ_DEFAULT);
+  CHECK((Ms5837_GetStatus() & ((1UL << 10U) | (1UL << 11U))) == 0U);
+
+  value[0] = MS5837_MODEL_02BA;
+  CHECK(Ms5837_SetParam(0x0105U, MS5837_PARAM_TYPE_U8, value, 1U) == MS5837_ERR_UNSUPPORTED);
+  CHECK(Ms5837_GetParam(0x0105U, &type, &length, value) == MS5837_ERR_UNSUPPORTED);
+  CHECK(Ms5837_SetParam(MS5837_PARAM_SURFACE_PRESSURE, MS5837_PARAM_TYPE_F32,
+                        value, 4U) == MS5837_ERR_UNSUPPORTED);
+  CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_ERR_NO_ZERO);
+  CHECK(Ms5837_Zero() == MS5837_ERR_NO_SAMPLE);
+
+  /* Only the explicit ZERO_DEPTH route can establish P0; the generic SET was rejected above. */
+  ms5837.sample_ready = 1U;
+  ms5837.status |= MS5837_STATUS_PRESSURE_VALID;
+  ms5837.sample.pressure_pa = 100123.5f;
+  CHECK(Ms5837_Zero() == MS5837_OK);
+  CHECK(ms5837.zero_valid == 1U && ms5837.config.surface_pressure_pa == 100123.5f);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_ZERO_VALID) != 0U);
+  CHECK((Ms5837_GetStatus() & ((1UL << 10U) | (1UL << 11U))) == 0U);
+  CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_OK);
+  CHECK(type == MS5837_PARAM_TYPE_F32 && length == 4U);
+
+  CHECK(Ms5837_Compensate(prom, 6465444U, 8077636U,
+                          &pressure_raw, &temperature_centi_c) == 1U);
+  CHECK(pressure_raw == 110002 && temperature_centi_c == 2000);
+
+  CHECK(Ms5837_RestoreDefaults() == MS5837_OK);
+  CHECK(Ms5837_GetModel() == MS5837_MODEL_02BA);
+  CHECK(ms5837.zero_valid == 1U && ms5837.config.surface_pressure_pa == 100123.5f);
+  CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_OK);
+  printf("PASS %u fixed-model and read-only-P0 checks\n", checks);
+  return 0;
+}
