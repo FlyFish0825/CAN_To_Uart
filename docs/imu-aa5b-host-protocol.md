@@ -1,5 +1,8 @@
 # IMU AA5B 上位机协议（TARGET = 1）——深度计协议的补充
 
+> **2026-10-07 新增 0x85 气压遥测**：新增部分已通过主机打包测试和 Debug/Release 构建，
+> 尚未烧录/真机验收，不适用下文“2026-10-06 真机实测”的历史声明。旧 0x80/0x81 不改布局。
+
 > 用途：直接交给上位机（Qt）开发照着实现，与《ms5837-aa5b-host-protocol.md》配合使用。
 > **依赖声明**：通用帧格式（AA 5B 帧头/CRC16-CCITT-FALSE/帧尾）、FLAGS 定义、RESULT 码表、
 > 0x83 状态流结构与背压规则，见《ms5837-aa5b-host-protocol.md》§2/§3/§10，本文件不重复。
@@ -70,14 +73,14 @@ GUI 触发前应向操作者确认（当前实现缺口：centiC 传参，见 do
 | 0 | 1 | `RESULT` | 0 |
 | 1 | 1 | `sensor_type` | **1（IMU）** |
 | 2 | 1 | `model` | **恒 0**：原生协议无型号读回，禁止凭四元数/磁力计数据猜 6/9 轴 |
-| 3 | 4 | `capabilities` | `0x000001E7`：bit0 raw、bit1 quaternion、bit2 euler、bit5 rate-config、bit6 algorithm-config、bit7 accel/gyro-cal、bit8 mag-cal |
+| 3 | 4 | `capabilities` | 未观察到气压样本时 `0x000001E7`；观察到原生 0x32 后为 `0x000001FF`，增加 bit3 气压、bit4 温度。能力不代表当前数据新鲜，也不用于猜测型号 |
 | 7 | 16 | `name` | `"7E23 IMU"` 后补 `\0` |
 | 23 | 8 | `firmware` | 版本串 `"1.0.0"`；**首次 GET_INFO 会自动触发原生版本查询并在收到版本后立即回复（实测请求后数十毫秒）**，之后走缓存即时回复 |
 
 ## 6. GET_STATUS 负载与状态位（IMU 侧取值）
 
 20 字节统计体（RESULT + status + sample_seq + age_ms + good_frames + errors）同深度计。
-实测 `status=0x0000043F`（含 bit10，因实测时速率/模式尚未设置过；SET 后清零）、
+实测 `status=0x0000043F`；当前驱动因没有参数原生读回，bit10 CONFIG_UNKNOWN 恒置位，SET 不清零。
 `sample_seq=62641`、`age_ms=3`、`errors=0`。
 
 **IMU 状态位定义（与深度计共用编号，取值不同）：**
@@ -88,7 +91,7 @@ GUI 触发前应向操作者确认（当前实现缺口：centiC 传参，见 do
 | 1/2/3 | RAW_VALID / QUAT_VALID / EULER_VALID | **三组独立新鲜度**：raw 到达不刷新姿态位 |
 | 4/5 | PRESSURE / TEMPERATURE_VALID | 来自气压计帧（0x32），十轴模块才有 |
 | 9 | PIN_BLOCKED | 调试器/占用期间置位（实测 WCH-Link 插着即 1） |
-| 10 | CONFIG_UNKNOWN | 速率或模式从未下发过（无读回，无法确认） |
+| 10 | CONFIG_UNKNOWN | 无原生参数读回，当前驱动恒置位；有缓存不等于配置已确认 |
 | 11 | MODEL_CONFIRMED | **恒 0**：无读回，GUI 不要做"型号已确认"判断 |
 
 `sample_seq` = 原始帧计数；`age_ms` 按四组最新时间算；`errors` = 校验和+长度+非有限
@@ -100,6 +103,7 @@ GUI 触发前应向操作者确认（当前实现缺口：centiC 传参，见 do
 | --- | --- | --- |
 | `0x80` IMU_RAW，**40B** | `status:u32` + `accel_g f32[3]` + `gyro_rad_s f32[3]` + `mag f32[3]` | **25.6 Hz**（=传感器输出率） |
 | `0x81` IMU_ATTITUDE，**32B** | `status:u32` + `quat_wxyz f32[4]` + `roll/pitch/yaw_rad f32[3]` | **51 Hz**（≠25！） |
+| `0x85` IMU_BAROMETER，**20B** | `status:u32` + `height_m:f32` + `temperature_c:f32` + `pressure_pa:f32` + `reference_pa:f32` | 新增，预计随原生 0x32 更新，尚未真机验收 |
 | `0x83` 状态流 | 同深度计（20B），按 TARGET 区分 | 各 1 Hz |
 
 **0x81 合并语义（实测 51 Hz）**：四元数（原生 0x16）与欧拉角（原生 0x26）各 25 Hz
@@ -112,6 +116,26 @@ GUI 触发前应向操作者确认（当前实现缺口：centiC 传参，见 do
 
 **时间戳**：= 数据接收完成时刻（HAL 毫秒 ×1000，分辨率 1 ms），与深度计"数据产生
 时刻"同口径——多传感器对齐用它，不要用上位机接收时刻。
+
+### 7.1 0x85 气压组完整布局（2026-10-07）
+
+公共 AA5B 包头不变：VERSION=1、CMD=0x85、FLAGS=8、TARGET=1、LEN=20，总长40字节。
+SEQ 与该目标其他流共用递增序号，TIMESTAMP_US 单独取 baro_time_us 低32位。
+
+| Payload 偏移 | 类型 | 字段 | 单位 |
+|---|---|---|---|
+| 0 | u32 | status | bit4 气压组有效，bit5 温度有效 |
+| 4 | f32 | height_m | 模块给出的气压高度，m；不是水深 |
+| 8 | f32 | temperature_c | IMU 气压计温度，°C |
+| 12 | f32 | pressure_pa | IMU 气压，Pa |
+| 16 | f32 | reference_pa | IMU 模块气压高度参考压力，Pa；不是 MS5837 的水面零点 |
+
+沿用原生 0x32 的四个字段顺序，单位按当前 imu_sensor 驱动契约；不得再做 hPa↔Pa 的隐式换算。
+只有 baro_seq 变化且 USB 队列接受后才推进 baro_sent；失败时保留重试机会。
+受 TARGET=1 的 START/STOP_STREAM 控制；重连重置发送游标。
+无效值填有限占位0并清相应有效位，接收端不得把占位0当测量。
+ONLINE 是 raw 组新鲜度，不用于替代气压组自己的 PRESSURE/TEMPERATURE_VALID。
+不改 IMU 配置、校准或输出频率；不把此组数据混入 TARGET=2 水深。
 
 ## 8. 上位机注意事项（IMU 专属）
 

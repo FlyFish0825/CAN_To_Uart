@@ -1,4 +1,5 @@
 #include "sensor_service.h"
+#include "sensor_imu_baro.h"
 #include "ms5837.h"
 #include <string.h>
 #include <stdio.h>
@@ -7,7 +8,7 @@
 static uint8_t link_up, streaming[2];
 static uint32_t last_tick, status_tick[2], stream_seq[2];
 static uint64_t tick_high, now_us;
-static uint32_t raw_sent, quat_sent, euler_sent, depth_sent;
+static uint32_t raw_sent, quat_sent, euler_sent, baro_sent, depth_sent;
 static struct {
     uint8_t active, token, command;
     uint32_t backend_sequence;
@@ -64,7 +65,9 @@ static void info_reply(uint8_t target,uint8_t token)
         /* Model cannot be queried with this IMU protocol. Do not infer six/nine axes
          * merely because a float or a nonzero magnetic value has arrived. */
         body[1]=0U;
-        Sensor_Write32(body+2,(1UL<<0)|(1UL<<1)|(1UL<<2)|(1UL<<5)|(1UL<<6)|(1UL<<7)|(1UL<<8));
+        uint32_t capabilities=(1UL<<0)|(1UL<<1)|(1UL<<2)|(1UL<<5)|(1UL<<6)|(1UL<<7)|(1UL<<8);
+        if(s.baro_seq) capabilities|=(1UL<<3)|(1UL<<4); /* Observed barometer support, not a guessed model. */
+        Sensor_Write32(body+2,capabilities);
         memcpy(body+6,"7E23 IMU",8U);
         if(s.version_valid) {
             char version[16];
@@ -176,7 +179,7 @@ void SensorService_Init(SensorSendFn send,ImuSensor_TxFn imu_tx)
 {
     link_up=0U; memset(streaming,0,sizeof(streaming)); memset(stream_seq,0,sizeof(stream_seq));
     memset(&imu_pending,0,sizeof(imu_pending));
-    raw_sent=quat_sent=euler_sent=depth_sent=0U;
+    raw_sent=quat_sent=euler_sent=baro_sent=depth_sent=0U;
     tick_high=now_us=0ULL; last_tick=0U; status_tick[0]=status_tick[1]=0U;
     /* Backend defaults: version query 1 s; calibration 30 s. */
     ImuSensor_Config config={imu_tx,NULL,0ULL};
@@ -190,7 +193,7 @@ void SensorService_SetLink(uint8_t connected)
     link_up=connected;
     SensorProtocol_ResetLink(); memset(&imu_pending,0,sizeof(imu_pending));
     streaming[0]=streaming[1]=connected;
-    raw_sent=quat_sent=euler_sent=depth_sent=0U;
+    raw_sent=quat_sent=euler_sent=baro_sent=depth_sent=0U;
     status_tick[0]=status_tick[1]=last_tick-1000U; // Status promptly on connection.
 }
 uint64_t SensorService_NowUs(void) { return now_us; }
@@ -239,6 +242,7 @@ void SensorService_Process(uint32_t now_ms)
             for(uint8_t i=0U;i<3U;++i) Sensor_WriteFloat(f.payload+20U+4U*i,value_or_zero(s.euler_rpy_rad[i]));
             if(send_stream(&f)) { quat_sent=s.quat_seq; euler_sent=s.euler_seq; }
         }
+        if(SensorImuBaro_MakeFrame(&s,baro_sent,&f) && send_stream(&f)) baro_sent=s.baro_seq;
     }
     if(streaming[1]) {
         Ms5837Sample_t s;
