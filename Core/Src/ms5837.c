@@ -94,11 +94,7 @@ void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
   i2c_tx_done = 1U;
   if (i2c_have_rx != 0U)
   {
-    /* 写阶段完成，紧接着发起读阶段。 */
-    if (i2c_bus_start_rx() != HAL_OK)
-    {
-      i2c_bus_finish(I2C_BUS_ERROR);
-    }
+    /* STOP 回调时硬件 BUSY 可能尚未消退；读阶段由主循环推进，避免误报 HAL_BUSY。 */
     return;
   }
   i2c_bus_finish(I2C_BUS_OK);
@@ -360,6 +356,19 @@ static void I2c_Process(void)
   }
   if ((int32_t)(HAL_GetTick() - i2c_deadline_ms) < 0)
   {
+    if ((i2c_have_rx != 0U) && (i2c_tx_done != 0U))
+    {
+      HAL_StatusTypeDef status = i2c_bus_start_rx();
+      if (status == HAL_OK)
+      {
+        i2c_tx_done = 0U; /* 读事务已提交，后续只等待完成回调。 */
+      }
+      else if (status != HAL_BUSY)
+      {
+        i2c_bus_finish(i2c_bus_map_status(status));
+      }
+      /* HAL_BUSY 保留待读状态；在原事务期限内下一拍重试，不在中断中自旋。 */
+    }
     return;
   }
 

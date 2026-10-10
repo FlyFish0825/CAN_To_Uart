@@ -15,21 +15,24 @@ static unsigned checks;
   } \
 } while (0)
 
-uint32_t HAL_GetTick(void) { return 0U; }
+static uint32_t test_tick;
+static HAL_StatusTypeDef test_tx_status = HAL_BUSY, test_rx_status = HAL_BUSY;
+static unsigned test_rx_calls, test_abort_calls;
+uint32_t HAL_GetTick(void) { return test_tick; }
 HAL_StatusTypeDef HAL_I2C_Master_Transmit_IT(I2C_HandleTypeDef *handle,
                                              uint16_t address,
                                              uint8_t *data,
                                              uint16_t size) {
-  (void)handle; (void)address; (void)data; (void)size; return HAL_BUSY;
+  (void)handle; (void)address; (void)data; (void)size; return test_tx_status;
 }
 HAL_StatusTypeDef HAL_I2C_Master_Receive_IT(I2C_HandleTypeDef *handle,
                                             uint16_t address,
                                             uint8_t *data,
                                             uint16_t size) {
-  (void)handle; (void)address; (void)data; (void)size; return HAL_BUSY;
+  (void)handle; (void)address; (void)data; (void)size; ++test_rx_calls; return test_rx_status;
 }
 HAL_StatusTypeDef HAL_I2C_Master_Abort_IT(I2C_HandleTypeDef *handle, uint16_t address) {
-  (void)handle; (void)address; return HAL_OK;
+  (void)handle; (void)address; ++test_abort_calls; return HAL_OK;
 }
 uint32_t HAL_I2C_GetError(const I2C_HandleTypeDef *handle) { (void)handle; return 0U; }
 void HAL_I2C_EV_IRQHandler(I2C_HandleTypeDef *handle) { (void)handle; }
@@ -134,6 +137,41 @@ int main(void) {
   CHECK(Ms5837_GetModel() == MS5837_MODEL_02BA);
   CHECK(ms5837.zero_valid == 1U && ms5837.config.surface_pressure_pa == 100123.5f);
   CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_OK);
-  printf("PASS %u fixed-model and read-only-P0 checks\n", checks);
+  /* 写完成中断之后 HAL_BUSY 只延迟读取，不能误报器件离线；读阶段不能重复提交。 */
+  I2C_HandleTypeDef handle = {0};
+  uint8_t command = 0xA0U, rx[2] = {0U, 0U};
+  I2c_Init(&handle);
+  test_tx_status = HAL_OK;
+  test_rx_status = HAL_BUSY;
+  test_rx_calls = 0U;
+  CHECK(I2c_Submit(&command, 1U, rx, 2U, 5U) == I2C_BUS_OK);
+  HAL_I2C_MasterTxCpltCallback(&handle);
+  CHECK(test_rx_calls == 0U && I2c_GetPhase() == I2C_BUS_PHASE_BUSY);
+  I2c_Process();
+  CHECK(test_rx_calls == 1U && I2c_GetPhase() == I2C_BUS_PHASE_BUSY);
+  test_rx_status = HAL_OK;
+  I2c_Process();
+  CHECK(test_rx_calls == 2U && I2c_GetPhase() == I2C_BUS_PHASE_BUSY);
+  I2c_Process();
+  CHECK(test_rx_calls == 2U);
+  HAL_I2C_MasterRxCpltCallback(&handle);
+  CHECK(I2c_GetResult() == I2C_BUS_OK);
+
+  /* 持续忙仍受原事务超时约束；非 BUSY 的失败按真实 HAL 类型返回。 */
+  test_tick = 100U;
+  test_rx_status = HAL_BUSY;
+  CHECK(I2c_Submit(&command, 1U, rx, 2U, 5U) == I2C_BUS_OK);
+  HAL_I2C_MasterTxCpltCallback(&handle);
+  test_tick = 106U;
+  I2c_Process();
+  CHECK(test_abort_calls == 1U);
+  HAL_I2C_AbortCpltCallback(&handle);
+  CHECK(I2c_GetResult() == I2C_BUS_TIMEOUT);
+  test_rx_status = HAL_ERROR;
+  CHECK(I2c_Submit(&command, 1U, rx, 2U, 5U) == I2C_BUS_OK);
+  HAL_I2C_MasterTxCpltCallback(&handle);
+  I2c_Process();
+  CHECK(I2c_GetResult() == I2C_BUS_ERROR);
+  printf("PASS %u fixed-model, read-only-P0 and deferred-I2C checks\n", checks);
   return 0;
 }

@@ -2,7 +2,7 @@
 
 > **2026-10-07 气压转发补齐**：原驱动已解出 baro 四个字段，但服务层此前只转发 0x80/0x81。
 > 现通过 sensor_imu_baro.h 与 sensor_service.c 增加 TARGET=1/CMD=0x85，20字节payload。
-> 后端原生解码不变，不执行校准/复位；尚待烧录验证。协议见 imu-aa5b-host-protocol.md §7.1。
+> 后端原生解码不变，不执行校准/复位。2026-10-10 已完成烧录与实机验收：WCH-Link 拔下后 0x80/0x81/0x85 三组同时有效，详见 experiments/2026-10-10-h750-flash-sensor-validation.md。协议见 imu-aa5b-host-protocol.md §7.1。
 
 > 对标文档：《ms5837.md》（深度计）。本文件对应 IMU 侧：`Core/Inc/imu_sensor.h`、
 > `Core/Src/imu_sensor.c`（1977+ 行级复杂度更低：纯 C、无 HAL 依赖、可在主机直接编译）。
