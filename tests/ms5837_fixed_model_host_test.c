@@ -48,6 +48,11 @@ int main(void) {
   CHECK(Ms5837_GetModel() == MS5837_MODEL_02BA);
   memset(&stats, 0, sizeof(stats));
   CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_DIAGNOSTICS_VALID) != 0U);
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_DRIVER_STATE_MASK) >>
+         MS5837_STATUS_DRIVER_STATE_SHIFT) == MS5837_STATE_OFFLINE);
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_I2C_PHASE_MASK) >>
+         MS5837_STATUS_I2C_PHASE_SHIFT) == I2C_BUS_PHASE_IDLE);
   CHECK(stats.osr == MS5837_OSR_DEFAULT && stats.output_rate_hz == MS5837_OUTPUT_RATE_HZ_DEFAULT);
   CHECK((Ms5837_GetStatus() & ((1UL << 10U) | (1UL << 11U))) == 0U);
   CHECK(Ms5837_IsZeroValid() == 1U);
@@ -120,6 +125,10 @@ int main(void) {
          MS5837_STATUS_LAST_I2C_COMMAND_SHIFT) == 0U);
   CHECK(((Ms5837_GetStatus() & MS5837_STATUS_LAST_ERROR_MASK) >>
          MS5837_STATUS_LAST_ERROR_SHIFT) == MS5837_ERR_PARAM);
+  i2c_phase = I2C_BUS_PHASE_BUSY;
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_I2C_PHASE_MASK) >>
+         MS5837_STATUS_I2C_PHASE_SHIFT) == I2C_BUS_PHASE_BUSY);
+  i2c_phase = I2C_BUS_PHASE_IDLE;
 
   CHECK(Ms5837_RestoreDefaults() == MS5837_OK);
   CHECK(Ms5837_GetModel() == MS5837_MODEL_02BA);

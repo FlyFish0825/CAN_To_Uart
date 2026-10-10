@@ -1469,13 +1469,22 @@ Ms5837Result_t Ms5837_GetSample(Ms5837Sample_t *sample)
     return MS5837_ERR_NO_SAMPLE;
   }
   *sample = ms5837.sample;
-  sample->status = ms5837.status;
+  sample->status = Ms5837_GetStatus();
   return MS5837_OK;
 }
 
 uint32_t Ms5837_GetStatus(void)
 {
-  return ms5837.status;
+  const uint32_t diagnostic_mask = MS5837_STATUS_DRIVER_STATE_MASK |
+                                   MS5837_STATUS_DIAGNOSTICS_VALID |
+                                   MS5837_STATUS_I2C_PHASE_MASK;
+  uint32_t status = ms5837.status & ~diagnostic_mask;
+  status |= (((uint32_t)ms5837.state << MS5837_STATUS_DRIVER_STATE_SHIFT) &
+             MS5837_STATUS_DRIVER_STATE_MASK);
+  status |= MS5837_STATUS_DIAGNOSTICS_VALID;
+  status |= (((uint32_t)I2c_GetPhase() << MS5837_STATUS_I2C_PHASE_SHIFT) &
+             MS5837_STATUS_I2C_PHASE_MASK);
+  return status;
 }
 
 uint32_t Ms5837_GetSampleAgeMs(void)
