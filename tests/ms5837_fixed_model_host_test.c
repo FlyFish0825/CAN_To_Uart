@@ -72,6 +72,9 @@ int main(void) {
   CHECK(ms5837.sample.pressure_pa == 110002.0f);
   CHECK(isfinite(ms5837.sample.depth_filtered_m));
   CHECK(fabsf(ms5837.sample.surface_pressure_pa - MS5837_AIR_REFERENCE_PRESSURE_PA) < 0.01f);
+  const float expected_depth_m = (110002.0f - MS5837_AIR_REFERENCE_PRESSURE_PA) /
+                                (MS5837_WATER_DENSITY_DEFAULT * MS5837_GRAVITY);
+  CHECK(fabsf(ms5837.sample.depth_raw_m - expected_depth_m) < 0.000001f);
 
   value[0] = MS5837_MODEL_02BA;
   CHECK(Ms5837_SetParam(0x0105U, MS5837_PARAM_TYPE_U8, value, 1U) == MS5837_ERR_UNSUPPORTED);
