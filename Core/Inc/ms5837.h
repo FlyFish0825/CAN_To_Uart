@@ -90,6 +90,11 @@ extern "C" {
 #define MS5837_STATUS_ZERO_VALID        (1UL << 7)  /* 固定空气基准或显式采集的 P0 有效。 */
 #define MS5837_STATUS_PROM_VALID        (1UL << 8)  /* PROM CRC4 校验通过。 */
 #define MS5837_STATUS_PIN_BLOCKED       (1UL << 9)  /* 本模块不使用该位（IMU 专用）。 */
+/* 诊断叠加字段：status[23:16] 为总线相关错误的 I2C 命令上下文，status[31:24] 为 MS5837 错误码。 */
+#define MS5837_STATUS_LAST_I2C_COMMAND_SHIFT 16U
+#define MS5837_STATUS_LAST_I2C_COMMAND_MASK  (0xFFUL << MS5837_STATUS_LAST_I2C_COMMAND_SHIFT)
+#define MS5837_STATUS_LAST_ERROR_SHIFT       24U
+#define MS5837_STATUS_LAST_ERROR_MASK        (0xFFUL << MS5837_STATUS_LAST_ERROR_SHIFT)
 
 /* 缺失值统一用 NaN 表示，绝不使用 0 冒充有效测量。 */
 #define MS5837_IS_NAN(value) ((value) != (value))

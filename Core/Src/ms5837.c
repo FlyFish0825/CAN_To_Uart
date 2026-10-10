@@ -699,10 +699,25 @@ static uint16_t ms5837_osr_from_index(uint8_t index)
 }
 
 /* ---------------------------------------------------------------- 错误处理 */
+static void ms5837_status_record_last_error(Ms5837Result_t error)
+{
+  const uint32_t diagnostic_mask = MS5837_STATUS_LAST_I2C_COMMAND_MASK |
+                                   MS5837_STATUS_LAST_ERROR_MASK;
+  const uint32_t command = (error == MS5837_ERR_BUSY || error == MS5837_ERR_TIMEOUT ||
+                            error == MS5837_ERR_IO || error == MS5837_ERR_CRC ||
+                            error == MS5837_ERR_NOT_READY)
+                               ? (uint32_t)ms5837.busy_command : 0U;
+  const uint32_t code = (uint32_t)error;
+  ms5837.status = (ms5837.status & ~diagnostic_mask) |
+                  (command << MS5837_STATUS_LAST_I2C_COMMAND_SHIFT) |
+                  (code << MS5837_STATUS_LAST_ERROR_SHIFT);
+}
+
 static void ms5837_record_error(Ms5837Result_t error, uint32_t now)
 {
   ms5837.stats.errors++;
   ms5837.stats.last_error = (uint32_t)error;
+  ms5837_status_record_last_error(error);
   if ((error == MS5837_ERR_TIMEOUT) || (error == MS5837_ERR_BUSY))
   {
     ms5837.stats.bus_timeouts++;
@@ -728,6 +743,7 @@ static void ms5837_record_invalid_conversion(uint32_t now)
 {
   ms5837.stats.errors++;
   ms5837.stats.last_error = (uint32_t)MS5837_ERR_NOT_READY;
+  ms5837_status_record_last_error(MS5837_ERR_NOT_READY);
   ms5837.status &= ~(MS5837_STATUS_RAW_VALID | MS5837_STATUS_PRESSURE_VALID |
                      MS5837_STATUS_TEMPERATURE_VALID | MS5837_STATUS_DEPTH_VALID);
   ms5837.sample.pressure_raw = 0;
@@ -1217,6 +1233,7 @@ static void ms5837_done_prom_word(uint32_t now)
     ms5837.stats.errors++;
     ms5837.stats.crc_errors++;
     ms5837.stats.last_error = (uint32_t)MS5837_ERR_CRC;
+    ms5837_status_record_last_error(MS5837_ERR_CRC);
     ms5837.prom_index = 0U;
     ms5837.state = MS5837_STATE_PROM_READ; /* 回到 PROM_READ，按重试间隔重读整块 */
     ms5837.deadline_ms = now + MS5837_RETRY_DELAY_MS;
@@ -1239,6 +1256,8 @@ Ms5837Result_t Ms5837_Init(void)
   {
     ms5837.state = MS5837_STATE_OFFLINE;
     ms5837.init_requested = 0U;
+    ms5837.stats.last_error = (uint32_t)MS5837_ERR_NOT_READY;
+    ms5837_status_record_last_error(MS5837_ERR_NOT_READY);
     return MS5837_ERR_NOT_READY;
   }
 

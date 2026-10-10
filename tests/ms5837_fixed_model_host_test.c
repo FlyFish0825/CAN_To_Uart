@@ -98,6 +98,29 @@ int main(void) {
                           &pressure_raw, &temperature_centi_c) == 1U);
   CHECK(pressure_raw == 110002 && temperature_centi_c == 2000);
 
+  /* 0x83 状态帧长度不变，高位可携带最近总线错误及命令上下文。 */
+  ms5837.status = MS5837_STATUS_ZERO_VALID;
+  ms5837.busy_command = MS5837_CMD_RESET;
+  ms5837_record_error(MS5837_ERR_IO, 2000U);
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_LAST_I2C_COMMAND_MASK) >>
+         MS5837_STATUS_LAST_I2C_COMMAND_SHIFT) == MS5837_CMD_RESET);
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_LAST_ERROR_MASK) >>
+         MS5837_STATUS_LAST_ERROR_SHIFT) == MS5837_ERR_IO);
+  ms5837.status = MS5837_STATUS_ZERO_VALID;
+  ms5837.busy_command = 0xACU;
+  ms5837_record_error(MS5837_ERR_CRC, 3000U);
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_LAST_I2C_COMMAND_MASK) >>
+         MS5837_STATUS_LAST_I2C_COMMAND_SHIFT) == 0xACU);
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_LAST_ERROR_MASK) >>
+         MS5837_STATUS_LAST_ERROR_SHIFT) == MS5837_ERR_CRC);
+  ms5837.status = MS5837_STATUS_ZERO_VALID;
+  ms5837.busy_command = 0xACU;
+  ms5837_record_error(MS5837_ERR_PARAM, 4000U);
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_LAST_I2C_COMMAND_MASK) >>
+         MS5837_STATUS_LAST_I2C_COMMAND_SHIFT) == 0U);
+  CHECK(((Ms5837_GetStatus() & MS5837_STATUS_LAST_ERROR_MASK) >>
+         MS5837_STATUS_LAST_ERROR_SHIFT) == MS5837_ERR_PARAM);
+
   CHECK(Ms5837_RestoreDefaults() == MS5837_OK);
   CHECK(Ms5837_GetModel() == MS5837_MODEL_02BA);
   CHECK(ms5837.zero_valid == 1U && ms5837.config.surface_pressure_pa == 100123.5f);
