@@ -1,6 +1,7 @@
 /* Host regression for the single fixed MS5837-02BA runtime policy. */
 #define I2C_BUS_ENABLE_NVIC 0
 #include "ms5837.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -49,16 +50,37 @@ int main(void) {
   CHECK(Ms5837_GetStats(&stats) == MS5837_OK);
   CHECK(stats.osr == MS5837_OSR_DEFAULT && stats.output_rate_hz == MS5837_OUTPUT_RATE_HZ_DEFAULT);
   CHECK((Ms5837_GetStatus() & ((1UL << 10U) | (1UL << 11U))) == 0U);
+  CHECK(Ms5837_IsZeroValid() == 1U);
+  CHECK((Ms5837_GetStatus() & MS5837_STATUS_ZERO_VALID) != 0U);
+  CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_OK);
+  float default_p0 = 0.0f;
+  memcpy(&default_p0, value, sizeof(default_p0));
+  CHECK(type == MS5837_PARAM_TYPE_F32 && length == 4U);
+  CHECK(default_p0 == MS5837_AIR_REFERENCE_PRESSURE_PA);
+
+  /* The first valid 02BA sample can produce depth against the fixed air baseline. */
+  memcpy(ms5837.prom, prom, sizeof(prom));
+  ms5837.prom_valid = 1U;
+  ms5837.status |= MS5837_STATUS_PROM_VALID;
+  ms5837.d1_raw = 6465444U;
+  ms5837.d2_raw = 8077636U;
+  ms5837_finish_sample(1000U);
+  CHECK((ms5837.status & (MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID |
+                          MS5837_STATUS_DEPTH_VALID | MS5837_STATUS_ZERO_VALID)) ==
+        (MS5837_STATUS_PRESSURE_VALID | MS5837_STATUS_TEMPERATURE_VALID |
+         MS5837_STATUS_DEPTH_VALID | MS5837_STATUS_ZERO_VALID));
+  CHECK(ms5837.sample.pressure_pa == 110002.0f);
+  CHECK(isfinite(ms5837.sample.depth_filtered_m));
+  CHECK(fabsf(ms5837.sample.surface_pressure_pa - MS5837_AIR_REFERENCE_PRESSURE_PA) < 0.01f);
 
   value[0] = MS5837_MODEL_02BA;
   CHECK(Ms5837_SetParam(0x0105U, MS5837_PARAM_TYPE_U8, value, 1U) == MS5837_ERR_UNSUPPORTED);
   CHECK(Ms5837_GetParam(0x0105U, &type, &length, value) == MS5837_ERR_UNSUPPORTED);
   CHECK(Ms5837_SetParam(MS5837_PARAM_SURFACE_PRESSURE, MS5837_PARAM_TYPE_F32,
                         value, 4U) == MS5837_ERR_UNSUPPORTED);
-  CHECK(Ms5837_GetParam(MS5837_PARAM_SURFACE_PRESSURE, &type, &length, value) == MS5837_ERR_NO_ZERO);
-  CHECK(Ms5837_Zero() == MS5837_ERR_NO_SAMPLE);
+  CHECK(Ms5837_Zero() == MS5837_OK);
 
-  /* Only the explicit ZERO_DEPTH route can establish P0; the generic SET was rejected above. */
+  /* Only explicit ZERO_DEPTH can replace the startup baseline; generic SET was rejected above. */
   ms5837.sample_ready = 1U;
   ms5837.status |= MS5837_STATUS_PRESSURE_VALID;
   ms5837.sample.pressure_pa = 100123.5f;

@@ -41,6 +41,7 @@ extern "C" {
 #define MS5837_OUTPUT_RATE_HZ_MIN     1U
 #define MS5837_OUTPUT_RATE_HZ_MAX     100U
 #define MS5837_WATER_DENSITY_DEFAULT  1029.0f /* kg/m3，海水常用值，可由参数 0102 覆盖。 */
+#define MS5837_AIR_REFERENCE_PRESSURE_PA 100965.0f /* 上次空气实测并沿用的固定默认基准；ZERO_DEPTH 可按需更新。 */
 #define MS5837_WATER_DENSITY_MIN      900.0f
 #define MS5837_WATER_DENSITY_MAX      1300.0f
 #define MS5837_SURFACE_PRESSURE_MIN   10000.0f
@@ -83,10 +84,10 @@ extern "C" {
 /* 位编号与 AA5B v1 状态字一致；本模块只会置位/清零其中一部分。 */
 #define MS5837_STATUS_ONLINE            (1UL << 0)  /* 最近一次总线访问成功。 */
 #define MS5837_STATUS_RAW_VALID         (1UL << 1)  /* 有可信的 PROM + D1/D2。 */
-#define MS5837_STATUS_PRESSURE_VALID    (1UL << 4)  /* pressure_pa 有效（需已确认型号）。 */
-#define MS5837_STATUS_TEMPERATURE_VALID (1UL << 5)  /* temperature_c 有效（需已确认型号）。 */
+#define MS5837_STATUS_PRESSURE_VALID    (1UL << 4)  /* pressure_pa 按固定 02BA 补偿有效。 */
+#define MS5837_STATUS_TEMPERATURE_VALID (1UL << 5)  /* temperature_c 按固定 02BA 补偿有效。 */
 #define MS5837_STATUS_DEPTH_VALID       (1UL << 6)  /* 深度有效（压力有效且零点有效）。 */
-#define MS5837_STATUS_ZERO_VALID        (1UL << 7)  /* 零点已显式采集或设定。 */
+#define MS5837_STATUS_ZERO_VALID        (1UL << 7)  /* 固定空气基准或显式采集的 P0 有效。 */
 #define MS5837_STATUS_PROM_VALID        (1UL << 8)  /* PROM CRC4 校验通过。 */
 #define MS5837_STATUS_PIN_BLOCKED       (1UL << 9)  /* 本模块不使用该位（IMU 专用）。 */
 
@@ -219,7 +220,7 @@ uint16_t Ms5837_GetOutputRateHz(void);
 Ms5837Result_t Ms5837_SetWaterDensity(float kg_m3); /* 900~1300。 */
 float Ms5837_GetWaterDensity(void);
 
-Ms5837Result_t Ms5837_GetSurfacePressurePa(float *pa); /* 未设定返回 MS5837_ERR_NO_ZERO。 */
+Ms5837Result_t Ms5837_GetSurfacePressurePa(float *pa); /* 默认固定空气基准；清除后返回 MS5837_ERR_NO_ZERO。 */
 
 Ms5837Result_t Ms5837_SetFilterK(float k); /* 0~0.99。 */
 float Ms5837_GetFilterK(void);
@@ -239,7 +240,7 @@ Ms5837Result_t Ms5837_SetParam(uint16_t param_id,
  * @brief 通用参数读取，供 AA5B GET_PARAMETER 路由。
  *
  * 参数值都保存在 MCU 侧（无设备回读），因此属于“已确认的本地配置”。
- * 零点未设定时返回 MS5837_ERR_NO_ZERO，不会用默认值冒充。
+ * 上电默认使用 MS5837_AIR_REFERENCE_PRESSURE_PA；显式 ZERO_DEPTH 可按需更新。
  */
 Ms5837Result_t Ms5837_GetParam(uint16_t param_id,
                                uint8_t *type,
@@ -250,7 +251,7 @@ Ms5837Result_t Ms5837_GetParam(uint16_t param_id,
  * @brief 恢复参数默认值（对应 AA5B RESTORE_DEFAULTS）。
  *
  * 恢复 OUTPUT_RATE_HZ=25、DEPTH_OSR=4096、WATER_DENSITY=1029、FILTER_K=0；
- * 保留本机固定 02BA 型号和现有水面 P0，不改变 PROM、CRC 结论和总线连接。
+ * 保留本机固定 02BA 型号和当前 P0（默认空气基准或后续显式归零值），不改变 PROM、CRC 结论和总线连接。
  * 采样时序改变时丢弃正在进行的半周期。
  */
 Ms5837Result_t Ms5837_RestoreDefaults(void);

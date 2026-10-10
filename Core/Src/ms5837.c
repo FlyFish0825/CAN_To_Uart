@@ -451,7 +451,7 @@ typedef struct
   uint16_t osr; /* 过采样率。 */
   uint16_t output_rate_hz; /* 采样率。 */
   float water_density; /* 水体密度 kg/m3。 */
-  float surface_pressure_pa; /* 显式零点压力；zero_valid 为唯一有效性依据。 */
+  float surface_pressure_pa; /* 固定空气参考或显式零点压力；zero_valid 为唯一有效性依据。 */
   float filter_k; /* 一阶滤波系数 0~0.99。 */
 } Ms5837Config_t;
 
@@ -483,20 +483,20 @@ typedef struct
   uint8_t prom_bytes[MS5837_PROM_BYTES]; /* PROM 单字读缓冲。 */
 } Ms5837Sensor_t;
 
-/* 单实例驱动状态。探头固定为 02BA；OSR4096、25 Hz、海水密度、无零点、不做滤波。 */
+/* 单实例驱动状态。探头固定为 02BA；上电沿用历史空气基准 P0，其余为 OSR4096、25 Hz、海水密度、不做滤波。 */
 static Ms5837Sensor_t ms5837 =
 {
   .state = MS5837_STATE_OFFLINE,
   .init_requested = 0U,
   .prom_valid = 0U,
-  .zero_valid = 0U,
+  .zero_valid = 1U,
   .sample_ready = 0U,
   .new_sample = 0U,
   .filter_valid = 0U,
   .prom_index = 0U,
   .deadline_ms = 0U,
   .cycle_start_ms = 0U,
-  .status = 0U,
+  .status = MS5837_STATUS_ZERO_VALID,
   .d1_raw = 0U,
   .d2_raw = 0U,
   .depth_filtered_m = 0.0f,
@@ -506,7 +506,7 @@ static Ms5837Sensor_t ms5837 =
     .osr = MS5837_OSR_DEFAULT,
     .output_rate_hz = MS5837_OUTPUT_RATE_HZ_DEFAULT,
     .water_density = MS5837_WATER_DENSITY_DEFAULT,
-    .surface_pressure_pa = 0.0f, /* 未采集零点时不参与任何计算。 */
+    .surface_pressure_pa = MS5837_AIR_REFERENCE_PRESSURE_PA,
     .filter_k = MS5837_FILTER_K_DEFAULT
   },
   .sample = {0},
